@@ -1,0 +1,13 @@
+# deps
+node_modules/
+dist/
+
+# segredos — por workspace, NUNCA commitar
+.kilo/*-key.json
+*-key.json
+.env
+.env.*
+
+# estado local
+*.log
+.hermes/

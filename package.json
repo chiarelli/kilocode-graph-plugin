@@ -1,0 +1,26 @@
+{
+  "name": "kilocode-graph-plugin",
+  "version": "0.1.0",
+  "description": "Memória curada (Graphiti) + RAG de código para Kilo Code",
+  "type": "module",
+  "main": "src/index.ts",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/"
+  },
+  "devDependencies": {
+    "typescript": "^5.6",
+    "@types/node": "^22.7"
+  },
+  "peerDependencies": {
+    "@kilocode/plugin": "*"
+  },
+  "notes": [
+    "O plugin NÃO carrega o graphiti nem o FalkorDB — fala HTTP com o graphiti-daemon.",
+    "Nada hardcoded: config vem de plugin.yaml + env vars (PRD FR-303).",
+    "O timeout do hook de injeção é 4000ms; recall medido = 0,85s (REPORT Q14)."
+  ]
+}
