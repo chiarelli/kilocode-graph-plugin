@@ -1,19 +1,22 @@
 /**
- * Injeção de memória — do texto do usuário ao bloco injetado (E2-S1 tracer).
+ * Injeção de memória — do texto do usuário ao bloco injetado (E2-S1 tracer;
+ * endurecido na E2-S2).
  *
- * Fluxo: `client.recall(query)` → `applyBudget` → formata o bloco com
- * procedência (`[CONTEXTO DE MEMÓRIA]`, sentinela `graph-memory` — FR-105).
- * Resposta vazia ⇒ `null` (não injeta bloco vazio).
+ * Fluxo: `client.recall(query)` → (dedup por turno) → `applyBudget` → formata o
+ * bloco com procedência (`[CONTEXTO DE MEMÓRIA]`, sentinela `graph-memory` —
+ * FR-105). Resposta vazia ⇒ `null` (não injeta bloco vazio).
  *
- * Puro no que dá: recebe o client (injetável) e a config; não lê env/arquivo.
- * O hook (`hooks/messages.ts`) é thin e só liga isto ao transform.
+ * Endurecimento (E2-S2): `max_tokens` no request (A1), `maxChars` (corte por
+ * fato inteiro, via `applyBudget`), `timeout_ms` como `AbortSignal` da chamada,
+ * dedup por turno (não reinjeta a mesma memória — FR-104), health gate opcional
+ * e log de `truncated`.
  *
- * Endurecimento (E2-S2): `maxChars` (corte por fato inteiro), `max_tokens` no
- * request, `tokens_estimated`/`truncated`, dedup por turno e log detalhado de
- * degradação. Aqui só o mínimo do tracer (`maxMemories` + `limit`).
+ * Recebe o client (injetável) e a config; não lê env/arquivo. O hook
+ * (`hooks/messages.ts`) é thin e só liga isto ao transform.
  */
 
-import type { Fact, MemtierClient } from "../client.ts";
+import type { Fact, MemtierClient, RecallOpts, RecallResult } from "../client.ts";
+import { debug, log } from "../logger.ts";
 import { applyBudget, type Budget } from "./budget.ts";
 
 /** Sentinela do bloco de memória (não colide com `ov-memory` do antecessor). */
@@ -22,14 +25,19 @@ export const MEMORY_SENTINEL = "graph-memory";
 /** Título do bloco — procedência visível ao modelo (FR-105). */
 export const MEMORY_HEADER = "[CONTEXTO DE MEMÓRIA]";
 
-/** Config da injeção consumida por `recallAndFormat` (subconjunto de `inject.*`). */
+/** Config da injeção consumida por `memory.ts` (subconjunto de `inject.*`). */
 export interface RecallConfig extends Budget {
-  /** `null` desliga o teto de chars (E2-S2). Ausente ⇒ sem teto no tracer. */
-  maxChars?: number;
+  /** Teto de tokens no servidor (A1). `undefined` ⇒ sem orçamento A1. */
+  maxTokens?: number;
+  /** Teto da chamada de recall (ms) — governa o `AbortSignal`. */
+  timeoutMs?: number;
+  /** Checa `health()` antes do recall e degrada rápido se não estiver ok. */
+  healthGate?: boolean;
 }
 
-/** Só o que `memory.ts` precisa do client (permite stub estreito em teste). */
-export type RecallClient = Pick<MemtierClient, "recall">;
+/** O que `memory.ts` precisa do client (permite stub estreito em teste). */
+export type RecallClient = Pick<MemtierClient, "recall"> &
+  Partial<Pick<MemtierClient, "health">>;
 
 /**
  * Formata um fato como linha, com procedência temporal quando houver `valid_at`.
@@ -51,22 +59,115 @@ export function formatMemoryBlock(facts: Fact[]): string | null {
   return `\n\n<context ${MEMORY_SENTINEL}="true">\n${MEMORY_HEADER}\n${lines}\n</context>`;
 }
 
+/** Teto de chars medido sobre o bloco renderizado (para `applyBudget`). */
+function renderForBudget(facts: Fact[]): string {
+  return formatMemoryBlock(facts) ?? "";
+}
+
+/** Opções de `recall` derivadas da config (limit/max_tokens/signal). */
+function recallOpts(cfg: RecallConfig, signal?: AbortSignal): RecallOpts {
+  const opts: RecallOpts = { limit: cfg.maxMemories };
+  if (cfg.maxTokens !== undefined) opts.maxTokens = cfg.maxTokens;
+  if (signal) opts.signal = signal;
+  return opts;
+}
+
+/** Timeout da chamada de recall como `AbortSignal` (ou `undefined` sem teto). */
+function timeoutSignal(cfg: RecallConfig): AbortSignal | undefined {
+  return cfg.timeoutMs && cfg.timeoutMs > 0
+    ? AbortSignal.timeout(cfg.timeoutMs)
+    : undefined;
+}
+
+/** Loga o envelope A1 quando o servidor devolve `truncated`. */
+function logBudget(result: RecallResult): void {
+  if (result.truncated) {
+    log(
+      `recall truncated tokens_estimated=${result.tokensEstimated ?? "?"} ` +
+        `(orçamento A1)`,
+    );
+  }
+}
+
 /**
- * Recall + formatação. Devolve o bloco pronto para virar um part injetado, ou
- * `null` quando não há o que injetar (0 fatos após o orçamento).
- *
- * **Lança** o erro do client (HTTP tipado / transporte) — quem chama é o hook,
- * que degrada sem quebrar o turno (NFR-03). Manter o lançamento aqui deixa a
- * política de degradação num único ponto (o hook).
+ * Recall de baixo nível: chama o client e loga o envelope A1. Lança no erro do
+ * client (HTTP tipado / transporte) — a política de degradação fica no hook.
+ */
+async function runRecall(
+  client: RecallClient,
+  cfg: RecallConfig,
+  query: string,
+  signal?: AbortSignal,
+): Promise<RecallResult> {
+  const result = await client.recall(query, recallOpts(cfg, signal));
+  logBudget(result);
+  return result;
+}
+
+/**
+ * Recall + orçamento + formatação, sem estado. Devolve o bloco pronto para virar
+ * um part injetado, ou `null` quando não há o que injetar (0 fatos após o
+ * orçamento). **Lança** o erro do client — quem chama (o hook) degrada.
  */
 export async function recallAndFormat(
   client: RecallClient,
   cfg: RecallConfig,
   query: string,
+  signal?: AbortSignal,
 ): Promise<string | null> {
-  // TODO(tracer-bullet): enviar `max_tokens` (A1) e respeitar
-  // `tokens_estimated`/`truncated`; dedup por turno — E2-S2.
-  const result = await client.recall(query, { limit: cfg.maxMemories });
-  const facts = applyBudget(result.facts, cfg);
+  const result = await runRecall(client, cfg, query, signal);
+  const facts = applyBudget(result.facts, cfg, renderForBudget);
   return formatMemoryBlock(facts);
+}
+
+/**
+ * Injetor com estado de **dedup por turno** (FR-104): a mesma memória não é
+ * reinjetada no mesmo turno. O turno é identificado pelo texto do usuário; ao
+ * mudar o turno, o conjunto de fatos já injetados é limpo. Fatos já vistos no
+ * turno são filtrados antes do orçamento — se nada sobra, devolve `null` (não
+ * injeta bloco vazio).
+ */
+export class MemoryInjector {
+  private readonly client: RecallClient;
+  private readonly cfg: RecallConfig;
+  private turnKey: string | null = null;
+  private readonly seen = new Set<string>();
+
+  constructor(client: RecallClient, cfg: RecallConfig) {
+    this.client = client;
+    this.cfg = cfg;
+  }
+
+  /** Health gate opcional — `true` quando pode tentar o recall. */
+  async ready(): Promise<boolean> {
+    if (!this.cfg.healthGate || !this.client.health) return true;
+    try {
+      return (await this.client.health()).ok;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Recall + dedup + orçamento + bloco. `null` ⇒ nada a injetar. */
+  async inject(query: string): Promise<string | null> {
+    if (query !== this.turnKey) {
+      this.turnKey = query;
+      this.seen.clear();
+    }
+    const result = await runRecall(
+      this.client,
+      this.cfg,
+      query,
+      timeoutSignal(this.cfg),
+    );
+
+    const fresh = result.facts.filter((f) => !this.seen.has(f.fact));
+    const facts = applyBudget(fresh, this.cfg, renderForBudget);
+    if (facts.length === 0) {
+      debug(`recall: nada novo a injetar (${result.facts.length} fatos)`);
+      return null;
+    }
+    for (const f of facts) this.seen.add(f.fact);
+    return formatMemoryBlock(facts);
+  }
 }

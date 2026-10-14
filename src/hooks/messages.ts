@@ -1,22 +1,32 @@
 /**
- * Hook de injeção de memória: `experimental.chat.messages.transform` (E2-S1).
+ * Hook de injeção de memória: `experimental.chat.messages.transform`
+ * (E2-S1 tracer; endurecido na E2-S2).
  *
  * Thin por design (decisão 6 da spec): só liga o transform do Kilo ao
- * `recallAndFormat` de `inject/memory.ts`. Reusa a forma dos helpers do
+ * `MemoryInjector` de `inject/memory.ts`. Reusa a forma dos helpers do
  * antecessor (`lastUserMessageIndex`/`extractUserText`/`appendContextPart`,
  * `openviking-memory.js:388`): o bloco vira um **novo part** no último turno do
  * usuário, sem alterar mensagens anteriores.
  *
- * Degradação (NFR-03): o hook **nunca lança** — `enabled=false`, sem turno de
- * usuário, texto vazio, recall vazio ou falha de recall ⇒ retorna sem injetar.
- * O log de erro é visível (`logFatal`) quando o recall falha.
+ * Degradação (NFR-03) — o hook **nunca lança**:
+ *   - `enabled=false` → retorna imediato (default);
+ *   - sem turno de usuário / texto vazio → retorna;
+ *   - health gate reprovado (degradado/503) → retorna sem injetar, log discreto;
+ *   - timeout do recall → aborta, retorna (log `debug`, não é erro do usuário);
+ *   - `401`/`403` → log **visível** (`logFatal`), sem retry;
+ *   - resposta vazia / nada novo no turno → não injeta (sem bloco vazio).
  *
- * Endurecer (E2-S2): dedup por turno, `maxChars`/`max_tokens`, health gate e
- * classificação de erro (401/403 visível, timeout silencioso).
+ * O estado de dedup por turno vive no `MemoryInjector` (uma instância por boot
+ * do plugin) — por isso o hook é montado uma vez em `index.ts`.
  */
 
-import { logFatal } from "../logger.ts";
-import { recallAndFormat, type RecallClient, type RecallConfig } from "../inject/memory.ts";
+import { AuthError, InfraError } from "../client.ts";
+import { debug, log, logFatal } from "../logger.ts";
+import {
+  MemoryInjector,
+  type RecallClient,
+  type RecallConfig,
+} from "../inject/memory.ts";
 
 /** Um `Part` do turno, na forma mínima que a injeção consome. */
 export interface TransformPart {
@@ -64,15 +74,47 @@ export function appendContextPart(parts: TransformPart[], block: string): void {
   parts.push({ type: "text", text: block });
 }
 
+/** Um timeout/abort do recall (`AbortSignal.timeout`) — não é erro do usuário. */
+function isAbort(err: unknown): boolean {
+  return err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError");
+}
+
 /**
- * Corpo do transform: extrai o texto do último turno do usuário, chama o recall
- * e injeta o bloco. **Nunca lança** — qualquer falha vira "segue sem memória".
+ * Classifica a falha do recall para o log correto. Nunca propaga — só decide a
+ * visibilidade:
+ *   - timeout/abort: esperado, log discreto (`debug`);
+ *   - `401`/`403`: erro de configuração, log **visível** (precisa de ação);
+ *   - `503`: memtier degradado, log discreto (a rota de dados já degrada);
+ *   - o resto: FATAL (erro inesperado, visível).
+ */
+function logRecallFailure(err: unknown): void {
+  if (isAbort(err)) {
+    debug(`recall abortado por timeout: ${err instanceof Error ? err.message : err}`);
+    return;
+  }
+  if (err instanceof AuthError) {
+    // Token ausente/revogado/sem capability — precisa de ação humana.
+    logFatal(`recall auth (${err.status})`, err);
+    return;
+  }
+  if (err instanceof InfraError) {
+    log(`recall: memtier indisponível (${err.status}); seguindo sem memória`);
+    return;
+  }
+  logFatal("recall", err);
+}
+
+/**
+ * Corpo do transform: extrai o texto do último turno do usuário, checa o health
+ * gate, chama o injector e injeta o bloco. **Nunca lança** — qualquer falha vira
+ * "segue sem memória".
  */
 export async function injectMemoryIntoMessages(
   messages: TransformMessage[],
-  rt: InjectRuntime,
+  enabled: boolean,
+  injector: MemoryInjector,
 ): Promise<void> {
-  if (!rt.enabled) return;
+  if (!enabled) return;
 
   const lastUserIdx = lastUserMessageIndex(messages);
   if (lastUserIdx === -1) return;
@@ -83,29 +125,38 @@ export async function injectMemoryIntoMessages(
   const text = extractUserText(parts);
   if (!text.trim()) return;
 
+  // Health gate (opcional): degradado/503 ⇒ segue sem memória, sem recall.
+  if (!(await injector.ready())) {
+    log("recall: health gate reprovado; seguindo sem memória");
+    return;
+  }
+
   let block: string | null;
   try {
-    block = await recallAndFormat(rt.client, rt.cfg, text);
+    block = await injector.inject(text);
   } catch (err) {
-    // TODO(tracer-bullet): classificar o erro (401/403 visível, timeout
-    // silencioso, health gate) — E2-S2. Aqui todo erro vira um FATAL.
-    // Recall falhou (rede/timeout/HTTP). O turno segue sem memória (NFR-03).
-    logFatal("recall", err);
+    logRecallFailure(err);
     return;
   }
   if (!block) return;
 
+  debug("messages.transform: injetando contexto de memória");
   appendContextPart(parts, block);
 }
 
-/** Registra o hook no formato do Kilo (`{ "hook.name": fn }`). */
+/**
+ * Registra o hook no formato do Kilo (`{ "hook.name": fn }`). Monta o
+ * `MemoryInjector` (estado de dedup por turno) uma única vez — o hook é
+ * registrado no boot e reutilizado em todos os turnos.
+ */
 export function messagesHook(rt: InjectRuntime) {
+  const injector = new MemoryInjector(rt.client, rt.cfg);
   return {
     "experimental.chat.messages.transform": async (
       _input: Record<string, unknown>,
       output: { messages: TransformMessage[] },
     ): Promise<void> => {
-      await injectMemoryIntoMessages(output.messages, rt);
+      await injectMemoryIntoMessages(output.messages, rt.enabled, injector);
     },
   };
 }
