@@ -5,7 +5,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { MemtierClient, type FetchLike } from "../src/client.ts";
+import {
+  AuthError,
+  InfraError,
+  MemtierClient,
+  MemtierHttpError,
+  type FetchLike,
+  type ReadFileLike,
+} from "../src/client.ts";
 
 /** Stub que devolve uma `Response` construída a partir do status e body. */
 function stubFetch(
@@ -122,4 +129,129 @@ test("health_hits_v1_health_path", async () => {
   });
   await client.health();
   assert.equal(called, "http://memtier:8400/v1/health");
+});
+
+// --- E1-S2: endurecimento --------------------------------------------------
+
+test("token_from_env: env vence o arquivo", async () => {
+  let auth: string | undefined;
+  const client = new MemtierClient({
+    url: "http://memtier:8400",
+    token: "envtoken",
+    token_file: "/does/not/matter.json",
+    readFile: () => JSON.stringify({ token: "filetoken" }),
+    fetch: stubFetch(200, { status: "ok" }, (_i, init) => {
+      auth = new Headers(init?.headers).get("Authorization") ?? undefined;
+    }),
+  });
+  await client.health();
+  assert.equal(auth, "Bearer envtoken");
+});
+
+test("token_from_file: lê o arquivo e cacheia (1 leitura)", async () => {
+  let reads = 0;
+  let auth: string | undefined;
+  const readFile: ReadFileLike = () => {
+    reads += 1;
+    return JSON.stringify({ token: "filetoken" });
+  };
+  const client = new MemtierClient({
+    url: "http://memtier:8400",
+    token_file: "/ws/.kilo/graph-key.json",
+    readFile,
+    fetch: stubFetch(200, { status: "ok" }, (_i, init) => {
+      auth = new Headers(init?.headers).get("Authorization") ?? undefined;
+    }),
+  });
+  await client.health();
+  await client.health();
+  assert.equal(auth, "Bearer filetoken");
+  assert.equal(reads, 1, "token_file deve ser lido uma vez (cache)");
+});
+
+test("token_absent: sem env nem arquivo ⇒ sem header (borda decide 401)", async () => {
+  let auth: string | undefined = "unset";
+  const client = new MemtierClient({
+    url: "http://memtier:8400",
+    token_file: "/missing.json",
+    readFile: () => {
+      throw new Error("ENOENT");
+    },
+    fetch: stubFetch(200, { status: "ok" }, (_i, init) => {
+      auth = new Headers(init?.headers).get("Authorization") ?? undefined;
+    }),
+  });
+  await client.health();
+  assert.equal(auth, undefined);
+});
+
+test("http_401_typed: request 401 ⇒ AuthError", async () => {
+  const client = new MemtierClient({
+    url: "http://memtier:8400",
+    fetch: stubFetch(401, "unauthorized"),
+  });
+  await assert.rejects(
+    () => client.request("POST", "/v1/recall", {}),
+    (err: unknown) => err instanceof AuthError && err.status === 401,
+  );
+});
+
+test("http_403_typed: request 403 ⇒ AuthError", async () => {
+  const client = new MemtierClient({
+    url: "http://memtier:8400",
+    fetch: stubFetch(403, "forbidden"),
+  });
+  await assert.rejects(
+    () => client.request("POST", "/v1/code/sync", {}),
+    (err: unknown) => err instanceof AuthError && err.status === 403,
+  );
+});
+
+test("http_503_typed: request 503 ⇒ InfraError", async () => {
+  const client = new MemtierClient({
+    url: "http://memtier:8400",
+    fetch: stubFetch(503, "down"),
+  });
+  await assert.rejects(
+    () => client.request("POST", "/v1/recall", {}),
+    (err: unknown) => err instanceof InfraError && err.status === 503,
+  );
+});
+
+test("http_other_typed: request 422 ⇒ MemtierHttpError (não Auth/Infra)", async () => {
+  const client = new MemtierClient({
+    url: "http://memtier:8400",
+    fetch: stubFetch(422, "unprocessable"),
+  });
+  await assert.rejects(
+    () => client.request("POST", "/v1/code/sync", {}),
+    (err: unknown) =>
+      err instanceof MemtierHttpError &&
+      !(err instanceof AuthError) &&
+      !(err instanceof InfraError) &&
+      err.status === 422,
+  );
+});
+
+test("program_in_identity: resolveIdentity devolve {workspace,program}", () => {
+  const client = new MemtierClient({
+    url: "http://memtier:8400",
+    workspace: "waweb",
+    program: "custom",
+  });
+  assert.deepEqual(client.resolveIdentity(), {
+    workspace: "waweb",
+    program: "custom",
+  });
+});
+
+test("program_default_identity: sem program ⇒ 'default'", () => {
+  const client = new MemtierClient({ url: "http://memtier:8400", workspace: "ws" });
+  assert.equal(client.resolveIdentity().program, "default");
+});
+
+test("token_never_logged: formatToken não expõe o valor", async () => {
+  const { formatToken } = await import("../src/logger.ts");
+  assert.equal(formatToken("supersecret"), "SET(len=11)");
+  assert.ok(!formatToken("supersecret").includes("supersecret"));
 });

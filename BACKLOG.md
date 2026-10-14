@@ -46,7 +46,7 @@ Convenções válidas para todas as epics:
 
 ### E1 — Fundação (cliente do memtier)
 - [x] **E1-S1** — Tracer bullet: skeleton do plugin + config + client + `GET /v1/health` atravessando até o memtier
-- [ ] **E1-S2** — Endurecer: timeout, retry/degradação, workspace + `program`, `token_file`, erros tipados
+- [x] **E1-S2** — Endurecer: timeout, retry/degradação, workspace + `program`, `token_file`, erros tipados
 - [ ] **E1-S3** — Fechamento: typecheck + testes verdes, docs, zero marcadores
 
 ### E2 — Injeção de memória

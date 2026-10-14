@@ -56,3 +56,26 @@ export function formatToken(token: string | undefined | null): string {
   if (!token) return "EMPTY";
   return `SET(len=${token.length})`;
 }
+
+/** Campos da linha de boot (o token entra só como tamanho, via `formatToken`). */
+export interface BootLineFields {
+  workspace: string;
+  url: string;
+  program: string;
+  token: string;
+  debug: boolean;
+}
+
+/**
+ * Monta a linha de boot do log. **Ponto único** onde o token é serializado —
+ * sempre por `formatToken` (nunca o valor cru). Pura e testável: prova que o
+ * valor do token não aparece no log sem abrir socket.
+ */
+export function formatBootLine(fields: BootLineFields): string {
+  return (
+    `boot workspace=${fields.workspace} url=${fields.url} ` +
+    `program=${fields.program} token=${formatToken(fields.token)} ` +
+    `debug=${fields.debug}`
+  );
+}
+

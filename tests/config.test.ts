@@ -61,3 +61,17 @@ test("config_max_chars_env: KILOCODE_GRAPH_INJECT_MAX_CHARS é honrado", () => {
   process.env.KILOCODE_GRAPH_INJECT_MAX_CHARS = "1234";
   assert.equal(loadConfig().inject.max_chars, 1234);
 });
+
+test("config_invalid_type: número inválido cai no default (nunca NaN)", () => {
+  clearEnv();
+  process.env.KILOCODE_GRAPH_INJECT_TIMEOUT_MS = "abc";
+  const cfg = loadConfig();
+  assert.equal(cfg.inject.timeout_ms, 4000);
+  assert.ok(Number.isFinite(cfg.inject.timeout_ms));
+});
+
+test("config_int_via_options: inteiro de options é aceito", () => {
+  clearEnv();
+  const cfg = loadConfig({ inject: { max_memories: "7" } });
+  assert.equal(cfg.inject.max_memories, 7);
+});
