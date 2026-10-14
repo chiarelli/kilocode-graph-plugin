@@ -8,3 +8,5 @@
 | [002](002-ingestao-assincrona.md) | Ingestão assíncrona — o turno nunca espera | aceito |
 | [003](003-adaptadores-por-cli.md) | Adaptadores por CLI; núcleo compartilhado | aceito |
 | [004](004-orcamento-de-injecao.md) | Orçamento de injeção com defaults conservadores | aceito |
+| [005](005-plugin-e-o-coletor.md) | O plugin é o coletor de código; o indexer é dependência do cliente | aceito |
+| [006](006-push-vs-pull-mcp.md) | Push (injeção) vs pull (ferramentas MCP) | aceito |

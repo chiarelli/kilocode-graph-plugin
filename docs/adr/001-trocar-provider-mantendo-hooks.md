@@ -30,7 +30,7 @@ esqueleto do `openviking-memory.js` (2112 linhas) e substitui:
 
 | Antes | Depois |
 |---|---|
-| `VikingClient` (OpenViking) | `DaemonClient` (HTTP → graphiti-daemon) |
+| `VikingClient` (OpenViking) | `DaemonClient` (HTTP → memtier) |
 | injeta só memória | injeta memória **+ código do repo** |
 | ingestão síncrona | ingestão enfileirada (202) |
 
