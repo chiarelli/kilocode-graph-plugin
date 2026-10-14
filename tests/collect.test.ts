@@ -141,6 +141,69 @@ test("collect_hook_returns_boot_promise: background, não bloqueia", async () =>
   await boot;
 });
 
+// --- E3a-S3: removidos via manifest ----------------------------------------
+
+/** Manifest em memória para o teste: `load` devolve `initial`, `save` acumula. */
+function fakeState(initial: string[]) {
+  const saved: string[][] = [];
+  return {
+    initial,
+    saved,
+    load: () => ({ files: initial }),
+    save: (files: string[]) => {
+      saved.push(files);
+    },
+  };
+}
+
+test("collect_sends_removed: arquivo saiu do repo ⇒ body inclui chunks: []", async () => {
+  let sentFiles: Array<{ file_path: string; chunks: unknown[] }> = [];
+  const rt = runtime({
+    run: async () => ({
+      events: [chunkEvent("src/a.rs", "a1")],
+      skipped: false,
+    }),
+    state: fakeState(["src/a.rs", "src/gone.rs"]),
+    client: {
+      syncCode: async (f) => {
+        sentFiles = f as never;
+        return EMPTY_SYNC;
+      },
+    },
+  });
+  await collectCode(rt);
+  const gone = sentFiles.find((f) => f.file_path === "src/gone.rs");
+  assert.ok(gone, "o removido deve estar no body");
+  assert.deepEqual(gone?.chunks, []);
+});
+
+test("collect_saves_current: manifest pós-sync grava só os arquivos atuais", async () => {
+  const st = fakeState(["src/a.rs", "src/gone.rs"]);
+  const rt = runtime({
+    run: async () => ({ events: [chunkEvent("src/a.rs", "a1")], skipped: false }),
+    state: st,
+  });
+  await collectCode(rt);
+  assert.deepEqual(st.saved[0], ["src/a.rs"]);
+});
+
+test("collect_first_use: manifest vazio ⇒ sem removidos", async () => {
+  let sentFiles: Array<{ file_path: string }> = [];
+  const rt = runtime({
+    run: async () => ({ events: [chunkEvent("src/a.rs", "a1")], skipped: false }),
+    state: fakeState([]),
+    client: {
+      syncCode: async (f) => {
+        sentFiles = f;
+        return EMPTY_SYNC;
+      },
+    },
+  });
+  await collectCode(rt);
+  assert.equal(sentFiles.length, 1);
+  assert.equal(sentFiles[0]?.file_path, "src/a.rs");
+});
+
 // --- client.syncCode -------------------------------------------------------
 
 test("sync_body_shape: body tem workspace/program/files/edges", async () => {

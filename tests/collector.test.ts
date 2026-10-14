@@ -59,25 +59,31 @@ test("build_body_groups_by_file: 2 arquivos, 3 chunks ⇒ files.length==2", () =
     chunkEvent("src/a.rs", "a2"),
     chunkEvent("src/b.rs", "b1"),
   ];
-  const body = buildSyncBody(events, IDENTITY);
+  const body = buildSyncBody(events, IDENTITY, { readFile: () => "x" });
   assert.equal(body.files.length, 2);
   const a = body.files.find((f) => f.file_path === "src/a.rs");
-  assert.equal(a?.chunks.length, 2);
+  // 2 Symbols + 1 FullFile sintético (S3).
+  assert.equal(a?.chunks.filter((c) => c.chunk_kind === "Symbol").length, 2);
 });
 
 test("build_body_symbol_bare: symbol_id 'main' usado cru (sem file:)", () => {
-  const body = buildSyncBody([chunkEvent("src/main.rs", "main")], IDENTITY);
-  assert.equal(body.files[0]?.chunks[0]?.symbol_id, "main");
+  const body = buildSyncBody([chunkEvent("src/main.rs", "main")], IDENTITY, {
+    readFile: () => "x",
+  });
+  const sym = body.files[0]?.chunks.find((c) => c.chunk_kind === "Symbol");
+  assert.equal(sym?.symbol_id, "main");
 });
 
 test("build_body_symbol_bare_strips_qualified: 'src/x.rs:main' ⇒ 'main'", () => {
   const body = buildSyncBody(
     [chunkEvent("src/x.rs", "src/x.rs:main")],
     IDENTITY,
+    { readFile: () => "x" },
   );
   // Cinto de segurança: nunca reconcatena o arquivo (produziria
   // 'src/x.rs:src/x.rs:main'); a chave é montada pelo servidor.
-  assert.equal(body.files[0]?.chunks[0]?.symbol_id, "main");
+  const sym = body.files[0]?.chunks.find((c) => c.chunk_kind === "Symbol");
+  assert.equal(sym?.symbol_id, "main");
 });
 
 test("build_body_ignores_junk: evento sem file/chunk inválido é ignorado", () => {
@@ -87,13 +93,18 @@ test("build_body_ignores_junk: evento sem file/chunk inválido é ignorado", () 
     { event: "capabilities", payload: { languages: ["rust"] } },
     { event: "job_completed", payload: { processed: 1 } },
   ];
-  const body = buildSyncBody(events, IDENTITY);
+  const body = buildSyncBody(events, IDENTITY, { readFile: () => "x" });
   assert.equal(body.files.length, 1);
-  assert.equal(body.files[0]?.chunks.length, 1);
+  assert.equal(
+    body.files[0]?.chunks.filter((c) => c.chunk_kind === "Symbol").length,
+    1,
+  );
 });
 
 test("sync_body_shape: body tem workspace/program/files/edges", () => {
-  const body = buildSyncBody([chunkEvent("src/a.rs", "a1")], IDENTITY);
+  const body = buildSyncBody([chunkEvent("src/a.rs", "a1")], IDENTITY, {
+    readFile: () => "x",
+  });
   assert.equal(body.workspace, "waweb");
   assert.equal(body.program, "default");
   assert.ok(Array.isArray(body.files));
@@ -131,7 +142,59 @@ test("fixture_real_events: agrupa os 2 arquivos do índice real", () => {
   }
 });
 
+// --- E3a-S3: FullFile sintético + removidos ---------------------------------
+
+test("fullfile_synthetic: arquivo sem FullFile do indexer ⇒ 1 FullFile inserido", () => {
+  const body = buildSyncBody([chunkEvent("src/a.rs", "a1")], IDENTITY, {
+    readFile: () => "fn a1() {}\n",
+  });
+  const a = body.files.find((f) => f.file_path === "src/a.rs");
+  assert.equal(a?.chunks.filter((c) => c.chunk_kind === "FullFile").length, 1);
+  assert.equal(a?.chunks[0]?.chunk_id, "full-src/a.rs");
+  assert.equal(a?.chunks[0]?.symbol_id, null);
+});
+
+test("no_dup_fullfile: indexer já emitiu FullFile ⇒ não duplica", () => {
+  const events: IndexerEvent[] = [
+    chunkEvent("src/a.rs", null), // FullFile (symbol null)
+    chunkEvent("src/a.rs", "a1"),
+  ];
+  const body = buildSyncBody(events, IDENTITY, { readFile: () => "x" });
+  const a = body.files.find((f) => f.file_path === "src/a.rs");
+  assert.equal(a?.chunks.filter((c) => c.chunk_kind === "FullFile").length, 1);
+});
+
+test("removed_chunks_empty: removido entra com chunks: []", () => {
+  const body = buildSyncBody([chunkEvent("src/a.rs", "a1")], IDENTITY, {
+    readFile: () => "x",
+    removed: ["src/gone.rs"],
+  });
+  const gone = body.files.find((f) => f.file_path === "src/gone.rs");
+  assert.ok(gone);
+  assert.deepEqual(gone?.chunks, []);
+});
+
+test("removed_skips_present: removido que ainda está no payload é ignorado", () => {
+  const body = buildSyncBody([chunkEvent("src/a.rs", "a1")], IDENTITY, {
+    readFile: () => "x",
+    removed: ["src/a.rs"],
+  });
+  assert.equal(body.files.filter((f) => f.chunks.length === 0).length, 0);
+});
+
+test("fullfile_unreadable: arquivo ilegível ⇒ FullFile com texto vazio", () => {
+  const body = buildSyncBody([chunkEvent("src/a.rs", "a1")], IDENTITY, {
+    readFile: () => {
+      throw new Error("EACCES");
+    },
+  });
+  const a = body.files.find((f) => f.file_path === "src/a.rs");
+  const full = a?.chunks.find((c) => c.chunk_kind === "FullFile");
+  assert.equal(full?.text, "");
+  assert.ok(full?.chunk_md5, "md5 do texto vazio existe");
+});
+
 test("build_body_handles_malformed_payload: payload null não lança", () => {
   const events: IndexerEvent[] = [{ event: "chunk_emitted", payload: null }];
-  assert.doesNotThrow(() => buildSyncBody(events, IDENTITY));
+  assert.doesNotThrow(() => buildSyncBody(events, IDENTITY, { readFile: () => "x" }));
 });

@@ -1,0 +1,111 @@
+/**
+ * `manifest.ts` — estado por workspace (E3a-S3).
+ *
+ * O contrato do memtier **não** auto-deleta arquivo ausente do payload (spike
+ * 010, A1): quem some do repo precisa ser enviado com `chunks: []`. O manifest
+ * guarda o conjunto de arquivos já sincronizados (para calcular os **removidos**)
+ * e o `last_git_head` (alimenta o `git_range` do incremental na S4).
+ *
+ * Arquivo por workspace: `.kilo/graph-manifest.json`. Escrita **atômica**
+ * (tmp+rename); corrompido ⇒ tratado como vazio (força full). É estado local —
+ * `.gitignore` cobre (padrão `.kilo/*` e `graph-manifest.json`).
+ *
+ * Módulo com I/O de arquivo, mas funções puras de estado (`removedFiles`,
+ * `mergeManifest`) testáveis isoladas; o leitor é injetável no teste.
+ */
+
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
+
+/** Estado persistido por workspace. */
+export interface Manifest {
+  workspace: string;
+  /** SHA do HEAD no último sync (base do incremental). `null` no 1º uso. */
+  last_git_head: string | null;
+  /** Arquivos sincronizados na última execução (para detectar removidos). */
+  files: string[];
+  /** ISO-8601 da última escrita. */
+  updated_at: string;
+}
+
+/** Manifest vazio (workspace sem estado — 1º uso ⇒ full). */
+export function emptyManifest(workspace: string): Manifest {
+  return { workspace, last_git_head: null, files: [], updated_at: "" };
+}
+
+/** Caminho default do manifest dentro do workspace. */
+export const MANIFEST_REL_PATH = ".kilo/graph-manifest.json";
+
+/**
+ * Carrega o manifest de `path`. Ausente/corrompido ⇒ manifest vazio (o chamador
+ * cai no full). `readFile` injetável (default `readFileSync` utf-8).
+ */
+export function loadManifest(
+  path: string,
+  workspace: string,
+  readFile: (p: string) => string = (p) => readFileSync(p, "utf-8") as string,
+): Manifest {
+  if (!path) return emptyManifest(workspace);
+  try {
+    const parsed = JSON.parse(readFile(path)) as Partial<Manifest>;
+    return {
+      workspace:
+        typeof parsed.workspace === "string" ? parsed.workspace : workspace,
+      last_git_head:
+        typeof parsed.last_git_head === "string" ? parsed.last_git_head : null,
+      files: Array.isArray(parsed.files)
+        ? parsed.files.filter((f): f is string => typeof f === "string")
+        : [],
+      updated_at: typeof parsed.updated_at === "string" ? parsed.updated_at : "",
+    };
+  } catch {
+    // Ausente/corrompido não é fatal: vazio força full (reindexa tudo).
+    return emptyManifest(workspace);
+  }
+}
+
+/**
+ * Grava o manifest com escrita atômica (tmp + rename): um crash no meio nunca
+ * deixa um JSON pela metade. `writeFile`/`rename` injetáveis para teste.
+ */
+export function saveManifest(
+  path: string,
+  manifest: Manifest,
+  io: {
+    writeFile?: (p: string, data: string) => void;
+    rename?: (from: string, to: string) => void;
+    exists?: (p: string) => boolean;
+  } = {},
+): void {
+  if (!path) return;
+  const write = io.writeFile ?? ((p, d) => writeFileSync(p, d, "utf-8"));
+  const rename = io.rename ?? renameSync;
+  const tmp = `${path}.tmp`;
+  const data = `${JSON.stringify(manifest, null, 2)}\n`;
+  write(tmp, data);
+  rename(tmp, path);
+}
+
+/** Removidos = estado anterior − arquivos do payload atual (preserva ordem). */
+export function removedFiles(manifest: Manifest, current: string[]): string[] {
+  const now = new Set(current);
+  return manifest.files.filter((f) => !now.has(f));
+}
+
+/** Novo estado a persistir após um sync (arquivos atuais + head opcional). */
+export function mergeManifest(
+  workspace: string,
+  current: string[],
+  head: string | null,
+): Manifest {
+  return {
+    workspace,
+    last_git_head: head,
+    files: [...new Set(current)],
+    updated_at: new Date().toISOString(),
+  };
+}
+
+/** `true` quando o manifest existe mas não tem arquivos (força full). */
+export function isFirstUse(manifest: Manifest): boolean {
+  return manifest.files.length === 0;
+}

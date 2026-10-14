@@ -1,17 +1,19 @@
 /**
- * `collector.ts` — eventos do indexer → body do `POST /v1/code/sync` (E3a-S1).
+ * `collector.ts` — eventos do indexer → body do `POST /v1/code/sync`.
  *
- * Fatia 1 (tracer): agrupa `chunk_emitted` por `file` em `files[]`. Mesma lógica
- * validada no probe (`montar_body`): `symbol_id` do indexer é o NOME PURO
- * (`protocol.md:105`) — usa-se CRU; uma linha não-JSON é ignorada (o parse
- * defensivo vive no `runner`, mas aqui também se valida o payload campo a campo).
+ * E3a-S1 (tracer): agrupa `chunk_emitted` por `file` em `files[]`; `symbol_id` do
+ * indexer é o NOME PURO (`protocol.md:105`) — usa-se CRU. E3a-S2: arestas
+ * resolvidas (orfã descartada). E3a-S3: `FullFile` sintético quando o indexer não
+ * o emite (necessário para as arestas de import em nível de arquivo, ADR-012 D3)
+ * e **removidos** (`chunks: []`).
  *
- * Módulo **puro** (sem I/O): recebe eventos, devolve estruturas. Endurecido nas
- * S2 (arestas), S3 (FullFile sintético/removidos) e S4 (paginação) — nunca rewrite.
- *
- * Minimal da fatia 1 (`TODO(tracer-bullet)`): `edges[]` sempre vazio (S2);
- * `removed` (`chunks: []`) e `FullFile` sintético ausentes (S3).
+ * Puro quanto a eventos → estruturas; o `readFile` (para o `FullFile` sintético)
+ * e os removidos entram por injeção — sem I/O de rede.
  */
+
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import type { CodeChunk, CodeEdge, CodeFile, IndexerEvent } from "../types.ts";
 import {
@@ -32,6 +34,19 @@ export interface SyncBody extends SyncIdentity {
   edges: CodeEdge[];
 }
 
+/** Leitor de arquivo injetável (default `readFileSync` utf-8). */
+export type ReadFileLike = (path: string) => string;
+
+/** Opções de `buildSyncBody` (S3+): leitor do `FullFile` e removidos. */
+export interface BuildBodyOptions {
+  /** Lê o texto do arquivo para o `FullFile` sintético. Default `readFileSync`. */
+  readFile?: ReadFileLike;
+  /** Arquivos removidos (estavam no manifest, sumiram) ⇒ `chunks: []`. */
+  removed?: string[];
+  /** Raiz do repo (para o `readFile` default resolver caminho relativo). */
+  repoRoot?: string;
+}
+
 const CHUNK_KINDS = new Set(["Symbol", "FullFile", "Contextual"]);
 
 /** Coerção estrita a número inteiro ≥0 (payload pode trazer `null`/string). */
@@ -50,6 +65,14 @@ function bareSymbol(raw: unknown): string | null {
   const bare = raw.split(":").pop() ?? "";
   return bare.trim() === "" ? null : bare;
 }
+
+/** Mapeia um kind não-`Symbol` para `FullFile`/`Contextual` (default `Symbol`). */
+function normalizeKind(raw: unknown): CodeChunk["chunk_kind"] {
+  return typeof raw === "string" && CHUNK_KINDS.has(raw)
+    ? (raw as CodeChunk["chunk_kind"])
+    : "Symbol";
+}
+
 
 /** Payload de `chunk_emitted` como objeto (ou `null` se malformado). */
 function chunkPayload(payload: unknown): Record<string, unknown> | null {
@@ -84,8 +107,7 @@ export function toChunk(payload: Record<string, unknown>): CodeChunk | null {
   if (typeof md5 !== "string" || md5.trim() === "") return null;
 
   const rawKind = payload.chunk_kind;
-  const chunkKind =
-    typeof rawKind === "string" && CHUNK_KINDS.has(rawKind) ? rawKind : "Symbol";
+  const chunkKind = normalizeKind(rawKind);
 
   // O indexer emite `symbol_id` como nome puro; `bareSymbol` faz o rsplit de
   // segurança contra uma versão que volte a qualificar com o caminho.
@@ -134,16 +156,84 @@ export function collectFiles(events: IndexerEvent[]): CodeFile[] {
 }
 
 /**
- * Eventos → body do sync. S2 inclui `edges[]` (resolvidas); removidos/FullFile
- * sintético ficam para a S3.
+ * `true` se há um `FullFile`/`Contextual` no arquivo (≤1 por arquivo; identidade
+ * `file:chunk_kind` — ADR-002). O indexer emite só `Symbol`; o `FullFile` é
+ * sintetizado por `ensureFullFile`.
+ */
+function hasFileChunk(entry: CodeFile): boolean {
+  return entry.chunks.some((c) => c.chunk_kind !== "Symbol");
+}
+
+/** md5 hex (mesmo algoritmo do probe: `hashlib.md5(texto.encode())`). */
+function md5Hex(text: string): string {
+  return createHash("md5").update(text, "utf-8").digest("hex");
+}
+
+/**
+ * Insere o `FullFile` sintético quando o indexer não o emitiu (o probe o
+ * materializa — `probe_e2e_lifecycle.py:205`). Necessário porque `import_edge`
+ * em nível de arquivo resolve para `{file}:FullFile` (ADR-012 D3). Se o arquivo
+ * não puder ser lido, usa texto vazio (o `FullFile` ainda existe como nó).
+ */
+function ensureFullFile(
+  entry: CodeFile,
+  repoRoot: string,
+  read: ReadFileLike,
+): CodeFile {
+  if (hasFileChunk(entry)) return entry;
+  const abs = repoRoot ? join(repoRoot, entry.file_path) : entry.file_path;
+  let text = "";
+  try {
+    text = read(abs);
+  } catch {
+    text = "";
+  }
+  const full: CodeChunk = {
+    chunk_id: `full-${entry.file_path}`,
+    chunk_kind: "FullFile",
+    symbol_id: null,
+    start_line: 1,
+    end_line: Math.max(1, text.split("\n").length),
+    chunk_md5: md5Hex(text),
+    text,
+  };
+  return { ...entry, chunks: [full, ...entry.chunks] };
+}
+
+/** Arquivo removido (estava no manifest, sumiu) ⇒ `chunks: []` (FR-504). */
+function removedFile(path: string): CodeFile {
+  return { file_path: path, language: "rust", chunks: [] };
+}
+
+/**
+ * Eventos → body do sync. S3: inclui `edges[]` resolvidas, `FullFile` sintético
+ * quando ausente (habilitando as arestas de import) e os `removed` (`chunks: []`).
  */
 export function buildSyncBody(
   events: IndexerEvent[],
   identity: SyncIdentity,
+  opts: BuildBodyOptions = {},
 ): SyncBody {
-  const files = collectFiles(events);
+  const repoRoot = opts.repoRoot ?? "";
+  const read =
+    opts.readFile ??
+    ((p: string) => {
+      try {
+        return readFileSync(p, "utf-8") as string;
+      } catch {
+        return "";
+      }
+    });
+
+  const files = collectFiles(events).map((f) => ensureFullFile(f, repoRoot, read));
+
+  // Removidos: não estão no payload atual ⇒ entram com `chunks: []`. O servidor
+  // não auto-deleta arquivo ausente (spike 010, A1).
+  const present = new Set(files.map((f) => f.file_path));
+  const removed = (opts.removed ?? []).filter((p) => !present.has(p));
+  for (const path of removed) files.push(removedFile(path));
+
   const { imports, calls } = collectEdges(events);
-  // TODO(tracer-bullet): removidos + FullFile sintético (S3).
   return {
     workspace: identity.workspace,
     program: identity.program,

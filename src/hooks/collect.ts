@@ -17,7 +17,16 @@ import {
 } from "../client.ts";
 import { debug, log, logFatal } from "../logger.ts";
 import { buildSyncBody } from "../index/collector.ts";
+import {
+  emptyManifest,
+  loadManifest,
+  MANIFEST_REL_PATH,
+  mergeManifest,
+  removedFiles,
+  saveManifest,
+} from "../index/manifest.ts";
 import { runIndexer } from "../index/runner.ts";
+import { join } from "node:path";
 import type { SyncResult } from "../types.ts";
 
 /** Config do coletor (subconjunto de `code_index.*`). */
@@ -35,6 +44,17 @@ export interface CollectRuntime {
   client: Pick<MemtierClient, "syncCode">;
   /** Runner injetável (default `runIndexer`); stubado em teste. */
   run?: typeof runIndexer;
+  /**
+   * Estado por workspace (manifest). Injetável para teste; default é o manifest
+   * real em `<repo>/.kilo/graph-manifest.json`.
+   */
+  state?: CollectState;
+}
+
+/** Porta de estado do coletor (manifest) — implementada por `index/manifest.ts`. */
+export interface CollectState {
+  load(): { files: string[] };
+  save(files: string[], head: string | null): void;
 }
 
 /** Classifica a falha do sync para o log correto (nunca propaga). */
@@ -68,10 +88,32 @@ function logCollection(
   log(`collect indexer_ms=${indexerMs} files=${files} edges=${edges}${stats}`);
 }
 
+/** Estado real do coletor: manifest em `<repo>/.kilo/graph-manifest.json`. */
+function fileState(repoRoot: string, workspace: string): CollectState {
+  const path = join(repoRoot, MANIFEST_REL_PATH);
+  return {
+    load: () => {
+      const manifest = loadManifest(path, workspace);
+      return { files: manifest.files };
+    },
+    save: (files, head) => {
+      try {
+        saveManifest(path, mergeManifest(workspace, files, head));
+      } catch (err) {
+        // Manifest é otimização/estado local: falha de escrita não é fatal (o
+        // próximo sync reindexa tudo por falta do estado).
+        debug(
+          `collect: manifest não gravado (${err instanceof Error ? err.message : err})`,
+        );
+      }
+    },
+  };
+}
+
 /**
- * Coleta completa: spawna o indexer, monta o body e chama `/v1/code/sync`.
- * **Nunca lança** — degrada em qualquer falha (FR-510/E5). Devolve o
- * `SyncResult` quando houve sync (para o E2E provar o efeito do outro lado).
+ * Coleta completa: spawna o indexer, monta o body (com removidos do manifest) e
+ * chama `/v1/code/sync`. **Nunca lança** — degrada em qualquer falha (FR-510/E5).
+ * Devolve o `SyncResult` quando houve sync (para o E2E provar o efeito real).
  */
 export async function collectCode(rt: CollectRuntime): Promise<SyncResult | null> {
   if (!rt.cfg.enabled) {
@@ -79,6 +121,7 @@ export async function collectCode(rt: CollectRuntime): Promise<SyncResult | null
     return null;
   }
   const run = rt.run ?? runIndexer;
+  const state = rt.state ?? fileState(rt.repoRoot, rt.identity.workspace);
   const start = Date.now();
 
   let result;
@@ -99,7 +142,17 @@ export async function collectCode(rt: CollectRuntime): Promise<SyncResult | null
     return null;
   }
 
-  const body = buildSyncBody(result.events, rt.identity);
+  const manifest = state.load();
+  const present = collectPresent(result.events);
+  const removed = removedFiles(
+    { ...emptyManifest(rt.identity.workspace), files: manifest.files },
+    present,
+  );
+
+  const body = buildSyncBody(result.events, rt.identity, {
+    repoRoot: rt.repoRoot,
+    removed,
+  });
   if (body.files.length === 0) {
     debug("collect: nenhum chunk emitido; nada a sincronizar");
     logCollection(indexerMs, 0, 0);
@@ -109,12 +162,25 @@ export async function collectCode(rt: CollectRuntime): Promise<SyncResult | null
   try {
     const sync = await rt.client.syncCode(body.files, body.edges);
     logCollection(indexerMs, body.files.length, body.edges.length, sync);
+    // Estado pós-sync: os arquivos ATUAIS (sem os removidos). O head entra na S4.
+    state.save(present, null);
     return sync;
   } catch (err) {
-    // TODO(tracer-bullet): fallback 422 sem arestas (S4) — na S1 não há arestas.
+    // TODO(tracer-bullet): fallback 422 sem arestas (S4).
     logSyncFailure(err);
     return null;
   }
+}
+
+/** Arquivos com `chunk_emitted` no stream (para o diff de removidos). */
+function collectPresent(events: import("../types.ts").IndexerEvent[]): string[] {
+  const seen = new Set<string>();
+  for (const ev of events) {
+    if (ev.event !== "chunk_emitted") continue;
+    const p = ev.payload as { file?: unknown } | null;
+    if (p && typeof p.file === "string" && p.file) seen.add(p.file);
+  }
+  return [...seen];
 }
 
 /**
