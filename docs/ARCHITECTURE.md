@@ -355,7 +355,8 @@ Nada hardcoded no script (FR-303). **JSON** + env vars, precedência:
   },
   "code_index": {                         // E3a — o coletor
     "enabled": false,                     // ativado por flag, como hoje
-    "indexer_bin": ""                     // caminho do rust_indexer (FR-306)
+    "indexer_bin": "",                    // caminho do rust_indexer (FR-306)
+    "sync_timeout_ms": 120000             // KILOCODE_GRAPH_INDEX_SYNC_TIMEOUT_MS
   },
   "mcp": {                                // E3b — registro do MCP do memtier
     "enabled": true,
@@ -368,16 +369,16 @@ Nada hardcoded no script (FR-303). **JSON** + env vars, precedência:
 > **Envs** (todas `KILOCODE_GRAPH_*`): `URL`, `TOKEN`, `TOKEN_FILE`, `PROGRAM`,
 > `INJECT_ENABLED`, `INJECT_MAX_MEMORIES`, `INJECT_MAX_CHARS`,
 > `INJECT_MAX_TOKENS`, `INJECT_TIMEOUT_MS`, `INDEX_ENABLED`, `INDEXER_BIN`,
-> `MCP_ENABLED`, `MCP_NAME`, `DEBUG`. O prefixo da env de config é
-> `KILOCODE_GRAPH_` (o `openviking` do antecessor mudou).
+> `INDEX_SYNC_TIMEOUT_MS`, `MCP_ENABLED`, `MCP_NAME`, `DEBUG`. O prefixo da env
+> de config é `KILOCODE_GRAPH_` (o `openviking` do antecessor mudou).
 
 > **Defaults desligados** para indexação e injeção — é a preferência registrada
 > do dono no plugin atual.
 >
 > **Escopo das chaves:** este bloco lista a config fixada pela **E1** (a tabela
-> de chaves da `specs/e1-stories.md` §2). Chaves de segunda onda — `ingest.*`
-> (E4) e `code_index.trigger`/`manifest_path` (E3a-S4) — entram quando suas
-> epics forem especificadas; declarar antes seria contrato fantasma.
+> de chaves da `specs/e1-stories.md` §2) mais `code_index.sync_timeout_ms`
+> (E3a-S4). Chaves de segunda onda — `ingest.*` (E4) — entram quando suas epics
+> forem especificadas; declarar antes seria contrato fantasma.
 
 
 ## 7. Adaptadores multi-CLI

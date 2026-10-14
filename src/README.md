@@ -1,9 +1,10 @@
 # kilocode-graph-plugin — src
 
-Estado: **E1 (fundação) e E2 (injeção de memória) implementadas**; E3a/E3b e
-segunda onda ainda são forma e contratos. O mapa abaixo é o alvo; o que existe
-hoje em `src/` é `index.ts`, `config.ts`, `client.ts`, `workspace.ts`,
-`logger.ts`, `types.ts`, `hooks/messages.ts` e `inject/{memory,budget}.ts`.
+Estado: **E1 (fundação), E2 (injeção de memória) e E3a (coletor de código)
+implementadas**; E3b e a segunda onda ainda são forma e contratos. O mapa abaixo
+é o alvo; o que existe hoje em `src/` é `index.ts`, `config.ts`, `client.ts`,
+`workspace.ts`, `logger.ts`, `types.ts`, `hooks/{messages,collect}.ts`,
+`inject/{memory,budget}.ts` e `index/{runner,collector,edges,manifest,trigger}.ts`.
 
 ```
 src/
@@ -34,49 +35,36 @@ src/
 
 ## Assinaturas esperadas
 
-### `client.ts` (E1 + `recall` da E2 — implementado)
+### `client.ts` (E1 + `recall` da E2 + `syncCode` da E3a — implementado)
 ```ts
 class MemtierClient {
   recall(query: string, opts?: { limit?; maxTokens?; signal? }): Promise<RecallResult>
+  syncCode(files, edges?, signal?): Promise<SyncResult>  // pagina ≤100 arquivos, ≤5000 arestas
   health(signal?): Promise<HealthReport>   // nunca lança (NFR-03)
-  // searchCode/syncCode/ingest entram com E3a/E4.
+  // searchCode/ingest entram com E3c/E4.
 }
 // identidade (`workspace`/`program`) vem do construtor; `max_tokens` é o
 // orçamento A1 no servidor. Erros HTTP viram tipos (AuthError 401/403,
-// InfraError 503) — o hook degrada, não propaga.
+// InfraError 503) — o hook degrada, não propaga. `syncCode` faz fallback 422
+// (reenvia sem arestas) e usa `sync_timeout_ms` (default 120000).
 ```
 
-### `index/runner.ts` — spawn do indexer
+### `index/` (E3a — implementado)
 ```ts
-interface IndexerRunner {
-  run(mode: "full" | "incremental", opts?: { gitRange?: string }): AsyncIterable<IndexerEvent>
-  // consome stdout linha a linha; trata `pause` → `resume` (backpressure two-way)
-}
+runIndexer(opts): Promise<{ events; skipped; reason? }>  // spawn + JSONL + ack/resume
+buildSyncBody(events, identity, opts?): { workspace, program, files, edges }
+resolveEdges(imports, calls, files): CodeEdge[]           // alvo E origem existem, senão descarta
+loadManifest/saveManifest/removedFiles/mergeManifest      // estado por workspace (atômico)
+decideTrigger(manifest): { mode, gitRange? }              // full no 1º uso; incremental depois
+// FullFile sintético quando o indexer só emitiu Symbol (habilita import_edge).
+// Removidos (`chunks: []`) só no FULL (o incremental só traz os alterados).
 ```
 
-### `index/collector.ts` — eventos → body do sync
+### `hooks/collect.ts` (E3a — implementado)
 ```ts
-function buildSyncBody(
-  events: IndexerEvent[], repoRoot: string, ws: string, manifest: Manifest
-): { files: CodeFile[]; edges: CodeEdge[]; removed: string[] }
-// agrupa chunk_emitted por `file`; ≤1 FullFile/Contextual por arquivo;
-// `removed` (no manifest e ausentes agora) viram `chunks: []` (FR-504)
-```
-
-### `index/edges.ts` — resolução de arestas
-```ts
-function resolveEdges(imports: ImportEdge[], calls: CallEdge[], files: CodeFile[]): CodeEdge[]
-// import_edge/call_edge → {from_file, to_file, edge_kind, from_symbol_id?, to_symbol_id?}
-// alvo ausente como CodeChunk → DESCARTA (senão o sync responde 422; ADR-012 D3)
-// `symbol_id` do indexer é o NOME puro; a chave é `{file}:{symbol}` (não reconcatena file)
-```
-
-### `index/trigger.ts` — híbrido
-```ts
-function decideTrigger(ws: string, manifest: Manifest): "full" | "incremental"
-// 1º uso do workspace → full (index_path); depois → incremental (incremental_index)
-// ⚠️ o indexer NÃO tem watch mode: a detecção de mudança é do plugin (git_range);
-//    mudanças não-commitadas ficam fora do MVP.
+collectHook(rt): { boot: Promise<void> }   // dispara no boot, fora do turno (FR-510)
+// nunca lança; degrada em indexer/sync fora do ar. Log de observabilidade:
+// `collect indexer_ms=… files=… edges=… removed=… sync={…}`.
 ```
 
 ### `mcp/register.ts` — registro do MCP remoto

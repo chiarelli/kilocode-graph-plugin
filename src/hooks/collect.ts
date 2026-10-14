@@ -80,13 +80,17 @@ function logCollection(
   indexerMs: number,
   files: number,
   edges: number,
+  removed: number,
   sync?: SyncResult,
 ): void {
   const stats = sync
     ? ` sync={upserted:${sync.upserted},deleted:${sync.deleted},` +
       `changed:${sync.changed},skipped:${sync.skipped}}`
     : " sync=skipped";
-  log(`collect indexer_ms=${indexerMs} files=${files} edges=${edges}${stats}`);
+  log(
+    `collect indexer_ms=${indexerMs} files=${files} edges=${edges} ` +
+      `removed=${removed}${stats}`,
+  );
 }
 
 /** Estado real do coletor: manifest em `<repo>/.kilo/graph-manifest.json`. */
@@ -157,7 +161,7 @@ export async function collectCode(rt: CollectRuntime): Promise<SyncResult | null
   const indexerMs = Date.now() - start;
 
   if (result.skipped) {
-    logCollection(indexerMs, 0, 0);
+    logCollection(indexerMs, 0, 0, 0);
     return null;
   }
 
@@ -179,13 +183,13 @@ export async function collectCode(rt: CollectRuntime): Promise<SyncResult | null
   });
   if (body.files.length === 0 && removed.length === 0) {
     debug("collect: nenhum chunk emitido; nada a sincronizar");
-    logCollection(indexerMs, 0, 0);
+    logCollection(indexerMs, 0, 0, 0);
     return null;
   }
 
   try {
     const sync = await rt.client.syncCode(body.files, body.edges);
-    logCollection(indexerMs, body.files.length, body.edges.length, sync);
+    logCollection(indexerMs, body.files.length, body.edges.length, removed.length, sync);
     // Estado pós-sync: arquivos ATUAIS (sem removidos) + HEAD atual. No
     // incremental, `present` só traz os alterados; mescla com os que já
     // estavam no manifest para não perder os inalterados.

@@ -59,7 +59,7 @@ Convenções válidas para todas as epics:
 - [x] **E3a-S2** — Arestas: `import_edge`/`call_edge` → `edges[]` (resolver alvo; descartar órfã)
 - [x] **E3a-S3** — Ciclo de vida: manifest por workspace → removidos com `chunks: []`; idempotência por `chunk_md5`
 - [x] **E3a-S4** — Trigger híbrido + backpressure (`pause`/`resume`) + paginação do sync
-- [ ] **E3a-S5** — Fechamento: E2E do ciclo de vida real, docs, zero marcadores
+- [x] **E3a-S5** — Fechamento: E2E do ciclo de vida real, docs, zero marcadores
 
 ### E3b — Registro do MCP do memtier
 - [ ] **E3b-S1** — Tracer bullet: registrar o MCP remoto no boot (`status`→`add`→`connect`)
@@ -296,7 +296,37 @@ redescobertas no meio do loop.
      de NFR-01 (≤4s) e coerente com NFR-02 (~0,85s, folga).
   5. `rg "TODO\(tracer-bullet\)" src/` → **zero**. Unit 62 verdes, 4 E2E gated
      (skip). `tsc --noEmit` limpo.
-  - Pendência #4 do BACKLOG (bearer do E2E da E2) **resolvida**: existe
-    `.kilo/graph-key.json` no workspace (bearer show-once, workspace
-    `kilocode-graph-plugin`/`graphplugin`); para um workspace **com fatos** o E2E
-    usa `E2E_TOKEN`/`E2E_WS` (o token legado `e2e-tok-a`→`alfa` tem fatos reais).
+   - Pendência #4 do BACKLOG (bearer do E2E da E2) **resolvida**: existe
+     `.kilo/graph-key.json` no workspace (bearer show-once, workspace
+     `kilocode-graph-plugin`/`graphplugin`); para um workspace **com fatos** o E2E
+     usa `E2E_TOKEN`/`E2E_WS` (o token legado `e2e-tok-a`→`alfa` tem fatos reais).
+
+- **2026-10-14 — E3a fechada (S1–S5):** coletor de código entregue sobre a base
+  tracer-bullet (S1 → S2 → S3 → S4 → S5, sem rewrite). Entrega:
+  1. `src/index/{runner,collector,edges,manifest,trigger}.ts` + `hooks/collect.ts`;
+     `client.syncCode` (paginação ≤100 arquivos / ≤5000 arestas, fallback 422).
+  2. Prova real da cadeia (stack viva, sem mock de infra):
+     `tests/e2e/test_e2e_collector.test.ts` (indexer→sync→search→neighbors;
+     OUT/IN call navegam) e `tests/e2e/test_e2e_lifecycle.test.ts`
+     (cresce/encolhe/deleta/idempotência). Ambos gated `E2E=1`; 6 E2E verdes com
+     `E2E_TOKEN=e2e-tok-a E2E_CODE_TOKEN=e2e-tok-b`.
+  3. **Defeitos medidos e corrigidos** no endurecimento real:
+     - import_edge é nível de arquivo ⇒ origem `{file}:FullFile` precisa existir
+       (ADR-012 D3); sem o `FullFile` sintético o lote inteiro tomava 422. O
+       `resolveEdges` descarta a aresta até o nó existir (nunca 422).
+     - `saveManifest` não criava `.kilo/` ⇒ escrita falhava em silêncio e o
+       manifest nunca persistia (full eterno).
+     - no incremental, `present` só traz os alterados; usá-lo para o diff de
+       removidos apagaria o grafo. Removidos só são calculados no FULL.
+     - `timeout_ms=2000` estourava o sync de 100 arquivos (embedding lento) ⇒
+       `code_index.sync_timeout_ms` (default 120000).
+  4. Coleta nunca no turno (FR-510), verificado: boot retornou em **41ms** e a
+     coleta de 50 arquivos terminou **12,7s depois** (`collect indexer_ms=62
+     files=50 sync={upserted:100…}`).
+  5. `rg "TODO\(tracer-bullet\)" src/` → **zero**. Unit 138 verdes, 6 E2E gated
+     (skip sem `E2E=1`). `tsc --noEmit` limpo.
+  6. Pendências de contrato do BACKLOG: **#2 (teto de arestas) resolvida** na
+     S4 (fatia as arestas em ≤5.000/request); **#1 (repo esvaziado)** permanece —
+     `CodeSyncBody.files` tem `min_length=1`, então "todos os removidos" não é
+     representável; o caso coberto é a remoção individual (`chunks: []`), que a
+     S3 prova.

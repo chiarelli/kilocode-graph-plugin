@@ -101,9 +101,9 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
       },
       client,
     }),
-    // Sem outros hooks de conteúdo na primeira fatia (ingestão/coleta/MCP são
-    // E4/E3a/E3b). `dispose` drena o trabalho em voo (o health do boot) antes
-    // de sair; o health tem timeout, então nunca pendura (`AbortSignal.timeout`).
+    // `dispose` drena o health do boot (curto, com `AbortSignal.timeout`). A
+    // coleta (E3a) é background e NÃO é drenada — o job do indexer pode ser
+    // longo (FR-510). MCP (E3b) e ingestão (E4) entram nas suas epics.
     dispose: async () => {
       debug("dispose");
       // A coleta é background (FR-510): o dispose não a espera — drenar o job
