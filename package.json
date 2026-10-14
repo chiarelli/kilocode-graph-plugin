@@ -19,7 +19,9 @@
     "@kilocode/plugin": "*"
   },
   "notes": [
-    "O plugin NÃO carrega o graphiti nem o FalkorDB — fala HTTP com o graphiti-daemon.",
+    "O plugin NÃO carrega o graphiti nem o FalkorDB — fala HTTP com o memtier.",
+    "O plugin é o COLETOR de código: spawna o binário do rust-ast-indexer (caminho configurável) e chama /v1/code/sync. Não reimplementa parsing (ADR-005).",
+    "O plugin registra o MCP remoto do memtier no Kilo; o modelo chama as tools (ADR-006).",
     "Nada hardcoded: config vem de plugin.yaml + env vars (PRD FR-303).",
     "O timeout do hook de injeção é 4000ms; recall medido = 0,85s (REPORT Q14)."
   ]
