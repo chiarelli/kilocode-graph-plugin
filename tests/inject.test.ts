@@ -417,14 +417,42 @@ test("D-3: fato com quebra de linha/tag não escapa da sentinela", () => {
   assert.match(block, /&lt;\/context&gt;/);
 });
 
-test("D-4: timeout NÃO-positivo = sem teto (não aborta de imediato)", async () => {
-  const client = new MemtierClient({
+test("D-4: timeout NÃO-positivo = sem teto (não aborta no primeiro tick)", async () => {
+  // Medido: `AbortSignal.timeout(0)` NÃO nasce abortado (`.aborted === false`).
+  // O timer de 0ms dispara no PRÓXIMO tick — então o defeito só aparece quando o
+  // fetch demora mais que isso. O stub espera 10ms de propósito: é a janela em
+  // que um `timeout(0)` dispara e mata a chamada.
+  const fetchStub: FetchLike = async (_input, init) => {
+    await new Promise<void>((resolve, reject) => {
+      const t = setTimeout(resolve, 10);
+      init?.signal?.addEventListener("abort", () => {
+        clearTimeout(t);
+        reject(new DOMException("aborted", "AbortError"));
+      });
+    });
+    return new Response(
+      JSON.stringify({ status: "ok", falkordb: "ok", indices: "ready" }),
+      { status: 200 },
+    );
+  };
+
+  // `health()` usa `healthTimeoutMs` — é ESTE o timeout a zerar.
+  const semTeto = new MemtierClient({
     url: "http://memtier:8400",
     workspace: "ws",
-    timeout_ms: 0,
-    // Se o defeito voltar, `AbortSignal.timeout(0)` nasce abortado e a promise
-    // é rejeitada ANTES do fetch resolver.
-    fetch: async () => new Response(JSON.stringify({ facts: [] }), { status: 200 }),
+    health_timeout_ms: 0,
+    fetch: fetchStub,
   });
-  await assert.doesNotReject(() => client.health());
+  // `health()` não rejeita: engole o erro de transporte e devolve `ok:false`.
+  // Com o defeito, o timer de 0ms aborta o fetch ⇒ `ok:false`.
+  assert.equal((await semTeto.health()).ok, true);
+
+  // Controle: teto positivo (600ms) não aborta uma espera de 10ms.
+  const comTeto = new MemtierClient({
+    url: "http://memtier:8400",
+    workspace: "ws",
+    health_timeout_ms: 600,
+    fetch: fetchStub,
+  });
+  assert.equal((await comTeto.health()).ok, true);
 });

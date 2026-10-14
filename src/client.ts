@@ -259,10 +259,12 @@ export class MemtierClient {
     timeoutMs: number,
     signal?: AbortSignal,
   ): Promise<Response> {
-    // `AbortSignal.timeout(0)` nasce JÁ abortado (medido): timeout ausente, `0`
-    // ou negativo significa "sem teto" (o contrato dos defaults via
-    // `?? DEFAULT_*`), não "aborta imediatamente". O guard fica aqui para cobrir
-    // todas as rotas de uma vez, em vez de confiar que cada story mandou > 0.
+    // Medido: `AbortSignal.timeout(0)` não nasce abortado, mas o timer de 0ms
+    // dispara no PRÓXIMO tick — mata qualquer I/O real. Timeout ausente, `0` ou
+    // negativo significa "sem teto" (o contrato dos defaults via
+    // `?? DEFAULT_*`), não "aborta no primeiro tick". O guard fica aqui para
+    // cobrir todas as rotas de uma vez, em vez de confiar que cada story mandou
+    // um valor > 0.
     const timeout = timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : undefined;
     const sig = timeout
       ? signal
