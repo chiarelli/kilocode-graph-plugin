@@ -1,9 +1,18 @@
 # ARCHITECTURE — kilocode-graph-plugin (draft)
 
-**Versão:** 0.1 (draft)
+**Versão:** 0.2 (draft)
 **Base empírica:** `~/spikes/007-graphiti-memory-migration/REPORT.md`
 **PRD:** [`PRD.md`](PRD.md)
-**Dependência:** [`../../graphiti-daemon/`](../../graphiti-daemon/)
+**Dependências:**
+- [`../../graphiti-daemon/`](../../graphiti-daemon/) — **memtier** (E1–E7/E11 + A1/A2/E12 implementados)
+- [`../../rust-ast-indexer/`](../../rust-ast-indexer/) — **dependência de runtime do cliente** (binário externo)
+
+> **Delta 0.2 (2026-10-14).** O PRD 0.1 dizia "indexar é do `rust-ast-indexer`".
+> O delta 0.2 corrige: o indexer **extrai**, o memtier **armazena/busca**, e o
+> **plugin é o coletor** — executa o indexer, agrupa `chunk_emitted` por arquivo,
+> resolve arestas e chama `/v1/code/sync`. Também alinha o contrato com o estado
+> real do memtier (`sync`, `neighbors`, `program`, `max_tokens`, `/v1/mcp`).
+> Ver ADR-005 (coletor) e ADR-006 (push vs pull).
 
 ---
 
@@ -15,18 +24,40 @@
 │                                                               │
 │  chat.message ──────────▶ captura o texto do usuário          │
 │                              │                                │
-│  experimental.chat.messages.transform ◀── INJEÇÃO             │
+│  experimental.chat.messages.transform ◀── INJEÇÃO (push)      │
 │                              │                                │
 │  experimental.chat.system.transform  ◀── contexto de sistema  │
 │  experimental.session.compacting     ◀── preserva memória     │
+│                                                               │
+│  ┌─────────────────────────────────────────────────────────┐ │
+│  │ PLUGIN = núcleo + coletor + registro MCP                │ │
+│  │                                                          │ │
+│  │  src/index/  ──spawn──▶ rust_indexer (binário externo)   │ │
+│  │      │  JSONL chunk_emitted / import_edge / call_edge    │ │
+│  │      └─ agrupa por arquivo, resolve arestas, manifest    │ │
+│  │                                                          │ │
+│  │  src/mcp/  ──registra──▶ MCP remoto do memtier (/v1/mcp) │ │
+│  │                          (o MODELO chama as tools — pull)│ │
+│  └─────────────────────────────────────────────────────────┘ │
 └───────────────┬───────────────────────────────────────────────┘
-                │  HTTP + token
+                │  HTTP + token (e MCP sobre a borda)
                 ▼
 ┌──────────────────────────────────────────────────────────────┐
-│  GRAPHITI DAEMON                                              │
-│  recall (síncrono)  ·  ingest (fila)  ·  code/search          │
+│  MEMTIER                                                      │
+│  recall (síncrono) · ingest (fila) · code/search · code/sync  │
+│  code/neighbors (HTTP — ainda SEM tool MCP)                   │
 └──────────────────────────────────────────────────────────────┘
 ```
+
+### Dois modos de consumo (ver ADR-006)
+
+| Modo | Direção | O que | Quando |
+|---|---|---|---|
+| **Push** | plugin → turno | memória + `code/search` injetados | automático, todo turno |
+| **Pull** | modelo → MCP | `recall`/`ingest`/`code_search`/`code_sync` | sob demanda do agente |
+
+O RAG automático (valor central) é **push**. As ferramentas MCP são **pull** — o
+modelo decide. Não se injeta o mesmo que já se oferece como tool.
 
 ### Princípio central
 
@@ -41,27 +72,34 @@ Orçamento do hook (medido, não suposto):
 | recall de memória | 0,62–2,08s (mediana 0,85s) | 4000ms |
 | busca de código | ~0,25–0,44s | idem (compartilhado) |
 
-## 2. Contrato com o daemon
+## 2. Contrato com o memtier
 
-O plugin **não** conhece FalkorDB nem graphiti. Ele só fala HTTP.
+O plugin **não** conhece FalkorDB nem graphiti. Ele só fala HTTP (e registra o
+MCP). Todas as rotas de dados aceitam `program` (aditivo, default `"default"` —
+E11) além de `workspace`.
 
 ### `POST /v1/recall`
 
 ```json
 // request
-{ "workspace": "waweb", "query": "<texto do usuário>", "depth": 1, "limit": 10 }
+{ "workspace": "waweb", "program": "default", "query": "<texto do usuário>",
+  "depth": 1, "limit": 10, "max_tokens": 2000 }
 
 // response
 { "facts": [ { "fact": "...", "valid_at": "...", "invalid_at": null,
-               "score": 0.83, "source": "memory" } ] }
+               "score": 0.83, "source": "memory" } ],
+  "tokens_estimated": 1850, "truncated": false }
 ```
+
+> `max_tokens` (A1) é opcional: sem ele o payload é o legado exato. O corte é por
+> **fato inteiro**, sem reordenar o ranking. Estouro do teto interno (16k) → 422.
 
 ### `POST /v1/code/search`
 
 ```json
 // request
-{ "workspace": "waweb", "query": "...", "limit": 5,
-  "labels": ["CodeSymbol", "CodeFullFile"] }
+{ "workspace": "waweb", "program": "default", "query": "...", "limit": 5,
+  "labels": ["CodeSymbol", "CodeFullFile"], "max_tokens": 2000 }
 
 // response
 { "chunks": [ { "path": "internal/billing/store.go", "symbol": "SaveInvoice",
@@ -69,15 +107,65 @@ O plugin **não** conhece FalkorDB nem graphiti. Ele só fala HTTP.
                 "score": 0.79, "match": "hybrid" } ] }
 ```
 
+`labels=None` → `["CodeChunk"]` (default). `match ∈ vector|fulltext|hybrid`.
+Escrita só existe via `/v1/code/sync` (abaixo) — a busca é read-only.
+
+### `POST /v1/code/sync` — **o destino do coletor**
+
+```json
+// request
+{ "workspace": "waweb", "program": "default",
+  "files": [ { "file_path": "internal/billing/store.go", "language": "go",
+               "chunks": [ { "chunk_id": "...", "chunk_kind": "Symbol",
+                             "symbol_id": "SaveInvoice", "start_line": 42,
+                             "end_line": 55, "chunk_md5": "...", "text": "..." } ] } ],
+  "edges": [ { "from_file": "internal/billing/store.go",
+               "to_file": "internal/db/db.go", "edge_kind": "call",
+               "from_symbol_id": "SaveInvoice", "to_symbol_id": "Insert" } ] }
+
+// response — 202
+{ "workspace": "waweb", "upserted": 9, "deleted": 0, "changed": 9, "skipped": 0,
+  "edges_upserted": 5, "edges_deleted": 0,
+  "results": [ { "file_path": "...", "upserted": 9, "deleted": 0,
+                 "changed": 9, "skipped": 0 } ] }
+```
+
+Regras do contrato (memtier ARCH §2):
+- **Arquivo removido = `chunks: []`** — o servidor **não** auto-deleta arquivo
+  ausente do payload (spike 010, A1). O coletor mantém um **manifest**.
+- ≤1 `FullFile`/`Contextual` por arquivo; `Symbol` exige `symbol_id`,
+  `FullFile`/`Contextual` o proíbem.
+- **Aresta cujo alvo não existe como `CodeChunk` → 422** (ADR-012 D3). Resolver
+  antes de enviar.
+- Limites: ≤100 arquivos/request, ≤5.000 chunks/arquivo, `text` ≤100KB.
+- `changed`/`skipped` (A2) são aditivos; `upserted + skipped == total` quando o
+  sync grava todos os chunks do payload.
+
+### `POST /v1/code/neighbors` — **HTTP-only (bloqueio MCP)**
+
+```json
+// request
+{ "workspace": "waweb", "program": "default", "uuid": "<chunk uuid>",
+  "direction": "out|in|both", "edge_kind": "import|call|all", "depth": 1, "limit": 20 }
+
+// response
+{ "neighbors": [ { "file_path": "...", "symbol": "...", "edge": { "kind": "call" } } ],
+  "total_neighbors": 2, "truncated": false }
+```
+
+> ⚠️ **Bloqueio:** esta rota **não tem tool MCP** no memtier (só `recall`,
+> `ingest`, `code_search`, `code_sync` são expostas). O plugin **não** promete
+> navegação por vizinhos até o memtier expor a tool. `depth>1` → 422.
+
 ### `POST /v1/ingest`
 
 ```json
 // request
-{ "workspace": "waweb", "session_id": "ses_...", "messages": [...],
-  "reference_time": "2026-10-06T12:00:00Z" }
+{ "workspace": "waweb", "program": "default", "session_id": "ses_...",
+  "messages": [...], "reference_time": "2026-10-06T12:00:00Z" }
 
 // response — 202, imediato
-{ "job_id": "...", "status": "queued" }
+{ "job_id": "...", "workspace": "waweb", "status": "queued" }
 ```
 
 > `reference_time` é a data da **mensagem**, não a do envio. Sem isso a
@@ -87,13 +175,21 @@ O plugin **não** conhece FalkorDB nem graphiti. Ele só fala HTTP.
 
 Usado pelo E5 (degradação) para decidir se injeta ou segue sem memória.
 
+### MCP — `/v1/mcp` (mesma app/porta, E7)
+
+Transporte **Streamable HTTP**, `stateless_http=True`. O plugin **registra** este
+MCP remoto no Kilo (ver §3, `src/mcp/`); o bearer viaja no header
+`Authorization`. Tools: `recall`, `ingest`, `code_search`, `code_sync`. Auth é
+validada por middleware **antes** de qualquer tool (sem token → 401; IAM down →
+503 fail-closed).
+
 ## 3. Componentes
 
 ```
 src/
-├── index.ts              # registro dos hooks (entrada do plugin)
-├── config.ts             # config.yaml + env vars (nada hardcoded)
-├── client.ts             # HTTP client do daemon (timeout, retry, auth)
+├── index.ts              # registro dos hooks + disparo do coletor + registro MCP
+├── config.ts             # plugin.yaml + env vars (nada hardcoded)
+├── client.ts             # HTTP client do memtier (timeout, retry, auth)
 ├── workspace.ts          # diretório do projeto → nome lógico
 ├── inject/
 │   ├── memory.ts         # formata o bloco de memória
@@ -102,6 +198,14 @@ src/
 ├── ingest/
 │   ├── capture.ts        # hook chat.message
 │   └── debounce.ts       # agrupa por sessão antes de enfileirar
+├── index/                # ⬅ NOVO (E3a) — o COLETOR
+│   ├── runner.ts         # spawn do rust_indexer; consome JSONL; trata pause/resume
+│   ├── collector.ts      # eventos → files[]/edges[] (agrupa por arquivo)
+│   ├── edges.ts          # import_edge/call_edge → to_file/to_symbol_id (alvo existe?)
+│   ├── manifest.ts       # estado por workspace → detecta removidos (chunks: [])
+│   └── trigger.ts        # híbrido: full no 1º uso; incremental_index depois
+├── mcp/                  # ⬅ NOVO (E3b) — registro do MCP do memtier
+│   └── register.ts       # client.mcp.add(type:remote) + connect; implícito
 └── adapters/
     ├── kilo.ts           # referência (hooks JS)
     ├── opencode.ts       # mesmo mecanismo
@@ -111,10 +215,46 @@ src/
 ### `workspace.ts` — escopo
 
 Mesma abordagem do plugin atual: o workspace deriva do diretório do projeto
-(hash do caminho, como hoje). O daemon recebe o **nome lógico**; ele resolve o
-`group_id` e valida contra o escopo do token.
+(hash do caminho, como hoje). O memtier recebe o **nome lógico** (+ `program`),
+resolve o `group_id` e valida contra o escopo do token.
 
 > O plugin **nunca** escolhe o grafo diretamente. Isso é o que garante FR-302.
+
+### `index/` — o coletor (E3a)
+
+O plugin **não** faz parsing. Ele **spawna** o binário do `rust-ast-indexer`
+(caminho configurável, FR-501) e traduz o protocolo JSONL:
+
+```
+rust_indexer (JSONL stdio)
+   ├─ chunk_emitted  ──▶ collector: agrupa por `file` → files[].chunks[]
+   ├─ import_edge    ──┐
+   ├─ call_edge      ──┴▶ edges.ts: resolve to_file/to_symbol_id; descarta se alvo ausente
+   └─ pause/resume   ──▶ runner: consome backpressure (ack/resume), nunca trava
+```
+
+O `manifest.ts` guarda, por workspace, o conjunto de arquivos já sincronizados —
+para mandar `chunks: []` aos que sumiram (FR-504) e para saber se é o 1º sync. O
+`trigger.ts` decide full (`index_path`) vs incremental (`incremental_index` +
+`git_range`) (FR-507).
+
+> ⚠️ **O `rust_indexer` não tem watch mode** (verificado 2026-10-14: sem crate de
+> watch no `Cargo.toml`; 9 comandos, nenhum `watch`; `cli/args.rs` só aceita
+> `--mcp`/`--quiet`). O indexer é **pull**: o plugin decide quando rodar. A
+> detecção de mudança é do plugin, e o modo incremental só cobre o que o **git**
+> vê — **mudanças não-commitadas não entram** no MVP.
+
+Referência validada (probe-grade, portar): `~/spikes/010-navegabilidade-codigo/probe_e2e_lifecycle.py`
+(`montar_body`, resolução de módulo Rust, materialização de `FullFile`).
+
+### `mcp/` — registro do MCP (E3b)
+
+Reuso de `registerOpenVikingMcp` do antecessor (`openviking-memory.js:1781`):
+`client.mcp.status` → `client.mcp.add` → `client.mcp.connect`. O registro é
+**implícito**: o plugin o faz no boot, sem o usuário definir nada em `kilo.jsonc`.
+Se o usuário **já** definiu o MCP lá, o plugin não registra por cima
+(idempotência). A diferença do antecessor: `type:"remote"` (URL `/v1/mcp` +
+header de auth) em vez de `type:"local"`.
 
 ### `inject/budget.ts` — orçamento
 
@@ -141,13 +281,34 @@ sessão e enfileira um job a cada N mensagens ou T segundos, o que vier primeiro
       ├── POST /v1/recall       (memória)
       └── POST /v1/code/search  (código)
       └── injeta bloco no turno
-4. LLM responde
+4. LLM responde (pode usar tools MCP — pull)
 5. hook chat.message        → acumula para ingestão
 6. debounce atinge o limiar → POST /v1/ingest (202)
 ```
 
 **Só o passo 3 está no caminho crítico.** Se ele estourar o timeout, o turno
 segue sem contexto (E5).
+
+### Fluxo de coleta de código (fora do turno)
+
+```
+start da sessão (ou gatilho)
+   ├── 1º uso do workspace?  → index_path (full)      [trigger.ts]
+   └── senão                 → incremental_index      [trigger.ts]
+         │                       (git_range)
+         ▼
+   rust_indexer (spawn; JSONL)  ──pause/resume──▶ runner.ts
+         │  chunk_emitted / import_edge / call_edge
+         ▼
+   collector.ts → files[] (agrupa por arquivo)
+   edges.ts     → edges[]  (alvo existe? senão descarta)
+   manifest.ts  → arquivos removidos ⇒ chunks: []
+         ▼
+   POST /v1/code/sync (202) → grafo populado
+```
+
+**Nunca no caminho do turno** (FR-510). Se o indexer demorar ou falhar, o turno
+segue; a próxima busca simplesmente não acha o código novo ainda.
 
 ## 5. Formato do contexto injetado
 
@@ -171,21 +332,30 @@ Nada hardcoded no script (FR-303). `plugin.yaml` + env vars, precedência: env
 var > arquivo de config > default.
 
 ```yaml
-daemon:
+daemon:                                  # memtier
   url: http://127.0.0.1:8400
-  token_file: .kilo/graph-key.json     # por workspace, no .gitignore
+  token_file: .kilo/graph-key.json       # por workspace, no .gitignore
+  program: default                        # E11 (aditivo)
 inject:
   enabled: true
   max_memories: 5
   max_code_chunks: 3
   max_chars: 4000
   timeout_ms: 4000
+  max_tokens: 2000                        # A1 — orçamento de resposta no servidor
 ingest:
   enabled: true
   batch_size: 20
   debounce_seconds: 60
-code_index:
-  enabled: false                        # ativado por flag, como hoje
+code_index:                               # E3a — o coletor
+  enabled: false                          # ativado por flag, como hoje
+  indexer_bin: ""                         # caminho do rust_indexer (FR-306)
+  trigger: hybrid                         # hybrid | full | incremental
+  manifest_path: .kilo/graph-manifest.json  # por workspace, no .gitignore
+mcp:                                       # E3b — registro do MCP do memtier
+  enabled: true
+  name: memtier
+  timeout_ms: 15000
 ```
 
 > **Defaults desligados** para indexação e injeção — é a preferência registrada
@@ -215,8 +385,13 @@ isso a separação em `adapters/`.
 | Recall estoura timeout | turno segue sem memória (code/search pode ter chegado) |
 | `/ingest` falha | job fica em retry local; nada bloqueia o turno |
 | Token rejeitado (401/403) | log de erro visível; sem retry infinito |
+| **`indexer_bin` ausente** | coletor desligado (não é erro fatal); memória segue (FR-306) |
+| **Indexer trava em `pause`** | runner consome backpressure (`resume`); se persistir, aborta o job, turno segue |
+| **`/v1/code/sync` 422** (aresta órfã) | loga o lote; descarta a aresta e reenvia (ADR-012 D3) |
+| **MCP não registra** | loga; turno segue sem tools; nunca fatal (FR-604) |
 
-O principio: **memória é um luxo, não um pré-requisito do turno.**
+O principio: **memória é um luxo, não um pré-requisito do turno** — e código
+indexado também.
 
 ## 9. Observabilidade (E7)
 
@@ -225,6 +400,14 @@ Log estruturado por turno:
 ```json
 { "turn": "...", "recall_ms": 830, "facts": 5, "code_chunks": 2,
   "injected_chars": 3120, "ingest_queued": true }
+```
+
+Log por ciclo de coleta (E3a) — separa o trabalho do turno:
+
+```json
+{ "collect": "incremental", "indexer_ms": 412, "files": 12, "edges": 30,
+  "sync": { "upserted": 9, "deleted": 2, "changed": 9, "skipped": 40 },
+  "removed": ["src/old.rs"] }
 ```
 
 Sem isso é impossível calibrar os limiares do §5 — e a suspeita de que a injeção
@@ -236,7 +419,12 @@ Ver `../../graphiti-daemon/docs/ARCHITECTURE.md` §5. As relevantes aqui:
 
 | # | Armadilha | Onde morde neste plugin |
 |---|---|---|
-| 1 | `driver.clone` obrigatório | invisível (o daemon encapsula) |
-| 2 | Fulltext não cobre código | a busca de código depende do daemon ter `CodeSearchable` |
+| 1 | `driver.clone` obrigatório | invisível (o memtier encapsula) |
+| 2 | Fulltext não cobre código | a busca de código depende do memtier ter `CodeSearchable` |
 | 6 | `reference_time` errado | quebra a supersessão — enviar a data da mensagem |
 | 7 | Daemon bloqueado por ingestão | **não acontece** (medido); não projetar em cima disso |
+| — | **Arquivo removido não auto-deleta** (spike 010 A1) | o coletor **precisa** mandar `chunks: []`; manifest obrigatório |
+| — | **Aresta com alvo inexistente → 422** (ADR-012 D3) | resolver o alvo antes de enviar; descartar se ausente |
+| — | **`symbol_id` é o nome puro** | montar a chave `{file}:{symbol}` com o valor cru (não concatenar `file` de novo) |
+| — | **Backpressure é two-way** | quem lê stdout sem `resume` deixa o job travado |
+| — | **Arestas têm atributos achatados** | `e.edge_kind`, não `e.attributes[...]` (relevante se ler neighbors) |
