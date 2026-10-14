@@ -5,7 +5,7 @@ Esqueleto. Nada implementado — apenas a forma e os contratos.
 ```
 src/
 ├── index.ts              # registro dos 4 hooks + disparo do coletor + registro MCP
-├── config.ts             # plugin.yaml + env vars
+├── config.ts             # graph-plugin.json + env vars
 ├── client.ts             # HTTP client do memtier
 ├── workspace.ts          # diretório → nome lógico
 ├── inject/
@@ -102,7 +102,7 @@ function shouldFlush(sessionId: string, cfg: IngestCfg): boolean
    caminho crítico (FR-510).
 3. **`reference_time` = data da mensagem**, não do envio (quebra supersessão).
 4. **Ingestão nunca é await no caminho do turno** — 202 e segue.
-5. **Nenhum valor hardcoded** — config via `plugin.yaml`/env (PRD FR-303).
+5. **Nenhum valor hardcoded** — config via `.kilo/graph-plugin.json`/env (PRD FR-303).
 6. **Defaults desligados** para indexação e injeção (preferência do dono).
 7. **Arquivo removido exige `chunks: []`** — o memtier não auto-deleta (FR-504).
 8. **Aresta com alvo ausente é descartada** — senão 422 no lote inteiro.

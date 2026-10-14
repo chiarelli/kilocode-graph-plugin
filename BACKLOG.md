@@ -47,7 +47,7 @@ Convenções válidas para todas as epics:
 ### E1 — Fundação (cliente do memtier)
 - [x] **E1-S1** — Tracer bullet: skeleton do plugin + config + client + `GET /v1/health` atravessando até o memtier
 - [x] **E1-S2** — Endurecer: timeout, retry/degradação, workspace + `program`, `token_file`, erros tipados
-- [ ] **E1-S3** — Fechamento: typecheck + testes verdes, docs, zero marcadores
+- [x] **E1-S3** — Fechamento: typecheck + testes verdes, docs, zero marcadores
 
 ### E2 — Injeção de memória
 - [ ] **E2-S1** — Tracer bullet: `messages.transform` injeta o bloco de memória via `/v1/recall`
@@ -232,6 +232,14 @@ redescobertas no meio do loop.
 4. **Pré-requisito não listado do E2E da E1:** não existe `.kilo/graph-key.json`
    (bearer show-once) em nenhum workspace desta máquina. As specs citam o
    caminho mas não a origem do token. Sem ele, o E2E da E1 fica pendente.
+
+   **Resolvido na E1-S3 (medido 2026-10-14):** o E2E da E1 **não** depende do
+   bearer. `GET /v1/health` é **aberto** (FR-305 do memtier) — responde 200 com
+   ou sem token. O E2E de health da E1 roda real contra a stack e prova o efeito
+   (health `ok:true` + workspace resolvido). O bearer por workspace segue
+   necessário para as rotas protegidas (`/v1/recall`, `/v1/code/sync`) — é
+   pré-requisito do **E2E da E2**, não da E1. O `token_file` já é exercitado com
+   um arquivo real (o client o lê lazy); o valor só é exigido por rota protegida.
 
 ## Histórico de revisão
 

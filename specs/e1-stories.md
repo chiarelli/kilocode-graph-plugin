@@ -99,7 +99,8 @@ fixado:
 - **Precedência do token:** `KILOCODE_GRAPH_TOKEN` (env) > `token_file` >
   ausente (⇒ 401 do memtier; o plugin **não** inventa token).
 - O arquivo é lido **na primeira necessidade** (lazy) e cacheado; ausente não é
-  erro fatal — a borda responde 401 e o plugin degrada (FR-305/NFR-03).
+  erro fatal — a borda responde 401 e o plugin degrada (NFR-03; FR-305 é
+  requisito do **memtier**, não deste PRD).
 - **Nunca** logar o token; em log, só `SET(len=N)` como o antecessor (`:1898`).
 
 ### 4. `workspace.ts` — dir → nome lógico

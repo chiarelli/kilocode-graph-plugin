@@ -328,38 +328,57 @@ func SaveInvoice(ctx context.Context, inv *Invoice) error {
 
 ## 6. Configuração
 
-Nada hardcoded no script (FR-303). `plugin.yaml` + env vars, precedência: env
-var > arquivo de config > default.
+Nada hardcoded no script (FR-303). **JSON** + env vars, precedência:
+`options` (do `kilo.jsonc`) > env var > arquivo JSON > default.
 
-```yaml
-daemon:                                  # memtier
-  url: http://127.0.0.1:8400
-  token_file: .kilo/graph-key.json       # por workspace, no .gitignore
-  program: default                        # E11 (aditivo)
-inject:
-  enabled: false                          # default desligado (FR-304, preferência do dono)
-  max_memories: 5
-  max_code_chunks: 3
-  max_chars: 3000                         # KILOCODE_GRAPH_INJECT_MAX_CHARS
-  timeout_ms: 4000
-  max_tokens: 2000                        # A1 — orçamento de resposta no servidor
-ingest:
-  enabled: true
-  batch_size: 20
-  debounce_seconds: 60
-code_index:                               # E3a — o coletor
-  enabled: false                          # ativado por flag, como hoje
-  indexer_bin: ""                         # caminho do rust_indexer (FR-306)
-  trigger: hybrid                         # hybrid | full | incremental
-  manifest_path: .kilo/graph-manifest.json  # por workspace, no .gitignore
-mcp:                                       # E3b — registro do MCP do memtier
-  enabled: true
-  name: memtier
-  timeout_ms: 15000
+> **JSON, não YAML** (decisão fixada na E1-S3). O texto original dizia
+> `plugin.yaml`, mas o ecossistema Kilo usa JSON no `.kilo/` e o antecessor
+> (`openviking.json`) também — adotar YAML exigiria um parser extra sem ganho.
+> Arquivos: `.kilo/graph-plugin.json` (por workspace) e
+> `~/.config/kilo/graph-plugin.json` (global), mesclados (workspace vence).
+
+```jsonc
+// .kilo/graph-plugin.json  (ou ~/.config/kilo/graph-plugin.json)
+{
+  "daemon": {                             // memtier
+    "url": "http://127.0.0.1:8400",
+    "token_file": ".kilo/graph-key.json", // por workspace, no .gitignore
+    "program": "default",                 // E11 (aditivo)
+    "health_timeout_ms": 2000
+  },
+  "inject": {
+    "enabled": false,                     // FR-304, preferência do dono
+    "max_memories": 5,
+    "max_chars": 3000,                    // KILOCODE_GRAPH_INJECT_MAX_CHARS
+    "max_tokens": 2000,                   // A1 — orçamento de resposta no servidor
+    "timeout_ms": 4000                    // orçamento do hook
+  },
+  "code_index": {                         // E3a — o coletor
+    "enabled": false,                     // ativado por flag, como hoje
+    "indexer_bin": ""                     // caminho do rust_indexer (FR-306)
+  },
+  "mcp": {                                // E3b — registro do MCP do memtier
+    "enabled": true,
+    "name": "memtier"
+  },
+  "debug": false
+}
 ```
+
+> **Envs** (todas `KILOCODE_GRAPH_*`): `URL`, `TOKEN`, `TOKEN_FILE`, `PROGRAM`,
+> `INJECT_ENABLED`, `INJECT_MAX_MEMORIES`, `INJECT_MAX_CHARS`,
+> `INJECT_MAX_TOKENS`, `INJECT_TIMEOUT_MS`, `INDEX_ENABLED`, `INDEXER_BIN`,
+> `MCP_ENABLED`, `MCP_NAME`, `DEBUG`. O prefixo da env de config é
+> `KILOCODE_GRAPH_` (o `openviking` do antecessor mudou).
 
 > **Defaults desligados** para indexação e injeção — é a preferência registrada
 > do dono no plugin atual.
+>
+> **Escopo das chaves:** este bloco lista a config fixada pela **E1** (a tabela
+> de chaves da `specs/e1-stories.md` §2). Chaves de segunda onda — `ingest.*`
+> (E4) e `code_index.trigger`/`manifest_path` (E3a-S4) — entram quando suas
+> epics forem especificadas; declarar antes seria contrato fantasma.
+
 
 ## 7. Adaptadores multi-CLI
 
