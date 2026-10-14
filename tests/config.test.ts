@@ -1,10 +1,18 @@
 /**
  * E1-S1 — `config.ts`: defaults e precedência `options` > env > default.
  * Puro: nenhum teste abre socket. Env é setada/restaurada por teste.
+ *
+ * Hermético ao cwd: um `.kilo/graph-plugin.json` de dev no workspace (gitignored)
+ * mudaria o resultado de `loadConfig()`. Os testes rodam num diretório temporário
+ * vazio, então o arquivo de config do cwd nunca é lido (o global segue o mesmo
+ * padrão, também vazio).
  */
 
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, afterEach, before, test } from "node:test";
 
 import { DEFAULTS, loadConfig } from "../src/config.ts";
 
@@ -19,6 +27,20 @@ const ENV_KEYS = [
 function clearEnv(): void {
   for (const k of ENV_KEYS) delete process.env[k];
 }
+
+const originalCwd = process.cwd();
+let sandbox = "";
+
+before(() => {
+  // cwd temporário: sem `.kilo/graph-plugin.json` de dev para contaminar.
+  sandbox = mkdtempSync(join(tmpdir(), "graph-config-test-"));
+  process.chdir(sandbox);
+});
+
+after(() => {
+  process.chdir(originalCwd);
+  rmSync(sandbox, { recursive: true, force: true });
+});
 
 afterEach(clearEnv);
 

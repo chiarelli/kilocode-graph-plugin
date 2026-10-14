@@ -64,6 +64,21 @@ function renderForBudget(facts: Fact[]): string {
   return formatMemoryBlock(facts) ?? "";
 }
 
+/**
+ * Resultado de uma injeção — bloco pronto + métricas do turno (base da
+ * observabilidade do E7: `recall_ms`, `facts`, `injected_chars`).
+ */
+export interface InjectionResult {
+  /** Bloco formatado, pronto para virar um part de texto. */
+  block: string;
+  /** Nº de fatos injetados (após orçamento e dedup). */
+  facts: number;
+  /** Chars do bloco injetado. */
+  chars: number;
+  /** Latência do recall HTTP (ms). */
+  recallMs: number;
+}
+
 /** Opções de `recall` derivadas da config (limit/max_tokens/signal). */
 function recallOpts(cfg: RecallConfig, signal?: AbortSignal): RecallOpts {
   const opts: RecallOpts = { limit: cfg.maxMemories };
@@ -98,16 +113,27 @@ async function runRecall(
   cfg: RecallConfig,
   query: string,
   signal?: AbortSignal,
-): Promise<RecallResult> {
+): Promise<{ result: RecallResult; recallMs: number }> {
+  const start = Date.now();
   const result = await client.recall(query, recallOpts(cfg, signal));
+  const recallMs = Date.now() - start;
   logBudget(result);
-  return result;
+  return { result, recallMs };
+}
+
+/** Linha de observabilidade do turno (E7): recall_ms/facts/injected_chars. */
+function logInjection(m: InjectionResult): void {
+  log(
+    `inject recall_ms=${m.recallMs} facts=${m.facts} injected_chars=${m.chars}`,
+  );
 }
 
 /**
  * Recall + orçamento + formatação, sem estado. Devolve o bloco pronto para virar
  * um part injetado, ou `null` quando não há o que injetar (0 fatos após o
  * orçamento). **Lança** o erro do client — quem chama (o hook) degrada.
+ *
+ * Sem observabilidade de turno (isso é do `MemoryInjector`, o caminho do hook).
  */
 export async function recallAndFormat(
   client: RecallClient,
@@ -115,7 +141,7 @@ export async function recallAndFormat(
   query: string,
   signal?: AbortSignal,
 ): Promise<string | null> {
-  const result = await runRecall(client, cfg, query, signal);
+  const { result } = await runRecall(client, cfg, query, signal);
   const facts = applyBudget(result.facts, cfg, renderForBudget);
   return formatMemoryBlock(facts);
 }
@@ -149,12 +175,12 @@ export class MemoryInjector {
   }
 
   /** Recall + dedup + orçamento + bloco. `null` ⇒ nada a injetar. */
-  async inject(query: string): Promise<string | null> {
+  async inject(query: string): Promise<InjectionResult | null> {
     if (query !== this.turnKey) {
       this.turnKey = query;
       this.seen.clear();
     }
-    const result = await runRecall(
+    const { result, recallMs } = await runRecall(
       this.client,
       this.cfg,
       query,
@@ -163,11 +189,19 @@ export class MemoryInjector {
 
     const fresh = result.facts.filter((f) => !this.seen.has(f.fact));
     const facts = applyBudget(fresh, this.cfg, renderForBudget);
-    if (facts.length === 0) {
+    const block = formatMemoryBlock(facts);
+    if (!block) {
       debug(`recall: nada novo a injetar (${result.facts.length} fatos)`);
       return null;
     }
     for (const f of facts) this.seen.add(f.fact);
-    return formatMemoryBlock(facts);
+    const injection: InjectionResult = {
+      block,
+      facts: facts.length,
+      chars: block.length,
+      recallMs,
+    };
+    logInjection(injection);
+    return injection;
   }
 }

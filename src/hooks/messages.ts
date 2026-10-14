@@ -131,17 +131,17 @@ export async function injectMemoryIntoMessages(
     return;
   }
 
-  let block: string | null;
+  let injection: { block: string } | null;
   try {
-    block = await injector.inject(text);
+    injection = await injector.inject(text);
   } catch (err) {
     logRecallFailure(err);
     return;
   }
-  if (!block) return;
+  if (!injection) return;
 
   debug("messages.transform: injetando contexto de memória");
-  appendContextPart(parts, block);
+  appendContextPart(parts, injection.block);
 }
 
 /**

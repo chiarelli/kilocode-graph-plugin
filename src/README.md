@@ -1,6 +1,9 @@
 # kilocode-graph-plugin — src
 
-Esqueleto. Nada implementado — apenas a forma e os contratos.
+Estado: **E1 (fundação) e E2 (injeção de memória) implementadas**; E3a/E3b e
+segunda onda ainda são forma e contratos. O mapa abaixo é o alvo; o que existe
+hoje em `src/` é `index.ts`, `config.ts`, `client.ts`, `workspace.ts`,
+`logger.ts`, `types.ts`, `hooks/messages.ts` e `inject/{memory,budget}.ts`.
 
 ```
 src/
@@ -31,16 +34,16 @@ src/
 
 ## Assinaturas esperadas
 
-### `client.ts`
+### `client.ts` (E1 + `recall` da E2 — implementado)
 ```ts
-interface DaemonClient {
-  recall(ws: string, query: string, opts?): Promise<Fact[]>
-  searchCode(ws: string, query: string, opts?): Promise<Chunk[]>
-  syncCode(ws: string, files: CodeFile[], edges: CodeEdge[]): Promise<SyncResult>
-  ingest(ws: string, sessionId: string, msgs: Msg[]): Promise<{job_id: string}>
-  health(): Promise<boolean>
+class MemtierClient {
+  recall(query: string, opts?: { limit?; maxTokens?; signal? }): Promise<RecallResult>
+  health(signal?): Promise<HealthReport>   // nunca lança (NFR-03)
+  // searchCode/syncCode/ingest entram com E3a/E4.
 }
-// `program` e `max_tokens` são campos aditivos de opts (E11 / A1).
+// identidade (`workspace`/`program`) vem do construtor; `max_tokens` é o
+// orçamento A1 no servidor. Erros HTTP viram tipos (AuthError 401/403,
+// InfraError 503) — o hook degrada, não propaga.
 ```
 
 ### `index/runner.ts` — spawn do indexer
@@ -84,9 +87,27 @@ async function registerMemtierMcp(client: KiloClient, cfg: McpCfg): Promise<void
 // se já definido lá, não registra por cima (idempotência) — FR-602
 ```
 
-### `inject/budget.ts`
+### `inject/budget.ts` (E2 — implementado)
 ```ts
-function applyBudget(facts: Fact[], chunks: Chunk[], cfg: Budget): string
+function applyBudget(facts: Fact[], cfg: Budget, render?: (f: Fact[]) => string): Fact[]
+// corta por fato INTEIRO: maxMemories (nº) e maxChars (teto do bloco renderizado).
+// `render` é injetado por memory.ts só para medir (evita ciclo de import).
+```
+
+### `inject/memory.ts` (E2 — implementado)
+```ts
+function formatMemoryBlock(facts: Fact[]): string | null   // null ⇒ não injeta
+async function recallAndFormat(client, cfg, query, signal?): Promise<string | null>
+class MemoryInjector {                                    // dedup por turno (FR-104)
+  inject(query): Promise<InjectionResult | null>          // { block, facts, chars, recallMs }
+}
+// observabilidade do turno (base E7): loga `inject recall_ms=… facts=… injected_chars=…`
+```
+
+### `hooks/messages.ts` (E2 — implementado)
+```ts
+function messagesHook(rt: InjectRuntime): { "experimental.chat.messages.transform": fn }
+// thin: liga o transform do Kilo ao MemoryInjector; nunca lança (NFR-03).
 ```
 
 ### `ingest/debounce.ts`

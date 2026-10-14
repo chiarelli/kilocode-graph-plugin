@@ -112,7 +112,11 @@ Resposta 200: `{ facts: [...] }` (+ `tokens_estimated`/`truncated` quando
   nunca deve falhar por tamanho).
 - `include_invalid` **não** é usado (E2 injeta só o vigente).
 
-### 5. Degradação (FR-305/NFR-03) — nunca quebra o turno
+### 5. Degradação (NFR-03) — nunca quebra o turno
+
+> A `FR-305` citada no BACKLOG pendência #3 é requisito do **memtier**, não
+> deste PRD. O requisito local de degradação é **NFR-03** (obrigação de
+> comportamento) sobre a `FR-305 do daemon` (fonte). Corrigido aqui (epic dona).
 
 | Situação | Comportamento |
 |---|---|
@@ -207,8 +211,9 @@ o bloco aparece no turno.
 **Objetivo:** E2E real + zero marcadores.
 
 **Entregável:**
-- `tests/e2e/test_e2e_recall_inject.ts` (**novo**, gated `E2E=1`): com o memtier de
-  pé e um workspace com fatos, o plugin injeta ≥1 fato no turno.
+- `tests/e2e/test_e2e_recall_inject.test.ts` (**novo**, gated `E2E=1`; sufixo
+  `.test.ts` para casar o glob da spec — mesma convenção do E1-S3): com o memtier
+  de pé e um workspace com fatos, o plugin injeta ≥1 fato no turno.
 - Log de observabilidade do turno (base do E7): `{recall_ms, facts, injected_chars}`.
 - Remover todos os `TODO(tracer-bullet)`.
 

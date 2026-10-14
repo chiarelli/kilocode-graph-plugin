@@ -344,6 +344,19 @@ test("health_gate_blocks_recall: health degradado ⇒ sem part", async () => {
   assert.equal(messages[0]?.parts.length, 1);
 });
 
+test("observability_log: inject loga recall_ms/facts/injected_chars", async () => {
+  const { injector } = rt([fact("f0"), fact("f1")], { maxMemories: 5 });
+  const logPath = "/tmp/kilocode-graph-plugin.log";
+  const before = readFileSync(logPath, "utf-8").length;
+  const injection = await injector.inject("q");
+  assert.ok(injection);
+  assert.equal(injection.facts, 2);
+  assert.equal(injection.chars, injection.block.length);
+  assert.ok(injection.recallMs >= 0);
+  const appended = readFileSync(logPath, "utf-8").slice(before);
+  assert.match(appended, /inject recall_ms=\d+ facts=2 injected_chars=\d+/);
+});
+
 test("timeout_no_inject: recall pendura ⇒ aborta; sem injeção; turno segue", async () => {
   const messages = userTurn("q");
   const client = new MemtierClient({

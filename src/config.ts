@@ -142,7 +142,7 @@ function filePick(
 /**
  * Monta a configuração efetiva. `options` vem do `kilo.jsonc`; env e arquivos
  * são lidos do ambiente/workspace. Puro o suficiente para teste (chamadores de
- * teste passam `options` e controlam env).
+ * teste isolam o cwd/global — ver `tests/config.test.ts`).
  */
 export function loadConfig(options?: PluginOptions): Config {
   const env = process.env;

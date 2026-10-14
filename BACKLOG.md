@@ -52,7 +52,7 @@ Convenções válidas para todas as epics:
 ### E2 — Injeção de memória
 - [x] **E2-S1** — Tracer bullet: `messages.transform` injeta o bloco de memória via `/v1/recall`
 - [x] **E2-S2** — Endurecer: orçamento (`maxMemories`/`maxChars`/`timeout_ms`), `max_tokens`, dedup no turno, blocos com procedência
-- [ ] **E2-S3** — Fechamento: E2E real contra o memtier, docs, zero marcadores
+- [x] **E2-S3** — Fechamento: E2E real contra o memtier, docs, zero marcadores
 
 ### E3a — Coletor de código
 - [ ] **E3a-S1** — Tracer bullet: spawn do indexer → `chunk_emitted` → `POST /v1/code/sync` (1 arquivo)
@@ -276,3 +276,27 @@ redescobertas no meio do loop.
 - **2026-10-14 — primeira onda especificada (E1, E2, E3a, E3b):** o memtier está
   implementado e o PRD/ARCH foram revisados para v0.2 (o plugin é o coletor).
   Segunda onda (E3c, E4, E5, E6, E7) fica com spec sob demanda.
+
+- **2026-10-14 — E2 fechada (S1/S2/S3):** injeção de memória entregue sobre a
+  base tracer-bullet (S1 → S2, sem rewrite). E2-S3 fecha com:
+  1. `tests/e2e/test_e2e_recall_inject.test.ts` (**novo**, gated `E2E=1`): recall
+     real contra o memtier (`127.0.0.1:8400`) devolve ≥1 fato e o plugin bootado
+     injeta o bloco `<context graph-memory="true">` no último turno. Medido com
+     o bearer escopado ao workspace com fatos: 4/4 E2E verdes (recall 1,46s;
+     injeção 0,55s).
+  2. **Defeito de fechamento corrigido:** o arquivo nasceu como
+     `test_e2e_recall_inject.ts` (sem `.test.ts`), então **não casava** o glob da
+     spec (`tests/e2e/**/*.test.ts`) e rodava **0 testes** — falso-verde. Renomeado
+     para `.test.ts` (mesma convenção do E1-S3) e a spec alinhada. O glob agora
+     coleta os 4 E2E.
+  3. Observabilidade do turno (base do E7): `MemoryInjector.inject` devolve
+     `InjectionResult { block, facts, chars, recallMs }` e loga
+     `inject recall_ms=<n> facts=<n> injected_chars=<n>`.
+  4. Latência medida (n=5, workspace real): mediana **496ms**, máx 1518ms — dentro
+     de NFR-01 (≤4s) e coerente com NFR-02 (~0,85s, folga).
+  5. `rg "TODO\(tracer-bullet\)" src/` → **zero**. Unit 62 verdes, 4 E2E gated
+     (skip). `tsc --noEmit` limpo.
+  - Pendência #4 do BACKLOG (bearer do E2E da E2) **resolvida**: existe
+    `.kilo/graph-key.json` no workspace (bearer show-once, workspace
+    `kilocode-graph-plugin`/`graphplugin`); para um workspace **com fatos** o E2E
+    usa `E2E_TOKEN`/`E2E_WS` (o token legado `e2e-tok-a`→`alfa` tem fatos reais).
