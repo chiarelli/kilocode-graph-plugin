@@ -2,8 +2,11 @@
 node_modules/
 dist/
 
+# config local do Kilo — agentes/hooks por máquina, NUNCA commitar
+# (mesma convenção do ../graphiti-daemon/.gitignore: `.kilo/*`)
+.kilo/*
+
 # segredos — por workspace, NUNCA commitar
-.kilo/*-key.json
 *-key.json
 .env
 .env.*
