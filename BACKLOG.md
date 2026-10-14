@@ -101,8 +101,10 @@ unidade com happy path e unhappy path**:
 - **Happy path:** entrada válida → comportamento esperado.
 - **Unhappy path:** entrada inválida / dependência fora do ar / timeout →
   erro mapeado corretamente (sem exceção não tratada, sem escrita parcial).
-- Testes em `tests/`, `node --test` (runner nativo do Node ≥ 22; `package.json`
-  já aponta `node --test tests/`).
+- Testes em `tests/`, `node --test` (runner nativo do Node ≥ 22, com type
+  stripping — roda `.ts` sem build; `package.json` aponta
+  `node --test "tests/**/*.test.ts"`). **Não** usar `node --test tests/`: o Node
+  ≥ 22 trata o argumento como módulo (`MODULE_NOT_FOUND`).
 - Privados são exercitados via interface pública; lógica crítica isolada vira
   unidade própria testável (ex.: `buildSyncBody`, `resolveEdges`).
 - **Nada de rede real em teste unitário** — o cliente HTTP é injetado/stubado.
@@ -207,9 +209,61 @@ navegação `neighbors` (bloqueada até o memtier expor tool MCP).
 
 ---
 
+## Pendências conhecidas de contrato (medidas 2026-10-14, antes da primeira onda)
+
+Não bloqueiam a E1; **bloqueiam a E3a**. Ficam registradas para não serem
+redescobertas no meio do loop.
+
+1. **"Todos os arquivos removidos" não é representável.** `CodeSyncBody.files`
+   tem `min_length=1` (`graphiti-daemon/src/memtier/main.py:710`), então o
+   coletor não consegue zerar o grafo de um repo esvaziado. O caso coberto pela
+   E3a-S3 é a remoção **individual** (`chunks: []` por arquivo — o campo `chunks`
+   não tem mínimo). Decidir: aceitar a limitação e documentar, ou pedir campo
+   aditivo ao memtier.
+2. **Arestas sem teto de paginação.** A E3a-S4 fatia em lotes de ≤100 arquivos
+   (`MAX_FILES_PER_REQUEST`, `code.py:112`), mas
+   `MAX_EDGES_PER_REQUEST = 5_000` (`code.py:99`). 100 arquivos produzem
+   facilmente >5.000 arestas → **422 no lote inteiro**. Nenhuma story limita as
+   arestas. Corrigir na E3a-S4 (fatiar arestas também, não só arquivos).
+3. **`FR-305` não existe neste PRD** — é requisito do **memtier**. Citado como
+   se fosse local em `docs/adr/005:72`, `specs/e1-stories.md:98` e
+   `specs/e2-stories.md:113`. Aqui o requisito de degradação é **NFR-03**. Trocar
+   a citação (a epic dona corrige; não muda comportamento).
+4. **Pré-requisito não listado do E2E da E1:** não existe `.kilo/graph-key.json`
+   (bearer show-once) em nenhum workspace desta máquina. As specs citam o
+   caminho mas não a origem do token. Sem ele, o E2E da E1 fica pendente.
+
 ## Histórico de revisão
 
 > Registro append-only das decisões de escopo. Não editar entradas antigas.
+
+- **2026-10-14 — decisões do dono sobre config e ambiente (pós-revisão das specs):**
+  1. `inject.enabled` default = **`false`** (desligado). O `true` que aparecia em
+     `docs/ARCHITECTURE.md` §6 e `docs/adr/004` era erro — o texto ao redor já
+     dizia "desligado por padrão"; o default alinha com FR-304 e com a
+     preferência do dono.
+  2. `max_chars` default = **`3000`**, configurável por env var
+     `KILOCODE_GRAPH_INJECT_MAX_CHARS`. O `4000` do ARCH/ADR-004 era erro; o
+     **3000** da E2 e do antecessor (`recallMaxChars=3000`) é o valor correto.
+  3. Chaves `inject.max_memories`/`max_chars`/`max_tokens` passam a ser
+     **declaradas pela E1** (tabela de chaves) — a E2 só as lê. Fecha o churn de
+     config entre epics (ver §"conflito #3" da revisão).
+  4. Ambiente: `node --test tests/` **não funciona** no Node ≥ 22
+     (`MODULE_NOT_FOUND` — o argumento é tratado como módulo). Comando correto:
+     `node --test "tests/**/*.test.ts"` (é o que o `package.json` aponta). As
+     quatro specs citavam a forma quebrada; corrigidas.
+  5. Dependências instaladas e travadas em `bun.lock`. **Kilo pinado em
+     `7.8.3`** — o runtime real da máquina é o binário `~/.kilo/bin/kilo`
+     (`--version` → 7.8.3); a extensão VSCode de 7.8.8 é outro runtime e não é o
+     que carrega o plugin. `typescript@5.9.3`, `@types/node@22.20.5`,
+     `@kilocode/sdk@7.8.3` (dev) e `@kilocode/plugin@7.8.3` (peer pinado — era
+     `*`). `tsconfig.json` criado (não existia).
+  6. Dependência de runtime validada: `rust_indexer` buildado em
+     `../rust-ast-indexer/rust_indexer/target/release/rust_indexer`
+     (`cargo build --release --features parsing`, 53,85s) e responde com o
+     evento `capabilities` (`jsonl`, `incremental_index`, `git_diff`,
+     `pause_resume`, `mcp_compatible`; 6 linguagens). O default
+     `code_index.indexer_bin: ""` (FR-306) passa a ter valor a apontar.
 
 - **2026-10-14 — primeira onda especificada (E1, E2, E3a, E3b):** o memtier está
   implementado e o PRD/ARCH foram revisados para v0.2 (o plugin é o coletor).

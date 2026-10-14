@@ -264,7 +264,7 @@ potencial: se o recall trouxer ruído, a resposta piora. O orçamento é o freio
 ```
 maxMemories:   5
 maxCodeChunks: 3
-maxChars:      4000
+maxChars:      3000
 ```
 
 ### `ingest/debounce.ts` — agrupamento
@@ -337,10 +337,10 @@ daemon:                                  # memtier
   token_file: .kilo/graph-key.json       # por workspace, no .gitignore
   program: default                        # E11 (aditivo)
 inject:
-  enabled: true
+  enabled: false                          # default desligado (FR-304, preferência do dono)
   max_memories: 5
   max_code_chunks: 3
-  max_chars: 4000
+  max_chars: 3000                         # KILOCODE_GRAPH_INJECT_MAX_CHARS
   timeout_ms: 4000
   max_tokens: 2000                        # A1 — orçamento de resposta no servidor
 ingest:

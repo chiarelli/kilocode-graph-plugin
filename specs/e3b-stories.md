@@ -20,7 +20,7 @@ quando `rg "TODO\(tracer-bullet\)" src/` = 0.
 **Depende de:** E1 (config/logger) · memtier MCP (`/v1/mcp`, implementado).
 **Independente de** E2/E3a (só precisa do MCP de pé).
 
-**Ambiente de dev:** `bun run typecheck` · `node --test tests/` · E2E gated
+**Ambiente de dev:** `bun run typecheck` · `node --test "tests/**/*.test.ts"` · E2E gated
 `E2E=1` (memtier de pé).
 
 ---
@@ -177,8 +177,8 @@ MCP.
 
 **Comandos:**
 ```bash
-bun run typecheck && node --test tests/
-E2E=1 node --test tests/e2e/
+bun run typecheck && node --test "tests/**/*.test.ts"
+E2E=1 node --test "tests/e2e/**/*.test.ts"
 ```
 
 ---

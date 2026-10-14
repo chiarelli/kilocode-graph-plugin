@@ -19,8 +19,9 @@ chama → memtier responde`, com código de produção desde a fatia 1. S2/S3
 
 **Ordem de execução:** E1-S1 → E1-S2 → E1-S3 (cadeia linear).
 
-**Ambiente de dev:** `bun run typecheck` (`tsc --noEmit`) · `bun test` ou
-`node --test tests/` · E2E gated: `E2E=1` (stack do memtier de pé em
+**Ambiente de dev:** `bun run typecheck` (`tsc --noEmit`) · `npm test`
+(`node --test "tests/**/*.test.ts"` — glob, não `tests/`, que o Node ≥ 22 não
+aceita como diretório) · E2E gated: `E2E=1` (stack do memtier de pé em
 `127.0.0.1:8400`).
 
 ---
@@ -70,6 +71,9 @@ Chaves (todas com env `KILOCODE_GRAPH_*`):
 | `daemon.token_file` | `KILOCODE_GRAPH_TOKEN_FILE` | `.kilo/graph-key.json` | bearer por workspace |
 | `daemon.program` | `KILOCODE_GRAPH_PROGRAM` | `default` | E11 |
 | `inject.enabled` | `KILOCODE_GRAPH_INJECT_ENABLED` | `false` | desligado por padrão |
+| `inject.max_memories` | `KILOCODE_GRAPH_INJECT_MAX_MEMORIES` | `5` | E2 — nº de fatos |
+| `inject.max_chars` | `KILOCODE_GRAPH_INJECT_MAX_CHARS` | `3000` | E2 — teto de chars do bloco |
+| `inject.max_tokens` | `KILOCODE_GRAPH_INJECT_MAX_TOKENS` | `2000` | E2 — A1 (orçamento no servidor) |
 | `inject.timeout_ms` | `KILOCODE_GRAPH_INJECT_TIMEOUT_MS` | `4000` | orçamento do hook |
 | `code_index.enabled` | `KILOCODE_GRAPH_INDEX_ENABLED` | `false` | desligado por padrão |
 | `code_index.indexer_bin` | `KILOCODE_GRAPH_INDEXER_BIN` | `""` | caminho do binário (FR-306) |
@@ -247,7 +251,7 @@ token em log (verificado por teste).
 
 **Critérios de aceite:**
 1. `bun run typecheck` limpo.
-2. `node --test tests/` verde (unit).
+2. `node --test "tests/**/*.test.ts"` verde (unit).
 3. `E2E=1` verde com a stack do memtier de pé.
 4. `rg "TODO\(tracer-bullet\)" src/` → zero.
 5. README/ARCH alinhados com a config real.
@@ -256,9 +260,9 @@ token em log (verificado por teste).
 ```bash
 cd /home/hermes/Projetos/kilocode-graph-plugin
 bun run typecheck
-node --test tests/
+node --test "tests/**/*.test.ts"
 # E2E (stack de pé):
-E2E=1 node --test tests/e2e/
+E2E=1 node --test "tests/e2e/**/*.test.ts"
 curl -s localhost:8400/v1/health   # sanidade da stack
 ```
 

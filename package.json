@@ -9,14 +9,15 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test tests/"
+    "test": "node --test \"tests/**/*.test.ts\""
   },
   "devDependencies": {
-    "typescript": "^5.6",
-    "@types/node": "^22.7"
+    "@kilocode/sdk": "7.8.3",
+    "@types/node": "22.20.5",
+    "typescript": "5.9.3"
   },
   "peerDependencies": {
-    "@kilocode/plugin": "*"
+    "@kilocode/plugin": "7.8.3"
   },
   "notes": [
     "O plugin NÃO carrega o graphiti nem o FalkorDB — fala HTTP com o memtier.",

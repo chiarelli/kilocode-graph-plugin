@@ -20,7 +20,7 @@ sem rewrite**; gaps mínimos marcados com `TODO(tracer-bullet):`. Fecha quando
 
 **Depende de:** E1 (client, config, workspace, logger).
 
-**Ambiente de dev:** `bun run typecheck` · `node --test tests/` · E2E gated
+**Ambiente de dev:** `bun run typecheck` · `node --test "tests/**/*.test.ts"` · E2E gated
 `E2E=1` com o memtier de pé.
 
 ---
@@ -84,8 +84,10 @@ plugin antecessor se ambos estiverem ativos):
 - `limit` do request = `maxMemories` (o servidor já limita; o cliente reafirma).
 - `timeout_ms` governa o `AbortSignal` da chamada — **não** o orçamento de 4s do
   hook como um todo (esse é o teto; `timeout_ms` é o teto da chamada de recall).
-- Config (E1 declarou `inject.*`): adicionar `max_memories` (default 5),
-  `max_chars` (default 3000), `max_tokens` (default 2000).
+- Config: `max_memories` (default 5), `max_chars` (default **3000**, env
+  `KILOCODE_GRAPH_INJECT_MAX_CHARS`) e `max_tokens` (default 2000) já são
+  **declarados pela E1** (tabela de chaves, decisão 2); a E2 apenas os **lê**.
+  Não há churn de config entre epics (decisão do dono, 2026-10-14).
 
 > Defaults conservadores (ADR-004): 5 fatos / 3000 chars / 2000 tokens. O
 > antecessor usava `recallMaxChars=3000` — coerente.
@@ -217,8 +219,8 @@ o bloco aparece no turno.
 
 **Comandos:**
 ```bash
-bun run typecheck && node --test tests/
-E2E=1 node --test tests/e2e/
+bun run typecheck && node --test "tests/**/*.test.ts"
+E2E=1 node --test "tests/e2e/**/*.test.ts"
 ```
 
 ---

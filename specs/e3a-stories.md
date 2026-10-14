@@ -25,7 +25,7 @@ independentes entre si, mas ambas dependem de S1; S4 depende de S3).
 **Depende de:** E1 (client/config/logger) · `rust-ast-indexer` (binário externo) ·
 memtier (`/v1/code/sync`, implementado).
 
-**Ambiente de dev:** `bun run typecheck` · `node --test tests/` · E2E gated
+**Ambiente de dev:** `bun run typecheck` · `node --test "tests/**/*.test.ts"` · E2E gated
 `E2E=1` (memtier de pé + binário buildado:
 `cargo build --release --features parsing` em `../rust-ast-indexer/rust_indexer`).
 
@@ -324,9 +324,9 @@ após full é mais barato (`skipped` alto).
 **Comandos:**
 ```bash
 cd /home/hermes/Projetos/kilocode-graph-plugin
-bun run typecheck && node --test tests/
+bun run typecheck && node --test "tests/**/*.test.ts"
 cd ../rust-ast-indexer/rust_indexer && cargo build --release --features parsing
-cd /home/hermes/Projetos/kilocode-graph-plugin && E2E=1 node --test tests/e2e/
+cd /home/hermes/Projetos/kilocode-graph-plugin && E2E=1 node --test "tests/e2e/**/*.test.ts"
 ```
 
 ---

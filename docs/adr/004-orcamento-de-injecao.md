@@ -23,10 +23,10 @@ Orçamento explícito, configurável, com **defaults conservadores**:
 
 ```yaml
 inject:
-  enabled: true          # desligado por padrão no plugin (preferência do dono)
+  enabled: false         # default desligado (FR-304, preferência do dono)
   max_memories: 5
   max_code_chunks: 3
-  max_chars: 4000
+  max_chars: 3000        # KILOCODE_GRAPH_INJECT_MAX_CHARS
   timeout_ms: 4000
 ```
 
