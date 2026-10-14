@@ -17,6 +17,7 @@ import { loadConfig, type PluginOptions } from "./config.ts";
 import { collectHook } from "./hooks/collect.ts";
 import { messagesHook } from "./hooks/messages.ts";
 import { debug, formatBootLine, log, logFatal, setDebug } from "./logger.ts";
+import { scheduleMcpRegistration, type KiloLikeClient } from "./mcp/register.ts";
 import type { PluginCtx } from "./types.ts";
 import { resolveWorkspaceDir, workspaceName } from "./workspace.ts";
 
@@ -85,6 +86,18 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
     client,
   });
 
+  // Registro do MCP remoto do memtier (E3b): implícito no boot, em background
+  // (`void ... .catch()`), nunca bloqueia o carregamento nem derruba o plugin
+  // (FR-601/FR-604). O token do header é o mesmo bearer do client HTTP.
+  scheduleMcpRegistration(ctx.client as KiloLikeClient | undefined, {
+    enabled: config.mcp.enabled,
+    name: config.mcp.name,
+    url: config.daemon.url,
+    token: client.resolveToken(),
+    directory: dir,
+    timeout_ms: config.mcp.timeout_ms,
+  });
+
   return {
     // E2: injeção de memória no turno (`messages.transform`). Só quando
     // `inject.enabled` (default `false`); o hook degrada sem quebrar o turno.
@@ -103,7 +116,8 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
     }),
     // `dispose` drena o health do boot (curto, com `AbortSignal.timeout`). A
     // coleta (E3a) é background e NÃO é drenada — o job do indexer pode ser
-    // longo (FR-510). MCP (E3b) e ingestão (E4) entram nas suas epics.
+    // longo (FR-510). O registro do MCP (E3b) também é background: não é
+    // drenado (não segura o shutdown). Ingestão (E4) entra na sua epic.
     dispose: async () => {
       debug("dispose");
       // A coleta é background (FR-510): o dispose não a espera — drenar o job

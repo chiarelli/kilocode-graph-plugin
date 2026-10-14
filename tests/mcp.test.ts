@@ -1,0 +1,146 @@
+/**
+ * E3b-S1 — `mcp/register.ts`: config pura + fluxo `status`→`add`→`connect` e
+ * degradação (nunca lança). Sem rede: `client.mcp` é stubado.
+ */
+
+import assert from "node:assert/strict";
+import { test } from "node:test";
+
+import {
+  buildMcpConfig,
+  registerMemtierMcp,
+  type KiloLikeClient,
+  type KiloMcpClient,
+  type KiloMcpStatus,
+  type McpRegisterConfig,
+} from "../src/mcp/register.ts";
+
+/** Config base do registro; cada teste sobrescreve o que importa. */
+function cfg(overrides: Partial<McpRegisterConfig> = {}): McpRegisterConfig {
+  return {
+    enabled: true,
+    name: "memtier",
+    url: "http://127.0.0.1:8400",
+    token: "tok-123",
+    directory: "/repo",
+    timeout_ms: 15000,
+    ...overrides,
+  };
+}
+
+/** Fake de `client.mcp` que registra as chamadas e devolve respostas dadas. */
+function fakeMcp(
+  opts: {
+    status?: KiloMcpStatus | undefined;
+    statusError?: unknown;
+    addThrows?: boolean;
+    addError?: unknown;
+    connectError?: unknown;
+  } = {},
+) {
+  const calls: string[] = [];
+  const statusMap: Record<string, KiloMcpStatus> = {};
+  if (opts.status) statusMap.memtier = opts.status;
+  const mcp: KiloMcpClient = {
+    status: async () => {
+      calls.push("status");
+      if (opts.statusError !== undefined) return { error: opts.statusError };
+      return { data: statusMap };
+    },
+    add: async () => {
+      calls.push("add");
+      if (opts.addThrows) throw new Error("boom");
+      if (opts.addError !== undefined) return { error: opts.addError };
+      return { data: {} };
+    },
+    connect: async () => {
+      calls.push("connect");
+      if (opts.connectError !== undefined) return { error: opts.connectError };
+      return { data: {} };
+    },
+    disconnect: async () => {
+      calls.push("disconnect");
+      return { data: {} };
+    },
+  };
+  return { client: { mcp } as KiloLikeClient, calls };
+}
+
+// --- buildMcpConfig (puro) -------------------------------------------------
+
+test("build_config_remote: url base vira …/v1/mcp com type remote", () => {
+  const config = buildMcpConfig({ url: "http://127.0.0.1:8400", token: "", timeout_ms: 15000 });
+  assert.equal(config.type, "remote");
+  assert.equal(config.url, "http://127.0.0.1:8400/v1/mcp");
+  assert.equal(config.enabled, true);
+});
+
+test("build_config_auth: token presente ⇒ header Authorization Bearer", () => {
+  const config = buildMcpConfig({ url: "http://memtier:8400", token: "abc", timeout_ms: 15000 });
+  assert.equal(config.headers?.Authorization, "Bearer abc");
+});
+
+test("build_config_no_token: sem token ⇒ sem header (borda decide 401)", () => {
+  const config = buildMcpConfig({ url: "http://memtier:8400", token: "", timeout_ms: 15000 });
+  assert.equal(config.headers, undefined);
+});
+
+test("build_config_trims_slash: url com barra final não duplica", () => {
+  const config = buildMcpConfig({ url: "http://memtier:8400/", token: "", timeout_ms: 15000 });
+  assert.equal(config.url, "http://memtier:8400/v1/mcp");
+});
+
+// --- registerMemtierMcp ----------------------------------------------------
+
+test("register_adds_and_connects: status vazio ⇒ add + connect", async () => {
+  const { client, calls } = fakeMcp();
+  await registerMemtierMcp(client, cfg());
+  assert.deepEqual(calls, ["status", "add", "connect"]);
+});
+
+test("register_skips_when_connected: status connected ⇒ não chama add", async () => {
+  const { client, calls } = fakeMcp({ status: { status: "connected" } });
+  await registerMemtierMcp(client, cfg());
+  assert.deepEqual(calls, ["status"]);
+});
+
+test("register_disabled: mcp.enabled=false ⇒ não chama nada", async () => {
+  const { client, calls } = fakeMcp();
+  await registerMemtierMcp(client, cfg({ enabled: false }));
+  assert.deepEqual(calls, []);
+});
+
+test("register_add_passes_remote_config: body com name + config remote", async () => {
+  let added: { name: string; config: { type: string; url: string } } | undefined;
+  const client: KiloLikeClient = {
+    mcp: {
+      status: async () => ({ data: {} }),
+      add: async (opts) => {
+        added = opts.body as never;
+        return { data: {} };
+      },
+      connect: async () => ({ data: {} }),
+      disconnect: async () => ({ data: {} }),
+    },
+  };
+  await registerMemtierMcp(client, cfg());
+  assert.equal(added?.name, "memtier");
+  assert.equal(added?.config.type, "remote");
+  assert.equal(added?.config.url, "http://127.0.0.1:8400/v1/mcp");
+});
+
+test("register_failure_not_fatal: add lança ⇒ não propaga", async () => {
+  const { client } = fakeMcp({ addThrows: true });
+  await assert.doesNotReject(() => registerMemtierMcp(client, cfg()));
+});
+
+test("register_status_error: status devolve erro ⇒ não registra", async () => {
+  const { client, calls } = fakeMcp({ statusError: { status: 500 } });
+  await registerMemtierMcp(client, cfg());
+  assert.deepEqual(calls, ["status"]);
+});
+
+test("register_connect_error: connect devolve erro ⇒ não lança", async () => {
+  const { client } = fakeMcp({ connectError: { status: 500 } });
+  await assert.doesNotReject(() => registerMemtierMcp(client, cfg()));
+});

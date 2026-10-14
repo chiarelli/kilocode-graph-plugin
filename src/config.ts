@@ -42,6 +42,7 @@ export const DEFAULTS = {
   mcp: {
     enabled: true,
     name: "memtier",
+    timeout_ms: 15000,
   },
   debug: false,
 } as const;
@@ -254,6 +255,14 @@ export function loadConfig(options?: PluginOptions): Config {
         DEFAULTS.mcp.enabled,
       ),
       name: resolve("mcp.name", "KILOCODE_GRAPH_MCP_NAME", DEFAULTS.mcp.name),
+      timeout_ms: resolveInt(
+        resolve(
+          "mcp.timeout_ms",
+          "KILOCODE_GRAPH_MCP_TIMEOUT_MS",
+          String(DEFAULTS.mcp.timeout_ms),
+        ),
+        DEFAULTS.mcp.timeout_ms,
+      ),
     },
     debug: resolveBool(
       resolve("debug", "KILOCODE_GRAPH_DEBUG", String(DEFAULTS.debug)),

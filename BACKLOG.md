@@ -62,7 +62,7 @@ Convenções válidas para todas as epics:
 - [x] **E3a-S5** — Fechamento: E2E do ciclo de vida real, docs, zero marcadores
 
 ### E3b — Registro do MCP do memtier
-- [ ] **E3b-S1** — Tracer bullet: registrar o MCP remoto no boot (`status`→`add`→`connect`)
+- [x] **E3b-S1** — Tracer bullet: registrar o MCP remoto no boot (`status`→`add`→`connect`)
 - [ ] **E3b-S2** — Endurecer: idempotência (não duplicar se já definido), degradação não-fatal
 - [ ] **E3b-S3** — Fechamento: prova de tools listáveis/chamáveis, docs, zero marcadores
 

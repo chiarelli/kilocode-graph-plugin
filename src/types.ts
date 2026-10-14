@@ -119,6 +119,8 @@ export interface Config {
   mcp: {
     enabled: boolean;
     name: string;
+    /** Timeout de fetch de tools do MCP no Kilo (ms). Default 15000. */
+    timeout_ms: number;
   };
   debug: boolean;
 }
