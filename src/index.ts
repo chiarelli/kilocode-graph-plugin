@@ -44,6 +44,7 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
     timeout_ms: config.daemon.health_timeout_ms,
     health_timeout_ms: config.daemon.health_timeout_ms,
     recall_timeout_ms: config.inject.timeout_ms,
+    sync_timeout_ms: config.code_index.sync_timeout_ms,
   });
 
   log(

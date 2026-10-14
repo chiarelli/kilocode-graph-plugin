@@ -204,6 +204,45 @@ test("collect_first_use: manifest vazio ⇒ sem removidos", async () => {
   assert.equal(sentFiles[0]?.file_path, "src/a.rs");
 });
 
+test("collect_incremental_no_removed: incremental não marca inalterados como removidos", async () => {
+  // Manifest com head ⇒ trigger incremental. O stream só traz o alterado; o
+  // inalterado (src/keep.rs) NÃO pode virar `chunks: []` (apagaria o grafo).
+  let sentFiles: Array<{ file_path: string; chunks: unknown[] }> = [];
+  const rt = runtime({
+    run: async (opts) => {
+      assert.equal(opts.mode, "incremental");
+      return { events: [chunkEvent("src/changed.rs", "c1")], skipped: false };
+    },
+    state: {
+      load: () => ({ files: ["src/keep.rs", "src/changed.rs"], last_git_head: "abc" }),
+      save: () => {},
+    },
+    client: {
+      syncCode: async (f) => {
+        sentFiles = f as never;
+        return EMPTY_SYNC;
+      },
+    },
+  });
+  await collectCode(rt);
+  const keep = sentFiles.find((f) => f.file_path === "src/keep.rs");
+  assert.equal(keep, undefined, "inalterado não deve ser enviado como removido");
+});
+
+test("collect_incremental_merges_manifest: estado pós-incremental preserva inalterados", async () => {
+  const saved: string[][] = [];
+  const rt = runtime({
+    run: async () => ({ events: [chunkEvent("src/changed.rs", "c1")], skipped: false }),
+    state: {
+      load: () => ({ files: ["src/keep.rs", "src/changed.rs"], last_git_head: "abc" }),
+      save: (files) => saved.push(files),
+    },
+    client: { syncCode: async () => EMPTY_SYNC },
+  });
+  await collectCode(rt);
+  assert.deepEqual(saved[0]?.sort(), ["src/changed.rs", "src/keep.rs"]);
+});
+
 // --- client.syncCode -------------------------------------------------------
 
 test("sync_body_shape: body tem workspace/program/files/edges", async () => {
@@ -247,4 +286,95 @@ test("sync_parses_result: 202 ⇒ upserted/deleted lidos", async () => {
   ]);
   assert.equal(result.upserted, 3);
   assert.equal(result.deleted, 1);
+});
+
+// --- E3a-S4: paginação + fallback 422 --------------------------------------
+
+/** Arquivo vazio (só conta para a paginação). */
+function emptyFile(i: number) {
+  return { file_path: `src/f${i}.rs`, language: "rust", chunks: [] };
+}
+
+test("sync_paginates_100: 250 arquivos ⇒ 3 requests (100/100/50)", async () => {
+  const sizes: number[] = [];
+  const client = new MemtierClient({
+    url: "http://memtier:8400",
+    workspace: "ws",
+    fetch: (async (_i, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { files: unknown[] };
+      sizes.push(body.files.length);
+      return new Response(JSON.stringify({ upserted: 0, deleted: 0, changed: 0, skipped: 0 }), { status: 202 });
+    }) as FetchLike,
+  });
+  const files = Array.from({ length: 250 }, (_v, i) => emptyFile(i));
+  await client.syncCode(files, []);
+  assert.deepEqual(sizes, [100, 100, 50]);
+});
+
+test("sync_aggregates: 3 respostas ⇒ upserted somado", async () => {
+  let n = 0;
+  const client = new MemtierClient({
+    url: "http://memtier:8400",
+    workspace: "ws",
+    fetch: (async () => {
+      n += 1;
+      return new Response(
+        JSON.stringify({ upserted: n, deleted: 0, changed: n, skipped: 0 }),
+        { status: 202 },
+      );
+    }) as FetchLike,
+  });
+  const files = Array.from({ length: 250 }, (_v, i) => emptyFile(i));
+  const result = await client.syncCode(files, []);
+  assert.equal(result.upserted, 1 + 2 + 3);
+});
+
+test("sync_422_fallback: 422 com edges ⇒ reenvia sem edges", async () => {
+  const bodies: Array<{ edges: unknown[] }> = [];
+  const client = new MemtierClient({
+    url: "http://memtier:8400",
+    workspace: "ws",
+    fetch: (async (_i, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { edges: unknown[] };
+      bodies.push(body);
+      if (body.edges.length > 0) {
+        return new Response(JSON.stringify({ detail: "aresta órfã" }), { status: 422 });
+      }
+      return new Response(JSON.stringify({ upserted: 1, deleted: 0, changed: 1, skipped: 0 }), { status: 202 });
+    }) as FetchLike,
+  });
+  const result = await client.syncCode(
+    [{ file_path: "src/a.rs", language: "rust", chunks: [] }],
+    [{ from_file: "src/a.rs", to_file: "src/b.rs", edge_kind: "import" }],
+  );
+  assert.equal(bodies.length, 2, "deve tentar com arestas e reenviar sem");
+  assert.equal(bodies[0]?.edges.length, 1);
+  assert.equal(bodies[1]?.edges.length, 0);
+  assert.equal(result.upserted, 1);
+});
+
+test("sync_422_no_edges: 422 sem arestas ⇒ propaga (nada a degradar)", async () => {
+  const client = new MemtierClient({
+    url: "http://memtier:8400",
+    workspace: "ws",
+    fetch: (async () => new Response("{}", { status: 422 })) as FetchLike,
+  });
+  await assert.rejects(
+    () => client.syncCode([{ file_path: "src/a.rs", language: "rust", chunks: [] }], []),
+    (err: unknown) => (err as { status?: number }).status === 422,
+  );
+});
+
+test("sync_single_no_pagination: ≤100 arquivos ⇒ 1 request", async () => {
+  let calls = 0;
+  const client = new MemtierClient({
+    url: "http://memtier:8400",
+    workspace: "ws",
+    fetch: (async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ upserted: 0, deleted: 0, changed: 0, skipped: 0 }), { status: 202 });
+    }) as FetchLike,
+  });
+  await client.syncCode([emptyFile(0)], []);
+  assert.equal(calls, 1);
 });

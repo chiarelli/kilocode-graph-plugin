@@ -11,8 +11,8 @@
  * `self::`/`super::` relativos; `std`/`core`/`alloc` descartados; só resolve se
  * o arquivo está no conjunto indexado.
  *
- * Módulo **puro** (sem I/O). Resolução de TS/Go/Java/Python fora do MVP
- * (`TODO(tracer-bullet)`) — sem resolução, a aresta é descartada.
+ * Módulo **puro** (sem I/O). Resolução de TS/Go/Java/Python fora do MVP — sem
+ * resolução, a aresta é descartada (o alvo não é inventado).
  */
 
 import type { CodeEdge, CodeFile } from "../types.ts";

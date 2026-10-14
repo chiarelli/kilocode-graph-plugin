@@ -2,11 +2,9 @@
  * Hook do coletor de código (E3a-S1) — thin.
  *
  * Dispara a coleta **fora do turno** (FR-510): roda em background
- * (`void run().catch(...)`) e nunca é `await` no caminho crítico. O gatilho da
- * fatia 1 é o **boot** do plugin; a S4 adiciona o híbrido full/incremental por
- * `git_range` e a cadência por sessão.
- *
- * Minimal (`TODO(tracer-bullet)`): só boot; sem incremental/backpressure/paginação.
+ * (`void run().catch(...)`) e nunca é `await` no caminho crítico. O gatilho é o
+ * **boot** do plugin; o `trigger.ts` decide full (1º uso) vs incremental
+ * (`git_range` a partir do HEAD gravado). O backpressure fica no `runner`.
  */
 
 import {
@@ -25,7 +23,8 @@ import {
   removedFiles,
   saveManifest,
 } from "../index/manifest.ts";
-import { runIndexer } from "../index/runner.ts";
+import { runIndexer, type IndexMode } from "../index/runner.ts";
+import { decideTrigger } from "../index/trigger.ts";
 import { join } from "node:path";
 import type { SyncResult } from "../types.ts";
 
@@ -53,7 +52,9 @@ export interface CollectRuntime {
 
 /** Porta de estado do coletor (manifest) — implementada por `index/manifest.ts`. */
 export interface CollectState {
-  load(): { files: string[] };
+  /** Estado atual (arquivos sincronizados + head). */
+  load(): { files: string[]; last_git_head?: string | null };
+  /** Persiste o estado pós-sync (arquivos atuais + head). */
   save(files: string[], head: string | null): void;
 }
 
@@ -94,7 +95,7 @@ function fileState(repoRoot: string, workspace: string): CollectState {
   return {
     load: () => {
       const manifest = loadManifest(path, workspace);
-      return { files: manifest.files };
+      return { files: manifest.files, last_git_head: manifest.last_git_head };
     },
     save: (files, head) => {
       try {
@@ -110,10 +111,20 @@ function fileState(repoRoot: string, workspace: string): CollectState {
   };
 }
 
+/** HEAD atual do repo (base do incremental); `null` fora de um repo git. */
+async function currentHead(repoRoot: string): Promise<string | null> {
+  const { execFile } = await import("node:child_process");
+  return new Promise((resolve) => {
+    execFile("git", ["-C", repoRoot, "rev-parse", "HEAD"], (err, stdout) => {
+      resolve(err ? null : stdout.trim() || null);
+    });
+  });
+}
+
 /**
- * Coleta completa: spawna o indexer, monta o body (com removidos do manifest) e
- * chama `/v1/code/sync`. **Nunca lança** — degrada em qualquer falha (FR-510/E5).
- * Devolve o `SyncResult` quando houve sync (para o E2E provar o efeito real).
+ * Coleta completa: decide full/incremental (trigger), spawna o indexer, monta o
+ * body (removidos do manifest) e chama `/v1/code/sync`. **Nunca lança** — degrada
+ * em qualquer falha (FR-510/E5). Devolve o `SyncResult` quando houve sync.
  */
 export async function collectCode(rt: CollectRuntime): Promise<SyncResult | null> {
   if (!rt.cfg.enabled) {
@@ -124,12 +135,20 @@ export async function collectCode(rt: CollectRuntime): Promise<SyncResult | null
   const state = rt.state ?? fileState(rt.repoRoot, rt.identity.workspace);
   const start = Date.now();
 
+  const manifest = state.load();
+  const trigger = decideTrigger({
+    files: manifest.files,
+    last_git_head: manifest.last_git_head ?? null,
+  });
+  const mode: IndexMode = trigger.mode;
+
   let result;
   try {
     result = await run({
       bin: rt.cfg.indexer_bin,
       repoRoot: rt.repoRoot,
-      mode: "full",
+      mode,
+      gitRange: trigger.gitRange,
     });
   } catch (err) {
     logFatal("collect indexer", err);
@@ -142,18 +161,23 @@ export async function collectCode(rt: CollectRuntime): Promise<SyncResult | null
     return null;
   }
 
-  const manifest = state.load();
   const present = collectPresent(result.events);
-  const removed = removedFiles(
-    { ...emptyManifest(rt.identity.workspace), files: manifest.files },
-    present,
-  );
+  // Removidos só se detectam no FULL: no incremental o stream traz apenas os
+  // arquivos alterados no range — tratá-los como "estado completo" marcaria
+  // todo inalterado como removido e apagaria o grafo (defeito medido).
+  const removed =
+    mode === "full"
+      ? removedFiles(
+          { ...emptyManifest(rt.identity.workspace), files: manifest.files },
+          present,
+        )
+      : [];
 
   const body = buildSyncBody(result.events, rt.identity, {
     repoRoot: rt.repoRoot,
     removed,
   });
-  if (body.files.length === 0) {
+  if (body.files.length === 0 && removed.length === 0) {
     debug("collect: nenhum chunk emitido; nada a sincronizar");
     logCollection(indexerMs, 0, 0);
     return null;
@@ -162,11 +186,15 @@ export async function collectCode(rt: CollectRuntime): Promise<SyncResult | null
   try {
     const sync = await rt.client.syncCode(body.files, body.edges);
     logCollection(indexerMs, body.files.length, body.edges.length, sync);
-    // Estado pós-sync: os arquivos ATUAIS (sem os removidos). O head entra na S4.
-    state.save(present, null);
+    // Estado pós-sync: arquivos ATUAIS (sem removidos) + HEAD atual. No
+    // incremental, `present` só traz os alterados; mescla com os que já
+    // estavam no manifest para não perder os inalterados.
+    const merged = mode === "incremental"
+      ? [...new Set([...manifest.files.filter((f) => !removed.includes(f)), ...present])]
+      : present;
+    state.save(merged, await currentHead(rt.repoRoot));
     return sync;
   } catch (err) {
-    // TODO(tracer-bullet): fallback 422 sem arestas (S4).
     logSyncFailure(err);
     return null;
   }

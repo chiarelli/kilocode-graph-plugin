@@ -37,6 +37,7 @@ export const DEFAULTS = {
   code_index: {
     enabled: false,
     indexer_bin: "",
+    sync_timeout_ms: 120000,
   },
   mcp: {
     enabled: true,
@@ -233,6 +234,14 @@ export function loadConfig(options?: PluginOptions): Config {
         "code_index.indexer_bin",
         "KILOCODE_GRAPH_INDEXER_BIN",
         DEFAULTS.code_index.indexer_bin,
+      ),
+      sync_timeout_ms: resolveInt(
+        resolve(
+          "code_index.sync_timeout_ms",
+          "KILOCODE_GRAPH_INDEX_SYNC_TIMEOUT_MS",
+          String(DEFAULTS.code_index.sync_timeout_ms),
+        ),
+        DEFAULTS.code_index.sync_timeout_ms,
       ),
     },
     mcp: {

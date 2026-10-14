@@ -9,8 +9,12 @@
  * Protocolo (doc/protocol.md): `{protocol_version, type:"command", command,
  * seq, job_id, payload}`. Linha não-JSON é ignorada (mesma tolerância do probe).
  *
- * Minimal da fatia 1 (`TODO(tracer-bullet)`): backpressure (`pause`→`ack`/
- * `error.code=BACKPRESSURE`→`resume`) e timeout do job entram na S4.
+ * Backpressure (S4, protocolo two-way — `protocol.md:159` e §"Armadilhas"): se a
+ * fila do indexer encher, ele pausa e espera resposta. Um runner que só lê trava
+ * para sempre. Trata as DUAS formas do protocolo:
+ *   - evento `pause` ⇒ responde `ack {count}` (drena a fila; resume automático);
+ *   - `error` com `code=BACKPRESSURE` ⇒ responde `resume` (spec §E3a-S1).
+ * Também manda `resume` no evento `resume` (idempotente, mantém o job fluindo).
  */
 
 import { spawn } from "node:child_process";
@@ -28,14 +32,14 @@ export interface RunIndexerOptions {
   bin: string;
   /** Raiz do repo a indexar. */
   repoRoot: string;
-  /** Modo (S4 usa "incremental"; a S1 só exercita "full"). */
+  /** Modo (full na S1; incremental na S4). */
   mode: IndexMode;
   /** Extrai imports/calls (arestas). Default `true`. */
   extractImports?: boolean;
   extractCalls?: boolean;
-  /** Range do incremental (S4). Sem uso na fatia 1. */
+  /** Range do incremental (S4). */
   gitRange?: { from: string; to: string };
-  /** Resolve ao ver `job_completed`; limita uma leitura patológica. */
+  /** Timeout do job (ms); estouro ⇒ encerra e devolve o que veio. */
   jobTimeoutMs?: number;
 }
 
@@ -50,12 +54,12 @@ export interface RunIndexerResult {
 
 const DEFAULT_JOB_TIMEOUT_MS = 300_000;
 
-/** Monta o comando JSONL do job (payload do probe/spec §2). */
+/** Monta o comando JSONL do job (payload do probe/spec §2) + o `job_id`. */
 export function buildCommand(
   mode: IndexMode,
   repoRoot: string,
   opts: RunIndexerOptions = {} as RunIndexerOptions,
-): string {
+): { line: string; jobId: string } {
   const command = mode === "incremental" ? "incremental_index" : "index_path";
   const payload: Record<string, unknown> = { path: repoRoot };
   if (mode === "incremental") {
@@ -68,14 +72,16 @@ export function buildCommand(
     extract_imports: opts.extractImports ?? true,
     extract_calls: opts.extractCalls ?? true,
   };
-  return JSON.stringify({
+  const jobId = `graph-${mode}-${Date.now()}`;
+  const line = JSON.stringify({
     protocol_version: "1.0.0",
     type: "command",
     command,
     seq: 1,
-    job_id: `graph-${mode}-${Date.now()}`,
+    job_id: jobId,
     payload,
   });
+  return { line, jobId };
 }
 
 /** Parse defensivo de uma linha JSONL: inválida ⇒ `null` (ignorada). */
@@ -93,6 +99,39 @@ export function parseLine(line: string): IndexerEvent | null {
   }
 }
 
+/** Tipo do comando de controle respondido ao backpressure. */
+export type ControlCommand = "ack" | "resume";
+
+/**
+ * Decide o comando de controle a enviar para um evento (ou `null`). Cobre as
+ * duas formas do protocolo:
+ *   - `pause` ⇒ `ack` com `count` (drena a fila; o resume automático só dispara
+ *     quando a fila cai abaixo do threshold, e ela só cai com `ack`);
+ *   - `error` com `code=BACKPRESSURE` ⇒ `ack` (a spec §E3a-S1 citava `resume`,
+ *     mas o próprio protocolo manda drenar com `ack` — enviar ambos é seguro);
+ *   - `resume` ⇒ `resume` (idempotente; mantém o job fluindo).
+ */
+export function controlForEvent(event: IndexerEvent): ControlCommand | null {
+  if (event.event === "pause") return "ack";
+  if (event.event === "resume") return "resume";
+  if (event.event === "error") {
+    const payload = event.payload as { code?: unknown } | null;
+    if (payload && payload.code === "BACKPRESSURE") return "ack";
+  }
+  return null;
+}
+
+/** Linha JSON do comando de controle (`ack`/`resume`) com o `job_id` do job. */
+export function controlLine(command: ControlCommand, jobId: string): string {
+  return JSON.stringify({
+    protocol_version: "1.0.0",
+    type: "command",
+    command,
+    job_id: jobId,
+    payload: { count: 500 },
+  });
+}
+
 /**
  * Spawna o indexer e devolve os eventos até `job_completed`. Degrada sem lançar:
  * `bin` vazio/caminho inexistente ⇒ `{events:[], skipped:true}` (FR-306). Falha
@@ -108,7 +147,7 @@ export async function runIndexer(
   }
 
   const events: IndexerEvent[] = [];
-  const command = buildCommand(opts.mode, opts.repoRoot, opts);
+  const { line, jobId } = buildCommand(opts.mode, opts.repoRoot, opts);
   const timeoutMs = opts.jobTimeoutMs ?? DEFAULT_JOB_TIMEOUT_MS;
 
   return new Promise<RunIndexerResult>((resolve) => {
@@ -160,6 +199,17 @@ export async function runIndexer(
       const ev = parseLine(line);
       if (!ev) return;
       events.push(ev);
+      // Backpressure (two-way): responde `ack`/`resume` no stdin do processo.
+      // Um runner que só lê deixa o job preso em `pause` para sempre.
+      const control = controlForEvent(ev);
+      if (control) {
+        debug(`collect: indexer ${ev.event} → enviando ${control}`);
+        try {
+          child.stdin.write(`${controlLine(control, jobId)}\n`);
+        } catch {
+          // stdin fechado (processo saindo): o `close` resolve o job.
+        }
+      }
       if (ev.event === "job_completed") finish({ events, skipped: false });
     });
 
@@ -169,7 +219,7 @@ export async function runIndexer(
     });
 
     try {
-      child.stdin.write(`${command}\n`);
+      child.stdin.write(`${line}\n`);
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       finish({ events, skipped: true, reason });

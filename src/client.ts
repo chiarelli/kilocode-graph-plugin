@@ -12,6 +12,7 @@
 
 import { readFileSync } from "node:fs";
 
+import { debug } from "./logger.ts";
 import type { CodeEdge, CodeFile, HealthReport, SyncResult } from "./types.ts";
 
 /** Assinatura mínima de `fetch` usada pelo cliente (permite stub em teste). */
@@ -40,6 +41,8 @@ export interface MemtierClientOptions {
   health_timeout_ms?: number;
   /** Timeout do recall (ms) — default 4000 (orçamento do hook). */
   recall_timeout_ms?: number;
+  /** Timeout do sync de código (ms) — default 120000 (embedding é lento). */
+  sync_timeout_ms?: number;
   /** `fetch` injetável (default `globalThis.fetch`). */
   fetch?: FetchLike;
   /** Leitor de arquivo injetável (default `readFileSync` utf-8). */
@@ -49,6 +52,11 @@ export interface MemtierClientOptions {
 const DEFAULT_TIMEOUT_MS = 2000;
 const DEFAULT_HEALTH_TIMEOUT_MS = 2000;
 const DEFAULT_RECALL_TIMEOUT_MS = 4000;
+const DEFAULT_SYNC_TIMEOUT_MS = 120000;
+
+/** Limites do `POST /v1/code/sync` (memtier `code.py`, NFR-09). */
+const MAX_FILES_PER_REQUEST = 100;
+const MAX_EDGES_PER_REQUEST = 5000;
 
 /** Erro HTTP base — carrega o status para o chamador decidir. */
 export class MemtierHttpError extends Error {
@@ -84,8 +92,18 @@ export function httpError(status: number, detail: string): MemtierHttpError {
   return new MemtierHttpError(status, msg);
 }
 
-/** Deriva `ok` do status textual do servidor. */
-function reportFromBody(status: string, body: Partial<HealthReport>): HealthReport {
+/**
+ * Fatia uma lista de arestas em lotes de ≤`size`. Lista vazia ⇒ `[[]]` (o lote
+ * de arquivos ainda precisa ser enviado, mesmo sem arestas).
+ */
+export function chunkEdges<T>(edges: T[], size: number): T[][] {
+  if (edges.length === 0) return [[]];
+  const out: T[][] = [];
+  for (let i = 0; i < edges.length; i += size) out.push(edges.slice(i, i + size));
+  return out;
+}
+
+/** Deriva `ok` do status textual do servidor. */function reportFromBody(status: string, body: Partial<HealthReport>): HealthReport {
   return {
     ok: status === "ok",
     status,
@@ -166,6 +184,7 @@ export class MemtierClient {
   private readonly timeoutMs: number;
   private readonly healthTimeoutMs: number;
   private readonly recallTimeoutMs: number;
+  private readonly syncTimeoutMs: number;
   private readonly fetchImpl: FetchLike;
   private readonly readFileImpl: ReadFileLike;
   /** Cache do token de arquivo: `undefined` = ainda não lido (lazy). */
@@ -180,6 +199,7 @@ export class MemtierClient {
     this.timeoutMs = options.timeout_ms ?? DEFAULT_TIMEOUT_MS;
     this.healthTimeoutMs = options.health_timeout_ms ?? DEFAULT_HEALTH_TIMEOUT_MS;
     this.recallTimeoutMs = options.recall_timeout_ms ?? DEFAULT_RECALL_TIMEOUT_MS;
+    this.syncTimeoutMs = options.sync_timeout_ms ?? DEFAULT_SYNC_TIMEOUT_MS;
     this.fetchImpl = options.fetch ?? (globalThis.fetch as FetchLike);
     this.readFileImpl =
       options.readFile ?? ((p) => readFileSync(p, "utf-8") as string);
@@ -310,14 +330,66 @@ export class MemtierClient {
   }
 
   /**
-   * `POST /v1/code/sync` (E3a-S1). Envia o estado completo dos arquivos + as
-   * arestas resolvidas e devolve a resposta 202. Body aditivo E11/E12
-   * (`program`/`edges`). Sem paginação nesta fatia (1 request; S4 pagina).
-   * Lança erro tipado no HTTP não-2xx — quem chama (o coletor) degrada.
+   * `POST /v1/code/sync` (E3a-S1; paginação/fallback na S4). Fatia `files` em
+   * lotes de ≤`MAX_FILES_PER_REQUEST` (100) e agrega os `SyncResult`. As arestas
+   * são agrupadas por arquivo de ORIGEM e enviadas **no lote que contém a
+   * origem** (o servidor exige a origem no payload quando a aresta é de nível de
+   * arquivo — ADR-012 D3). Se um lote der 422, reenvia **sem as arestas**
+   * (fallback: a dependência é menos crítica que os chunks) e loga.
    */
   async syncCode(
     files: CodeFile[],
     edges: CodeEdge[] = [],
+    signal?: AbortSignal,
+  ): Promise<SyncResult> {
+    if (files.length <= MAX_FILES_PER_REQUEST) {
+      return this.sendSyncCode(files, edges, signal);
+    }
+    const aggregated: SyncResult = {
+      workspace: this.workspace,
+      upserted: 0,
+      deleted: 0,
+      changed: 0,
+      skipped: 0,
+      edges_upserted: 0,
+      edges_deleted: 0,
+      results: [],
+    };
+    const edgesByOrigin = new Map<string, CodeEdge[]>();
+    for (const e of edges) {
+      const list = edgesByOrigin.get(e.from_file) ?? [];
+      list.push(e);
+      edgesByOrigin.set(e.from_file, list);
+    }
+    for (let i = 0; i < files.length; i += MAX_FILES_PER_REQUEST) {
+      const batch = files.slice(i, i + MAX_FILES_PER_REQUEST);
+      const batchEdges = batch.flatMap((f) => edgesByOrigin.get(f.file_path) ?? []);
+      // BACKLOG pendência #2: 100 arquivos produzem >5.000 arestas facilmente
+      // ⇒ 422 no lote inteiro. Fatia as arestas também: o mesmo lote de arquivos
+      // é reenviado com cada fatia de ≤5.000 arestas (idempotente no servidor).
+      const edgeGroups = chunkEdges(batchEdges, MAX_EDGES_PER_REQUEST);
+      for (const group of edgeGroups) {
+        const res = await this.sendSyncCode(batch, group, signal);
+        aggregated.upserted += res.upserted;
+        aggregated.deleted += res.deleted;
+        aggregated.changed += res.changed;
+        aggregated.skipped += res.skipped;
+        aggregated.edges_upserted =
+          (aggregated.edges_upserted ?? 0) + (res.edges_upserted ?? 0);
+        aggregated.edges_deleted =
+          (aggregated.edges_deleted ?? 0) + (res.edges_deleted ?? 0);
+        if (res.results) {
+          aggregated.results = [...(aggregated.results ?? []), ...res.results];
+        }
+      }
+    }
+    return aggregated;
+  }
+
+  /** Um request de sync (sem paginação). Rede + parse da resposta 202. */
+  private async sendSyncCode(
+    files: CodeFile[],
+    edges: CodeEdge[],
     signal?: AbortSignal,
   ): Promise<SyncResult> {
     const identity = this.resolveIdentity();
@@ -327,13 +399,32 @@ export class MemtierClient {
       files,
       edges,
     };
-    const res = await this.sendJson<SyncResult>(
-      "POST",
-      "/v1/code/sync",
-      body,
-      this.timeoutMs,
-      signal,
-    );
+    let res: SyncResult;
+    try {
+      res = await this.sendJson<SyncResult>(
+        "POST",
+        "/v1/code/sync",
+        body,
+        this.syncTimeoutMs,
+        signal,
+      );
+    } catch (err) {
+      // Fallback 422: a aresta órfã derruba o lote. Reenvia só os chunks (a
+      // navegação degrada, o conteúdo não). Nunca se aplica sem arestas.
+      if (!(err instanceof MemtierHttpError) || err.status !== 422 || edges.length === 0) {
+        throw err;
+      }
+      debug(
+        `collect: sync 422 com ${edges.length} arestas; reenviando sem arestas`,
+      );
+      res = await this.sendJson<SyncResult>(
+        "POST",
+        "/v1/code/sync",
+        { ...body, edges: [] },
+        this.syncTimeoutMs,
+        signal,
+      );
+    }
     return {
       workspace: res.workspace,
       upserted: res.upserted ?? 0,

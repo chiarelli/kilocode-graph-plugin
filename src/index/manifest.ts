@@ -14,7 +14,8 @@
  * `mergeManifest`) testáveis isoladas; o leitor é injetável no teste.
  */
 
-import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 
 /** Estado persistido por workspace. */
 export interface Manifest {
@@ -74,11 +75,17 @@ export function saveManifest(
     writeFile?: (p: string, data: string) => void;
     rename?: (from: string, to: string) => void;
     exists?: (p: string) => boolean;
+    mkdir?: (p: string) => void;
   } = {},
 ): void {
   if (!path) return;
   const write = io.writeFile ?? ((p, d) => writeFileSync(p, d, "utf-8"));
   const rename = io.rename ?? renameSync;
+  const mkdir = io.mkdir ?? ((p) => void mkdirSync(p, { recursive: true }));
+  // `.kilo/` pode não existir (repo sem config do Kilo) — sem criar, a escrita
+  // falha silenciosamente e o manifest nunca persiste (o full refaz sempre).
+  const dir = dirname(path);
+  if (dir && dir !== ".") mkdir(dir);
   const tmp = `${path}.tmp`;
   const data = `${JSON.stringify(manifest, null, 2)}\n`;
   write(tmp, data);

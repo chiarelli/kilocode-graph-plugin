@@ -113,6 +113,8 @@ export interface Config {
   code_index: {
     enabled: boolean;
     indexer_bin: string;
+    /** Timeout por request de sync (ms). Default 120000 (embedding é lento). */
+    sync_timeout_ms: number;
   };
   mcp: {
     enabled: boolean;

@@ -68,6 +68,7 @@ test("manifest_atomic_write: grava em tmp e renomeia; JSON válido", () => {
     rename: (from, to) => {
       renamed = [from, to];
     },
+    mkdir: () => {},
   });
   assert.equal(calls.length, 1);
   assert.match(calls[0]![0], /\.tmp$/);
@@ -84,4 +85,20 @@ test("manifest_merge_dedups: arquivos duplicados ⇒ um só", () => {
 
 test("manifest_no_path: caminho vazio ⇒ save é no-op (não lança)", () => {
   assert.doesNotThrow(() => saveManifest("", emptyManifest("ws")));
+});
+
+test("manifest_creates_dir: cria o diretório pai (.kilo) antes de gravar", () => {
+  let madeDir = "";
+  let renamed: [string, string] | null = null;
+  saveManifest("/repo/.kilo/graph-manifest.json", emptyManifest("ws"), {
+    writeFile: () => {},
+    rename: (from, to) => {
+      renamed = [from, to];
+    },
+    mkdir: (p) => {
+      madeDir = p;
+    },
+  });
+  assert.equal(madeDir, "/repo/.kilo");
+  assert.ok(renamed, "deve renomear o tmp para o destino");
 });

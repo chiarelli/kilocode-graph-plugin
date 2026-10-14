@@ -58,7 +58,7 @@ Convenções válidas para todas as epics:
 - [x] **E3a-S1** — Tracer bullet: spawn do indexer → `chunk_emitted` → `POST /v1/code/sync` (1 arquivo)
 - [x] **E3a-S2** — Arestas: `import_edge`/`call_edge` → `edges[]` (resolver alvo; descartar órfã)
 - [x] **E3a-S3** — Ciclo de vida: manifest por workspace → removidos com `chunks: []`; idempotência por `chunk_md5`
-- [ ] **E3a-S4** — Trigger híbrido + backpressure (`pause`/`resume`) + paginação do sync
+- [x] **E3a-S4** — Trigger híbrido + backpressure (`pause`/`resume`) + paginação do sync
 - [ ] **E3a-S5** — Fechamento: E2E do ciclo de vida real, docs, zero marcadores
 
 ### E3b — Registro do MCP do memtier

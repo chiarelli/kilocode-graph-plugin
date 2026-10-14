@@ -22,6 +22,7 @@ const ENV_KEYS = [
   "KILOCODE_GRAPH_TOKEN",
   "KILOCODE_GRAPH_INJECT_ENABLED",
   "KILOCODE_GRAPH_INJECT_MAX_CHARS",
+  "KILOCODE_GRAPH_INDEX_SYNC_TIMEOUT_MS",
 ] as const;
 
 function clearEnv(): void {
@@ -96,4 +97,11 @@ test("config_int_via_options: inteiro de options é aceito", () => {
   clearEnv();
   const cfg = loadConfig({ inject: { max_memories: "7" } });
   assert.equal(cfg.inject.max_memories, 7);
+});
+
+test("config_code_sync_timeout: default 120000 e env honrada", () => {
+  clearEnv();
+  assert.equal(loadConfig().code_index.sync_timeout_ms, 120000);
+  process.env.KILOCODE_GRAPH_INDEX_SYNC_TIMEOUT_MS = "5000";
+  assert.equal(loadConfig().code_index.sync_timeout_ms, 5000);
 });
