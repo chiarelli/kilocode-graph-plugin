@@ -21,6 +21,69 @@ export interface HealthReport {
 }
 
 /**
+ * Chunk de código no body de `POST /v1/code/sync` (espelha `CodeChunkBody` do
+ * memtier, E5-S1/S2). `symbol_id` é NOME puro do símbolo (`"main"`), nunca
+ * qualificado com o arquivo — a identidade `{file}:{symbol}` é do servidor.
+ * `Symbol` exige `symbol_id`; `FullFile`/`Contextual` o proíbem (ADR-002).
+ */
+export interface CodeChunk {
+  chunk_id: string;
+  chunk_kind: "Symbol" | "FullFile" | "Contextual";
+  symbol_id: string | null;
+  start_line: number;
+  end_line: number;
+  chunk_md5: string;
+  text: string;
+}
+
+/** Arquivo (com seus chunks) no body de `POST /v1/code/sync` (`CodeFileBody`). */
+export interface CodeFile {
+  file_path: string;
+  language: string;
+  chunks: CodeChunk[];
+}
+
+/** Aresta de código no body (`CodeEdgeBody`, ADR-012). Alvo tem de existir. */
+export interface CodeEdge {
+  from_file: string;
+  from_symbol_id?: string | null;
+  to_file: string;
+  to_symbol_id?: string | null;
+  edge_kind: "import" | "call";
+}
+
+/** Resposta de `POST /v1/code/sync` (202; `changed`/`skipped` aditivos A2). */
+export interface SyncResult {
+  workspace?: string;
+  upserted: number;
+  deleted: number;
+  changed: number;
+  skipped: number;
+  edges_upserted?: number;
+  edges_deleted?: number;
+  results?: Array<{
+    file_path: string;
+    upserted?: number;
+    deleted?: number;
+    changed?: number;
+    skipped?: number;
+  }>;
+}
+
+/**
+ * Evento do protocolo JSONL do `rust-ast-indexer` (doc/protocol.md): cada linha
+ * do stdout é um JSON independente. `payload` é `unknown` porque o formato varia
+ * por evento; o `collector` valida campo a campo.
+ */
+export interface IndexerEvent {
+  protocol_version?: string;
+  type?: string;
+  event?: string;
+  job_id?: string;
+  payload?: unknown;
+}
+
+/**
  * Contexto mínimo do plugin que a fundação consome. Estruturalmente compatível
  * com o `PluginInput` do SDK (que traz `client`, `directory`, `worktree`).
  */

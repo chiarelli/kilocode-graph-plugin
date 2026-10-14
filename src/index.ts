@@ -14,6 +14,7 @@ import { isAbsolute, join } from "node:path";
 
 import { MemtierClient } from "./client.ts";
 import { loadConfig, type PluginOptions } from "./config.ts";
+import { collectHook } from "./hooks/collect.ts";
 import { messagesHook } from "./hooks/messages.ts";
 import { debug, formatBootLine, log, logFatal, setDebug } from "./logger.ts";
 import type { PluginCtx } from "./types.ts";
@@ -73,6 +74,16 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
     debug(`workspace dir=${dir}`);
   }
 
+  // Coleta de código (E3a): dispara no boot, **fora do turno** (FR-510). O
+  // `collectCode` nunca lança e roda em background; não é drenado no shutdown
+  // (o job do indexer pode ser longo — o processo o encerra se sair).
+  void collectHook({
+    cfg: config.code_index,
+    repoRoot: dir,
+    identity: { workspace, program: config.daemon.program },
+    client,
+  });
+
   return {
     // E2: injeção de memória no turno (`messages.transform`). Só quando
     // `inject.enabled` (default `false`); o hook degrada sem quebrar o turno.
@@ -94,6 +105,9 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
     // de sair; o health tem timeout, então nunca pendura (`AbortSignal.timeout`).
     dispose: async () => {
       debug("dispose");
+      // A coleta é background (FR-510): o dispose não a espera — drenar o job
+      // do indexer poderia segurar o shutdown por todo o timeout do job. O
+      // health do boot é curto e tem `AbortSignal.timeout`, então é drenado.
       await bootHealth;
     },
   };

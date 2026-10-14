@@ -12,7 +12,7 @@
 
 import { readFileSync } from "node:fs";
 
-import type { HealthReport } from "./types.ts";
+import type { CodeEdge, CodeFile, HealthReport, SyncResult } from "./types.ts";
 
 /** Assinatura mínima de `fetch` usada pelo cliente (permite stub em teste). */
 export type FetchLike = (
@@ -307,6 +307,43 @@ export class MemtierClient {
     }
     if (typeof res.truncated === "boolean") result.truncated = res.truncated;
     return result;
+  }
+
+  /**
+   * `POST /v1/code/sync` (E3a-S1). Envia o estado completo dos arquivos + as
+   * arestas resolvidas e devolve a resposta 202. Body aditivo E11/E12
+   * (`program`/`edges`). Sem paginação nesta fatia (1 request; S4 pagina).
+   * Lança erro tipado no HTTP não-2xx — quem chama (o coletor) degrada.
+   */
+  async syncCode(
+    files: CodeFile[],
+    edges: CodeEdge[] = [],
+    signal?: AbortSignal,
+  ): Promise<SyncResult> {
+    const identity = this.resolveIdentity();
+    const body = {
+      workspace: identity.workspace,
+      program: identity.program,
+      files,
+      edges,
+    };
+    const res = await this.sendJson<SyncResult>(
+      "POST",
+      "/v1/code/sync",
+      body,
+      this.timeoutMs,
+      signal,
+    );
+    return {
+      workspace: res.workspace,
+      upserted: res.upserted ?? 0,
+      deleted: res.deleted ?? 0,
+      changed: res.changed ?? 0,
+      skipped: res.skipped ?? 0,
+      edges_upserted: res.edges_upserted,
+      edges_deleted: res.edges_deleted,
+      results: res.results,
+    };
   }
 
   /**
