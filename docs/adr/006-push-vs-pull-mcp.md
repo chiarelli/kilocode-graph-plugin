@@ -1,6 +1,6 @@
 # ADR-006 — Push (injeção no turno) vs pull (ferramentas MCP)
 
-**Status:** aceito
+**Status:** aceito · **implementado na E3b** (registro implícito do MCP remoto)
 **Data:** 2026-10-14
 **Origem:** decisão do dono (2026-10-14), PRD FR-601..604, memtier E7
 
@@ -69,3 +69,15 @@ expor a tool MCP.** O plugin **não** promete navegação nem a reimplementa via
 HTTP: seria uma segunda superfície para o mesmo dado, fora do modelo pull
 escolhido. Quando o memtier expuser a tool, o plugin a herda sem código novo
 (mesmo padrão de registro).
+
+## Implementação (E3b, 2026-10-14)
+
+- `src/mcp/register.ts` — `status` → `add` (`type:"remote"`, `url:…/v1/mcp`,
+  header `Authorization: Bearer <token>`) → `connect`; disparado no boot em
+  background (`scheduleMcpRegistration`), nunca bloqueia nem derruba o plugin.
+- `src/mcp/kilo-config.ts` — lê o `kilo.jsonc` (JSONC) e respeita um `mcp.<name>`
+  já definido pelo usuário (idempotência, FR-602).
+- E2E (`tests/e2e/test_e2e_mcp.test.ts`, gated `E2E=1`) prova o registro
+  implícito e as **4 tools** listáveis/chamáveis via cliente MCP real.
+- A tool `neighbors` **não** é oferecida (não existe no memtier) — navegação não
+  é prometida.

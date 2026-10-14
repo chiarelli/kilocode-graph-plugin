@@ -64,7 +64,7 @@ Convenções válidas para todas as epics:
 ### E3b — Registro do MCP do memtier
 - [x] **E3b-S1** — Tracer bullet: registrar o MCP remoto no boot (`status`→`add`→`connect`)
 - [x] **E3b-S2** — Endurecer: idempotência (não duplicar se já definido), degradação não-fatal
-- [ ] **E3b-S3** — Fechamento: prova de tools listáveis/chamáveis, docs, zero marcadores
+- [x] **E3b-S3** — Fechamento: prova de tools listáveis/chamáveis, docs, zero marcadores
 
 ### Segunda onda (spec sob demanda)
 - [ ] **E3c** — Injeção de código (`code_search` no `messages.transform`)
@@ -330,3 +330,30 @@ redescobertas no meio do loop.
      `CodeSyncBody.files` tem `min_length=1`, então "todos os removidos" não é
      representável; o caso coberto é a remoção individual (`chunks: []`), que a
      S3 prova.
+
+- **2026-10-14 — E3b fechada (S1/S2/S3):** registro do MCP remoto do memtier
+  entregue sobre a base tracer-bullet (S1 → S2 → S3, sem rewrite). Entrega:
+  1. `src/mcp/register.ts` (`buildMcpConfig` puro, `registerMemtierMcp` com
+     `client.mcp` injetado, `scheduleMcpRegistration` em background) +
+     `src/mcp/kilo-config.ts` (leitura do `kilo.jsonc` JSONC e override para
+     idempotência); `src/index.ts` dispara o registro no boot; `client.resolveToken()`
+     expõe o bearer (nunca logado).
+  2. Fluxo real medido contra o memtier (`/v1/mcp`, rota protegida — 401 sem
+     bearer): `initialize` → `tools/list` devolve as **4 tools**
+     (`recall`/`ingest`/`code_search`/`code_sync`); `recall` e `code_search`
+     respondem `isError:false`. O E2E `tests/e2e/test_e2e_mcp.test.ts` (gated
+     `E2E=1`) prova o **registro implícito** (espião do `client.mcp` captura o
+     `McpRemoteConfig` e o config real conecta no MCP), 2/2 verdes.
+  3. **Escopo do bearer medido:** o `graph-key.json` real é escopado ao programa
+     `graphplugin` (não `default`); chamar `recall` com `program:"default"` devolve
+     `isError:true` ("gestor … não owns o programa 'default'"). O E2E lê o
+     programa do próprio key file — nunca fabrica.
+  4. Idempotência (FR-602) e degradação (FR-604) provadas em unit: override do
+     `kilo.jsonc` pula o registro; `status failed`/`ENOENT` ⇒ `disconnect`+`add`;
+     `client.mcp` ausente (SDK antigo) ⇒ log, nunca lança.
+  5. `rg "TODO\(tracer-bullet\)" src/` → **zero**. `tsc --noEmit` limpo;
+     `tests/mcp.test.ts` 24/24. (O `npm test` global teve 1 falha em
+     `tests/inject.test.ts` de mudanças **alheias** não-commitadas em `src/inject/*`
+     — fora do escopo da E3b.)
+  6. Bloqueio registrado mantido: `neighbors` **não** é tool MCP — a E3b não
+     promete navegação (README/ADR-006).

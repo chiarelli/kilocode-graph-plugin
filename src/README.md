@@ -1,10 +1,11 @@
 # kilocode-graph-plugin — src
 
-Estado: **E1 (fundação), E2 (injeção de memória) e E3a (coletor de código)
-implementadas**; E3b e a segunda onda ainda são forma e contratos. O mapa abaixo
-é o alvo; o que existe hoje em `src/` é `index.ts`, `config.ts`, `client.ts`,
-`workspace.ts`, `logger.ts`, `types.ts`, `hooks/{messages,collect}.ts`,
-`inject/{memory,budget}.ts` e `index/{runner,collector,edges,manifest,trigger}.ts`.
+Estado: **E1 (fundação), E2 (injeção de memória), E3a (coletor de código) e E3b
+(registro do MCP) implementadas**; a segunda onda ainda é forma e contratos. O
+mapa abaixo é o alvo; o que existe hoje em `src/` é `index.ts`, `config.ts`,
+`client.ts`, `workspace.ts`, `logger.ts`, `types.ts`, `hooks/{messages,collect}.ts`,
+`inject/{memory,budget}.ts`, `index/{runner,collector,edges,manifest,trigger}.ts`
+e `mcp/{register,kilo-config}.ts`.
 
 ```
 src/
@@ -26,7 +27,8 @@ src/
 │   ├── manifest.ts       # estado por workspace → detecta removidos (chunks: [])
 │   └── trigger.ts        # híbrido: full no 1º uso; incremental depois
 ├── mcp/                  # ⬅ NOVO (E3b) — registro do MCP do memtier
-│   └── register.ts       # client.mcp.add(type:remote) + connect; implícito
+│   ├── register.ts       # client.mcp.add(type:remote) + connect; implícito
+│   └── kilo-config.ts    # lê kilo.jsonc (JSONC) → override (idempotência)
 └── adapters/
     ├── kilo.ts           # referência
     ├── opencode.ts       # não validado
@@ -67,12 +69,18 @@ collectHook(rt): { boot: Promise<void> }   // dispara no boot, fora do turno (FR
 // `collect indexer_ms=… files=… edges=… removed=… sync={…}`.
 ```
 
-### `mcp/register.ts` — registro do MCP remoto
+### `mcp/register.ts` + `mcp/kilo-config.ts` (E3b — implementado)
 ```ts
-async function registerMemtierMcp(client: KiloClient, cfg: McpCfg): Promise<void>
-// status → add(type:"remote", url:…/v1/mcp, headers:{Authorization}) → connect
-// registro IMPLÍCITO no boot (o usuário não define nada em kilo.jsonc);
-// se já definido lá, não registra por cima (idempotência) — FR-602
+function buildMcpConfig(cfg): McpRemoteConfig   // puro: url …/v1/mcp + header Bearer
+async function registerMemtierMcp(client, cfg): Promise<void>  // status → add → connect
+function scheduleMcpRegistration(client, cfg): void            // background no boot
+function getKiloMcpOverride(dir, name): entry | undefined       // idempotência (FR-602)
+function shouldRefreshMcpRegistration(existing): boolean        // failed/ENOENT ⇒ refresh
+// Registro IMPLÍCITO no boot (o usuário não define nada em kilo.jsonc); se já
+// definido lá, o plugin não registra por cima (idempotência) — FR-602.
+// Degradação (FR-604): status/add/connect falhos viram log; o boot NUNCA quebra.
+// Tool MCP `neighbors` NÃO existe no memtier (só recall/ingest/code_search/
+// code_sync) — navegação não é prometida (ADR-006).
 ```
 
 ### `inject/budget.ts` (E2 — implementado)
