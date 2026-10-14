@@ -18,7 +18,10 @@ import type { Fact } from "../client.ts";
 export interface Budget {
   /** Nº máximo de fatos injetados. */
   maxMemories: number;
-  /** Teto de chars do bloco final. `undefined`/negativo ⇒ sem teto de chars. */
+  /**
+   * Teto de chars do bloco final. `undefined`/negativo/`0` ⇒ sem teto de chars
+   * (é o que o contrato promete; `negativo` não pode desligar a injeção).
+   */
   maxChars?: number;
 }
 
@@ -42,7 +45,12 @@ export function applyBudget(
   render?: RenderFacts,
 ): Fact[] {
   let kept = cfg.maxMemories <= 0 ? [] : facts.slice(0, cfg.maxMemories);
-  if (cfg.maxChars === undefined || render === undefined) return kept;
+  // Teto NÃO-positivo ⇒ sem teto de chars (contrato da interface). Sem este
+  // guard, `maxChars` negativo drenava a lista até vazio (comparar
+  // `length > -N` é sempre verdadeiro) e a injeção morria em silêncio.
+  if (cfg.maxChars === undefined || cfg.maxChars <= 0 || render === undefined) {
+    return kept;
+  }
   while (kept.length > 0 && render(kept).length > cfg.maxChars) {
     kept = kept.slice(0, -1);
   }

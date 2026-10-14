@@ -44,9 +44,31 @@ export type RecallClient = Pick<MemtierClient, "recall"> &
  * `invalid_at` não aparece (o recall só devolve vigentes). Fato sem `valid_at`
  * não mostra data.
  */
+/**
+ * Sanitiza o texto VINDO DE FORA (o `fact` é conteúdo do grafo, não nosso).
+ *
+ * Sem isto, um fato contendo `\n</context>` FECHA o bloco da sentinela e o que
+ * vier depois entra no turno como instrução fora do envelope — prompt injection
+ * por memória envenenada, além de corromper a métrica de injeção (D-3).
+ *
+ * Quebras de linha viram espaço (um fato é UMA linha) e `<`/`>` do conteúdo são
+ * neutralizados (`&lt;`/`&gt;`), de modo que nenhuma tag pode ser aberta ou
+ * fechada pelo texto do fato. O wrapper (que é nosso) fica intacto.
+ */
+function sanitizeFactText(text: string): string {
+  return text.replace(/\r?\n/g, " ").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/**
+ * Formata um fato como linha, com procedência temporal quando houver `valid_at`.
+ * `invalid_at` não aparece (o recall só devolve vigentes). Fato sem `valid_at`
+ * não mostra data. O texto passa por `sanitizeFactText` — nunca confie no grafo.
+ */
 function formatFact(fact: Fact): string {
-  const suffix = fact.valid_at ? ` (válido desde ${fact.valid_at})` : "";
-  return `- ${fact.fact}${suffix}`;
+  const suffix = fact.valid_at
+    ? ` (válido desde ${sanitizeFactText(fact.valid_at)})`
+    : "";
+  return `- ${sanitizeFactText(fact.fact)}${suffix}`;
 }
 
 /**

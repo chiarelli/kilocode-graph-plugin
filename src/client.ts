@@ -259,15 +259,17 @@ export class MemtierClient {
     timeoutMs: number,
     signal?: AbortSignal,
   ): Promise<Response> {
-    // `AbortSignal.timeout(0)` nasce JÁ abortado (medido): um timeout ausente,
-    // `0` ou negativo significa "sem teto" (contrato dos defaults via
-    // `?? DEFAULT_*`), não "aborta imediatamente". Guardar aqui cobre todas as
-    // rotas de uma vez, em vez de confiar que cada story mandou > 0.
-    const timeout =
-      timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : undefined;
-    if (!timeout) return fetch(input, init);
-    const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
-    return this.fetchImpl(`${this.url}${path}`, { ...init, signal: combined });
+    // `AbortSignal.timeout(0)` nasce JÁ abortado (medido): timeout ausente, `0`
+    // ou negativo significa "sem teto" (o contrato dos defaults via
+    // `?? DEFAULT_*`), não "aborta imediatamente". O guard fica aqui para cobrir
+    // todas as rotas de uma vez, em vez de confiar que cada story mandou > 0.
+    const timeout = timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : undefined;
+    const sig = timeout
+      ? signal
+        ? AbortSignal.any([signal, timeout])
+        : timeout
+      : signal;
+    return this.fetchImpl(`${this.url}${path}`, { ...init, signal: sig });
   }
 
   /**
