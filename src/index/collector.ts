@@ -14,6 +14,11 @@
  */
 
 import type { CodeChunk, CodeEdge, CodeFile, IndexerEvent } from "../types.ts";
+import {
+  resolveEdges,
+  type CallEdge,
+  type ImportEdge,
+} from "./edges.ts";
 
 /** Identidade lógica do sync (aditiva E11: `program`). */
 export interface SyncIdentity {
@@ -50,6 +55,22 @@ function bareSymbol(raw: unknown): string | null {
 function chunkPayload(payload: unknown): Record<string, unknown> | null {
   if (!payload || typeof payload !== "object") return null;
   return payload as Record<string, unknown>;
+}
+
+/** Separa os eventos de aresta (`import_edge`/`call_edge`) do stream de chunks. */
+export function collectEdges(events: IndexerEvent[]): {
+  imports: ImportEdge[];
+  calls: CallEdge[];
+} {
+  const imports: ImportEdge[] = [];
+  const calls: CallEdge[] = [];
+  for (const ev of events) {
+    const payload = chunkPayload(ev.payload);
+    if (!payload) continue;
+    if (ev.event === "import_edge") imports.push(payload as ImportEdge);
+    else if (ev.event === "call_edge") calls.push(payload as CallEdge);
+  }
+  return { imports, calls };
 }
 
 /**
@@ -113,18 +134,20 @@ export function collectFiles(events: IndexerEvent[]): CodeFile[] {
 }
 
 /**
- * Eventos → body do sync. S1: só `files[]` (arestas ficam para a S2; removidos/
- * FullFile sintético para a S3).
+ * Eventos → body do sync. S2 inclui `edges[]` (resolvidas); removidos/FullFile
+ * sintético ficam para a S3.
  */
 export function buildSyncBody(
   events: IndexerEvent[],
   identity: SyncIdentity,
 ): SyncBody {
-  // TODO(tracer-bullet): resolver arestas (S2) e removidos/FullFile synth (S3).
+  const files = collectFiles(events);
+  const { imports, calls } = collectEdges(events);
+  // TODO(tracer-bullet): removidos + FullFile sintético (S3).
   return {
     workspace: identity.workspace,
     program: identity.program,
-    files: collectFiles(events),
-    edges: [],
+    files,
+    edges: resolveEdges(imports, calls, files),
   };
 }
