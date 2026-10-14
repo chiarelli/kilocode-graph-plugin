@@ -45,7 +45,7 @@ Convenções válidas para todas as epics:
 > fechar, valida-se e assume-se o próximo numa sessão nova, na ordem declarada.
 
 ### E1 — Fundação (cliente do memtier)
-- [ ] **E1-S1** — Tracer bullet: skeleton do plugin + config + client + `GET /v1/health` atravessando até o memtier
+- [x] **E1-S1** — Tracer bullet: skeleton do plugin + config + client + `GET /v1/health` atravessando até o memtier
 - [ ] **E1-S2** — Endurecer: timeout, retry/degradação, workspace + `program`, `token_file`, erros tipados
 - [ ] **E1-S3** — Fechamento: typecheck + testes verdes, docs, zero marcadores
 
