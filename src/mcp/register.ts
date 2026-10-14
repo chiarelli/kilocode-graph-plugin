@@ -20,6 +20,7 @@
  */
 
 import { debug, log, logFatal } from "../logger.ts";
+import { getKiloMcpOverride } from "./kilo-config.ts";
 
 /** Entrada remota de MCP como o Kilo a aceita (`McpRemoteConfig` do SDK). */
 export interface McpRemoteConfig {
@@ -40,6 +41,19 @@ export interface KiloMcpStatus {
 export interface McpCallResult<T> {
   data?: T;
   error?: unknown;
+}
+
+/**
+ * Um registro precisa de refresh quando está `failed` (o comando/URL mudou, ou
+ * o processo morreu) ou quando o erro menciona `ENOENT` (binário/rota sumiu).
+ * Idêntico a `shouldRefreshMcpRegistration` do antecessor
+ * (`openviking-memory.js:1770`). `connected`/`disabled` não refrescam.
+ */
+export function shouldRefreshMcpRegistration(existing: KiloMcpStatus | undefined): boolean {
+  if (!existing) return false;
+  if (existing.status === "failed") return true;
+  if (existing.error?.includes("ENOENT")) return true;
+  return false;
 }
 
 /** Porta do `client.mcp` do Kilo — implementada pelo SDK; fake nos testes. */
@@ -117,14 +131,22 @@ export async function registerMemtierMcp(
 
   const mcp = client?.mcp;
   if (!mcp) {
-    // TODO(tracer-bullet): tratamento explícito de SDK antigo (log + teste) — S2.
-    debug("mcp: client.mcp indisponível (SDK sem MCP); registro ignorado");
+    // SDK antigo sem `client.mcp`: loga e segue — o boot nunca depende do MCP.
+    log("mcp: client.mcp indisponível (SDK sem MCP); registro ignorado");
     return;
   }
 
   const directory = cfg.directory;
+
+  // Idempotência (FR-602): se o usuário já definiu `mcp.<name>` no kilo.jsonc,
+  // o plugin NÃO registra por cima — o que está lá é a vontade dele.
+  const override = getKiloMcpOverride(directory, cfg.name);
+  if (override) {
+    debug(`mcp "${cfg.name}" já definido no kilo.jsonc — registro do plugin ignorado`);
+    return;
+  }
+
   try {
-    // TODO(tracer-bullet): override do kilo.jsonc (não registrar por cima) — S2.
     const status = await mcp.status({ query: { directory } });
     if (status.error) {
       log(`mcp: status falhou: ${JSON.stringify(status.error)}`);
@@ -132,13 +154,30 @@ export async function registerMemtierMcp(
     }
 
     const existing = status.data?.[cfg.name];
-    if (existing?.status === "connected") {
+    if (existing?.status === "connected" && !shouldRefreshMcpRegistration(existing)) {
       debug(`mcp "${cfg.name}" já conectado — registro ignorado`);
       return;
     }
-    // TODO(tracer-bullet): refresh de registro falho (disconnect+add) — S2.
 
     const config = buildMcpConfig(cfg);
+    if (existing && shouldRefreshMcpRegistration(existing)) {
+      // Registro falho (status failed / ENOENT): derruba o antigo antes de
+      // re-adicionar — o `add` sobre um nome existente falharia.
+      debug(`mcp "${cfg.name}" refresh após falha (status=${existing.status})`);
+      const disconnect = await mcp.disconnect({
+        path: { name: cfg.name },
+        query: { directory },
+      });
+      if (disconnect.error) {
+        log(`mcp: disconnect falhou: ${JSON.stringify(disconnect.error)}`);
+      }
+    } else if (existing) {
+      // Já registrado e num estado que não é `connected` nem falho (ex.:
+      // `disabled`): não duplicar.
+      debug(`mcp "${cfg.name}" já registrado (status=${existing.status}) — ignorado`);
+      return;
+    }
+
     const add = await mcp.add({ body: { name: cfg.name, config }, query: { directory } });
     if (add.error) {
       logFatal("mcp add", new Error(JSON.stringify(add.error)));

@@ -4,16 +4,21 @@
  */
 
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import {
   buildMcpConfig,
   registerMemtierMcp,
+  shouldRefreshMcpRegistration,
   type KiloLikeClient,
   type KiloMcpClient,
   type KiloMcpStatus,
   type McpRegisterConfig,
 } from "../src/mcp/register.ts";
+import { getKiloMcpOverride, stripJsoncComments } from "../src/mcp/kilo-config.ts";
 
 /** Config base do registro; cada teste sobrescreve o que importa. */
 function cfg(overrides: Partial<McpRegisterConfig> = {}): McpRegisterConfig {
@@ -143,4 +148,120 @@ test("register_status_error: status devolve erro ⇒ não registra", async () =>
 test("register_connect_error: connect devolve erro ⇒ não lança", async () => {
   const { client } = fakeMcp({ connectError: { status: 500 } });
   await assert.doesNotReject(() => registerMemtierMcp(client, cfg()));
+});
+
+// --- E3b-S2: override, refresh, SDK antigo ---------------------------------
+
+/** Diretório temporário com um `kilo.jsonc` (e cleanup). */
+function withKiloConfig(content: string, fn: (dir: string) => Promise<void> | void) {
+  const dir = mkdtempSync(join(tmpdir(), "graph-mcp-"));
+  try {
+    mkdirSync(join(dir, ".kilo"), { recursive: true });
+    writeFileSync(join(dir, ".kilo", "kilo.jsonc"), content);
+    return Promise.resolve(fn(dir)).finally(() => rmSync(dir, { recursive: true, force: true }));
+  } catch (err) {
+    rmSync(dir, { recursive: true, force: true });
+    throw err;
+  }
+}
+
+test("override_skips: kilo.jsonc com mcp.memtier ⇒ plugin não registra", async () => {
+  const { client, calls } = fakeMcp();
+  await withKiloConfig(
+    `{ "mcp": { "memtier": { "type": "remote", "url": "http://other:1/v1/mcp" } } }`,
+    async (dir) => {
+      await registerMemtierMcp(client, cfg({ directory: dir }));
+    },
+  );
+  assert.deepEqual(calls, [], "com override não deve nem consultar o cliente");
+});
+
+test("override_comments: kilo.jsonc com // não confunde o parse", async () => {
+  const { client, calls } = fakeMcp();
+  await withKiloConfig(
+    `{\n  // servidor definido pelo usuário\n  "mcp": { "memtier": { "type": "remote" } }\n}`,
+    async (dir) => {
+      await registerMemtierMcp(client, cfg({ directory: dir }));
+    },
+  );
+  assert.deepEqual(calls, []);
+});
+
+test("no_override_registers: kilo.jsonc sem mcp.memtier ⇒ registra", async () => {
+  const { client, calls } = fakeMcp();
+  await withKiloConfig(`{ "mcp": { "outro": {} } }`, async (dir) => {
+    await registerMemtierMcp(client, cfg({ directory: dir }));
+  });
+  assert.deepEqual(calls, ["status", "add", "connect"]);
+});
+
+test("shouldRefresh_true_on_failed", () => {
+  assert.equal(shouldRefreshMcpRegistration({ status: "failed" }), true);
+  assert.equal(
+    shouldRefreshMcpRegistration({ status: "failed", error: "spawn ENOENT" }),
+    true,
+  );
+});
+
+test("shouldRefresh_true_on_enoent", () => {
+  assert.equal(
+    shouldRefreshMcpRegistration({ status: "connected", error: "open ENOENT" }),
+    true,
+  );
+});
+
+test("shouldRefresh_false_when_connected", () => {
+  assert.equal(shouldRefreshMcpRegistration({ status: "connected" }), false);
+  assert.equal(shouldRefreshMcpRegistration(undefined), false);
+});
+
+test("refresh_failed: status failed ⇒ disconnect + add + connect", async () => {
+  const { client, calls } = fakeMcp({ status: { status: "failed" } });
+  await registerMemtierMcp(client, cfg());
+  assert.deepEqual(calls, ["status", "disconnect", "add", "connect"]);
+});
+
+test("register_disabled_existing: já registrado (status disabled) ⇒ não duplica", async () => {
+  const { client, calls } = fakeMcp({ status: { status: "disabled" } });
+  await registerMemtierMcp(client, cfg());
+  assert.deepEqual(calls, ["status"]);
+});
+
+test("sdk_without_mcp: client.mcp undefined ⇒ log; não lança", async () => {
+  await assert.doesNotReject(() => registerMemtierMcp({}, cfg()));
+  await assert.doesNotReject(() => registerMemtierMcp(undefined, cfg()));
+});
+
+// --- kilo-config (S2) ------------------------------------------------------
+
+test("strip_jsonc_comments: remove // e /* */ mas preserva strings", () => {
+  const raw = `{\n // linha\n "url": "http://x//y", /* bloco */\n "n": 1\n}`;
+  const parsed = JSON.parse(stripJsoncComments(raw)) as { url: string; n: number };
+  assert.equal(parsed.url, "http://x//y", "// dentro de string não é comentário");
+  assert.equal(parsed.n, 1);
+});
+
+test("getKiloMcpOverride: ausente ⇒ undefined", async () => {
+  await withKiloConfig(`{ "mcp": {} }`, (dir) => {
+    assert.equal(getKiloMcpOverride(dir, "memtier"), undefined);
+  });
+});
+
+test("getKiloMcpOverride: presente ⇒ entry do usuário", async () => {
+  await withKiloConfig(
+    `{ "mcp": { "memtier": { "type": "remote", "url": "u" } } }`,
+    (dir) => {
+      const entry = getKiloMcpOverride(dir, "memtier");
+      assert.equal(entry?.url, "u");
+    },
+  );
+});
+
+test("getKiloMcpOverride: sem arquivo ⇒ undefined (registro implícito)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "graph-mcp-empty-"));
+  try {
+    assert.equal(getKiloMcpOverride(dir, "memtier"), undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

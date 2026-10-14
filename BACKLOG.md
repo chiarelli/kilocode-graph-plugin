@@ -63,7 +63,7 @@ Convenções válidas para todas as epics:
 
 ### E3b — Registro do MCP do memtier
 - [x] **E3b-S1** — Tracer bullet: registrar o MCP remoto no boot (`status`→`add`→`connect`)
-- [ ] **E3b-S2** — Endurecer: idempotência (não duplicar se já definido), degradação não-fatal
+- [x] **E3b-S2** — Endurecer: idempotência (não duplicar se já definido), degradação não-fatal
 - [ ] **E3b-S3** — Fechamento: prova de tools listáveis/chamáveis, docs, zero marcadores
 
 ### Segunda onda (spec sob demanda)
