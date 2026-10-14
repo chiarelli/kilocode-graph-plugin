@@ -38,6 +38,8 @@ export interface MemtierClientOptions {
   timeout_ms?: number;
   /** Timeout do health (ms) — default 2000. */
   health_timeout_ms?: number;
+  /** Timeout do recall (ms) — default 4000 (orçamento do hook). */
+  recall_timeout_ms?: number;
   /** `fetch` injetável (default `globalThis.fetch`). */
   fetch?: FetchLike;
   /** Leitor de arquivo injetável (default `readFileSync` utf-8). */
@@ -46,6 +48,7 @@ export interface MemtierClientOptions {
 
 const DEFAULT_TIMEOUT_MS = 2000;
 const DEFAULT_HEALTH_TIMEOUT_MS = 2000;
+const DEFAULT_RECALL_TIMEOUT_MS = 4000;
 
 /** Erro HTTP base — carrega o status para o chamador decidir. */
 export class MemtierHttpError extends Error {
@@ -110,6 +113,50 @@ export interface Identity {
   program: string;
 }
 
+/**
+ * Um fato de memória do recall (E2-S1). Espelha o contrato do memtier
+ * (`memory.py:_serialize_fact`): `fact` é a frase atômica, `valid_at`/
+ * `invalid_at` são ISO-8601 (ou `null`) e `score` é a relevância. `source` é
+ * `"memory"`; `uuid`/`episodes` existem no fio mas a E2 não os consome.
+ */
+export interface Fact {
+  fact: string;
+  valid_at: string | null;
+  invalid_at: string | null;
+  score: number;
+  source?: string;
+}
+
+/** Opções do recall (E2-S1). `maxTokens` liga o orçamento A1 no servidor. */
+export interface RecallOpts {
+  limit?: number;
+  maxTokens?: number;
+  signal?: AbortSignal;
+}
+
+/** Resultado do recall — `tokensEstimated`/`truncated` só com `maxTokens`. */
+export interface RecallResult {
+  facts: Fact[];
+  tokensEstimated?: number;
+  truncated?: boolean;
+}
+
+/** Corpo de `POST /v1/recall` (aditivo E11: `program`). */
+interface RecallBody {
+  workspace: string;
+  program: string;
+  query: string;
+  limit?: number;
+  max_tokens?: number;
+}
+
+/** Resposta crua de `POST /v1/recall` (snake_case do memtier). */
+interface RecallResponse {
+  facts?: Fact[];
+  tokens_estimated?: number;
+  truncated?: boolean;
+}
+
 export class MemtierClient {
   private readonly url: string;
   private readonly workspace: string;
@@ -118,6 +165,7 @@ export class MemtierClient {
   private readonly tokenFile: string;
   private readonly timeoutMs: number;
   private readonly healthTimeoutMs: number;
+  private readonly recallTimeoutMs: number;
   private readonly fetchImpl: FetchLike;
   private readonly readFileImpl: ReadFileLike;
   /** Cache do token de arquivo: `undefined` = ainda não lido (lazy). */
@@ -131,6 +179,7 @@ export class MemtierClient {
     this.tokenFile = options.token_file ?? "";
     this.timeoutMs = options.timeout_ms ?? DEFAULT_TIMEOUT_MS;
     this.healthTimeoutMs = options.health_timeout_ms ?? DEFAULT_HEALTH_TIMEOUT_MS;
+    this.recallTimeoutMs = options.recall_timeout_ms ?? DEFAULT_RECALL_TIMEOUT_MS;
     this.fetchImpl = options.fetch ?? (globalThis.fetch as FetchLike);
     this.readFileImpl =
       options.readFile ?? ((p) => readFileSync(p, "utf-8") as string);
@@ -196,6 +245,20 @@ export class MemtierClient {
     body?: unknown,
     signal?: AbortSignal,
   ): Promise<T> {
+    return this.sendJson<T>(method, path, body, this.timeoutMs, signal);
+  }
+
+  /**
+   * Envia um request JSON com timeout explícito e devolve o body tipado;
+   * HTTP não-2xx vira erro tipado (nunca passa cru).
+   */
+  private async sendJson<T>(
+    method: string,
+    path: string,
+    body: unknown,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<T> {
     const res = await this.doFetch(
       path,
       {
@@ -203,7 +266,7 @@ export class MemtierClient {
         headers: this.headers(),
         body: body !== undefined ? JSON.stringify(body) : undefined,
       },
-      this.timeoutMs,
+      timeoutMs,
       signal,
     );
     if (!res.ok) {
@@ -211,6 +274,39 @@ export class MemtierClient {
       throw httpError(res.status, detail);
     }
     return (await res.json()) as T;
+  }
+
+  /**
+   * `POST /v1/recall` (E2-S1). `query` é o texto do usuário — sem teto de
+   * tamanho no cliente (o servidor trunca; o hook nunca deve falhar por
+   * tamanho). Envia `program` (aditivo E11) e, quando houver, `limit`/`max_tokens`.
+   * Lança erro tipado no HTTP não-2xx — quem chama (o hook) degrada.
+   */
+  async recall(query: string, opts: RecallOpts = {}): Promise<RecallResult> {
+    const identity = this.resolveIdentity();
+    const body: RecallBody = {
+      workspace: identity.workspace,
+      program: identity.program,
+      query,
+    };
+    if (opts.limit !== undefined) body.limit = opts.limit;
+    if (opts.maxTokens !== undefined) body.max_tokens = opts.maxTokens;
+
+    const res = await this.sendJson<RecallResponse>(
+      "POST",
+      "/v1/recall",
+      body,
+      this.recallTimeoutMs,
+      opts.signal,
+    );
+
+    const facts = Array.isArray(res.facts) ? res.facts : [];
+    const result: RecallResult = { facts };
+    if (typeof res.tokens_estimated === "number") {
+      result.tokensEstimated = res.tokens_estimated;
+    }
+    if (typeof res.truncated === "boolean") result.truncated = res.truncated;
+    return result;
   }
 
   /**

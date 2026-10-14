@@ -50,7 +50,7 @@ Convenções válidas para todas as epics:
 - [x] **E1-S3** — Fechamento: typecheck + testes verdes, docs, zero marcadores
 
 ### E2 — Injeção de memória
-- [ ] **E2-S1** — Tracer bullet: `messages.transform` injeta o bloco de memória via `/v1/recall`
+- [x] **E2-S1** — Tracer bullet: `messages.transform` injeta o bloco de memória via `/v1/recall`
 - [ ] **E2-S2** — Endurecer: orçamento (`maxMemories`/`maxChars`/`timeout_ms`), `max_tokens`, dedup no turno, blocos com procedência
 - [ ] **E2-S3** — Fechamento: E2E real contra o memtier, docs, zero marcadores
 

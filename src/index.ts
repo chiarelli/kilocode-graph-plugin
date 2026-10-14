@@ -14,6 +14,7 @@ import { isAbsolute, join } from "node:path";
 
 import { MemtierClient } from "./client.ts";
 import { loadConfig, type PluginOptions } from "./config.ts";
+import { messagesHook } from "./hooks/messages.ts";
 import { debug, formatBootLine, log, logFatal, setDebug } from "./logger.ts";
 import type { PluginCtx } from "./types.ts";
 import { resolveWorkspaceDir, workspaceName } from "./workspace.ts";
@@ -41,6 +42,7 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
     token_file: resolveTokenFile(dir, config.daemon.token_file),
     timeout_ms: config.daemon.health_timeout_ms,
     health_timeout_ms: config.daemon.health_timeout_ms,
+    recall_timeout_ms: config.inject.timeout_ms,
   });
 
   log(
@@ -72,9 +74,19 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
   }
 
   return {
-    // Sem hooks de conteúdo na E1 (injeção/ingestão/coleta/MCP são E2/E3a/E3b).
-    // `dispose` drena o trabalho em voo (o health do boot) antes de sair; o
-    // health tem timeout, então nunca pendura (`AbortSignal.timeout`).
+    // E2: injeção de memória no turno (`messages.transform`). Só quando
+    // `inject.enabled` (default `false`); o hook degrada sem quebrar o turno.
+    ...messagesHook({
+      enabled: config.inject.enabled,
+      cfg: {
+        maxMemories: config.inject.max_memories,
+        maxChars: config.inject.max_chars,
+      },
+      client,
+    }),
+    // Sem outros hooks de conteúdo na primeira fatia (ingestão/coleta/MCP são
+    // E4/E3a/E3b). `dispose` drena o trabalho em voo (o health do boot) antes
+    // de sair; o health tem timeout, então nunca pendura (`AbortSignal.timeout`).
     dispose: async () => {
       debug("dispose");
       await bootHealth;
