@@ -11,14 +11,20 @@ import { test } from "node:test";
 
 import {
   buildMcpConfig,
+  isValidMcpName,
   registerMemtierMcp,
   shouldRefreshMcpRegistration,
   type KiloLikeClient,
   type KiloMcpClient,
   type KiloMcpStatus,
   type McpRegisterConfig,
+  type McpRemoteConfig,
 } from "../src/mcp/register.ts";
-import { getKiloMcpOverride, stripJsoncComments } from "../src/mcp/kilo-config.ts";
+import {
+  isMcpDefinedInKiloConfig,
+  stripJsoncComments,
+  stripTrailingCommas,
+} from "../src/mcp/kilo-config.ts";
 
 /** Config base do registro; cada teste sobrescreve o que importa. */
 function cfg(overrides: Partial<McpRegisterConfig> = {}): McpRegisterConfig {
@@ -69,6 +75,32 @@ function fakeMcp(
     },
   };
   return { client: { mcp } as KiloLikeClient, calls };
+}
+
+/** Fake que captura o corpo do `add` (para assertar `timeout`/`enabled`). */
+function capturingMcp() {
+  const calls: string[] = [];
+  let added: { name: string; config: McpRemoteConfig } | undefined;
+  const mcp: KiloMcpClient = {
+    status: async () => {
+      calls.push("status");
+      return { data: {} };
+    },
+    add: async (opts) => {
+      calls.push("add");
+      added = opts.body as { name: string; config: McpRemoteConfig };
+      return { data: {} };
+    },
+    connect: async () => {
+      calls.push("connect");
+      return { data: {} };
+    },
+    disconnect: async () => {
+      calls.push("disconnect");
+      return { data: {} };
+    },
+  };
+  return { client: { mcp } as KiloLikeClient, calls, added: () => added };
 }
 
 // --- buildMcpConfig (puro) -------------------------------------------------
@@ -215,21 +247,129 @@ test("shouldRefresh_false_when_connected", () => {
   assert.equal(shouldRefreshMcpRegistration(undefined), false);
 });
 
+test("shouldRefresh_true_on_any_not_connected: D-6", () => {
+  // Qualquer estado não-conectado precisa de refresh (não deixar morto/mudo).
+  for (const status of ["disabled", "connecting", "disconnected", "error"]) {
+    assert.equal(
+      shouldRefreshMcpRegistration({ status }),
+      true,
+      `status=${status} deve refrescar`,
+    );
+  }
+});
+
 test("refresh_failed: status failed ⇒ disconnect + add + connect", async () => {
   const { client, calls } = fakeMcp({ status: { status: "failed" } });
   await registerMemtierMcp(client, cfg());
   assert.deepEqual(calls, ["status", "disconnect", "add", "connect"]);
 });
 
-test("register_disabled_existing: já registrado (status disabled) ⇒ não duplica", async () => {
-  const { client, calls } = fakeMcp({ status: { status: "disabled" } });
+test("refresh_not_connected: D-6 status disabled/connecting/disconnected/error ⇒ repara", async () => {
+  for (const status of ["disabled", "connecting", "disconnected", "error"]) {
+    const { client, calls } = fakeMcp({ status: { status } });
+    await registerMemtierMcp(client, cfg());
+    assert.deepEqual(
+      calls,
+      ["status", "disconnect", "add", "connect"],
+      `status=${status}: MCP deve ser reparado, não deixado morto`,
+    );
+  }
+});
+
+test("register_add_409_not_fatal: D-7 ⇒ trata como já-existe e conecta", async () => {
+  const { client, calls } = fakeMcp({ addError: { status: 409, detail: "already exists" } });
+  await assert.doesNotReject(() => registerMemtierMcp(client, cfg()));
+  assert.deepEqual(calls, ["status", "add", "connect"], "409 não impede o connect");
+});
+
+test("register_add_error_not_409: erro real do add ⇒ não conecta", async () => {
+  const { client, calls } = fakeMcp({ addError: { status: 500, detail: "boom" } });
   await registerMemtierMcp(client, cfg());
-  assert.deepEqual(calls, ["status"]);
+  assert.deepEqual(calls, ["status", "add"], "erro não-409 aborta antes do connect");
 });
 
 test("sdk_without_mcp: client.mcp undefined ⇒ log; não lança", async () => {
   await assert.doesNotReject(() => registerMemtierMcp({}, cfg()));
   await assert.doesNotReject(() => registerMemtierMcp(undefined, cfg()));
+});
+
+// --- D-5: junção de URL -----------------------------------------------------
+
+test("build_config_url_with_query: D-5 base com ?query não corrompe", () => {
+  const config = buildMcpConfig({
+    url: "http://127.0.0.1:8400?x=1",
+    token: "",
+    timeout_ms: 15000,
+  });
+  assert.equal(config.url, "http://127.0.0.1:8400/v1/mcp");
+});
+
+test("build_config_url_with_fragment: D-5 base com #fragment não corrompe", () => {
+  const config = buildMcpConfig({
+    url: "http://127.0.0.1:8400#frag",
+    token: "",
+    timeout_ms: 15000,
+  });
+  assert.equal(config.url, "http://127.0.0.1:8400/v1/mcp");
+});
+
+test("build_config_url_with_subpath: D-5 base com subpath preserva o path", () => {
+  const config = buildMcpConfig({
+    url: "http://h:8400/api",
+    token: "",
+    timeout_ms: 15000,
+  });
+  assert.equal(config.url, "http://h:8400/api/v1/mcp");
+});
+
+test("build_config_url_empty: D-5 url vazia ⇒ lança (o chamador degrada)", () => {
+  assert.throws(() => buildMcpConfig({ url: "", token: "", timeout_ms: 15000 }));
+});
+
+test("build_config_no_scheme: D-5 host sem esquema ⇒ assume http", () => {
+  const config = buildMcpConfig({ url: "127.0.0.1:8400", token: "", timeout_ms: 15000 });
+  assert.equal(config.url, "http://127.0.0.1:8400/v1/mcp");
+});
+
+// --- D-8: validação do nome -------------------------------------------------
+
+test("isValidMcpName: rejeita vazio, barra, traversal, espaço", () => {
+  assert.equal(isValidMcpName("memtier"), true);
+  assert.equal(isValidMcpName(""), false);
+  assert.equal(isValidMcpName("a/b"), false);
+  assert.equal(isValidMcpName("../evil"), false);
+  assert.equal(isValidMcpName("a\\b"), false);
+  assert.equal(isValidMcpName("with space"), false);
+  assert.equal(isValidMcpName(" lead"), false);
+});
+
+test("register_invalid_name: D-8 nome inválido ⇒ não chama o cliente", async () => {
+  for (const name of ["", "a/b", "../evil"]) {
+    const { client, calls } = fakeMcp();
+    await registerMemtierMcp(client, cfg({ name }));
+    assert.deepEqual(calls, [], `nome ${JSON.stringify(name)} não deve registrar`);
+  }
+});
+
+// --- D-9: token só-espaços --------------------------------------------------
+
+test("build_config_whitespace_token: D-9 token só-espaços ⇒ sem header", () => {
+  const config = buildMcpConfig({ url: "http://h:8400", token: "   ", timeout_ms: 15000 });
+  assert.equal(config.headers, undefined);
+});
+
+test("build_config_token_trimmed: D-9 token com espaços nas pontas ⇒ trim", () => {
+  const config = buildMcpConfig({ url: "http://h:8400", token: "  abc  ", timeout_ms: 15000 });
+  assert.equal(config.headers?.Authorization, "Bearer abc");
+});
+
+// --- D-13: timeout/enabled no corpo do add ----------------------------------
+
+test("register_add_body_has_timeout_enabled: D-13", async () => {
+  const { client, added } = capturingMcp();
+  await registerMemtierMcp(client, cfg({ timeout_ms: 12345 }));
+  assert.equal(added()?.config.timeout, 12345, "timeout do add = mcp.timeout_ms");
+  assert.equal(added()?.config.enabled, true, "enabled do add = true");
 });
 
 // --- kilo-config (S2) ------------------------------------------------------
@@ -243,7 +383,7 @@ test("strip_jsonc_comments: remove // e /* */ mas preserva strings", () => {
 
 test("getKiloMcpOverride: ausente ⇒ undefined", async () => {
   await withKiloConfig(`{ "mcp": {} }`, (dir) => {
-    assert.equal(getKiloMcpOverride(dir, "memtier"), undefined);
+    assert.equal(isMcpDefinedInKiloConfig(dir, "memtier"), false);
   });
 });
 
@@ -251,8 +391,7 @@ test("getKiloMcpOverride: presente ⇒ entry do usuário", async () => {
   await withKiloConfig(
     `{ "mcp": { "memtier": { "type": "remote", "url": "u" } } }`,
     (dir) => {
-      const entry = getKiloMcpOverride(dir, "memtier");
-      assert.equal(entry?.url, "u");
+      assert.equal(isMcpDefinedInKiloConfig(dir, "memtier"), true);
     },
   );
 });
@@ -260,8 +399,94 @@ test("getKiloMcpOverride: presente ⇒ entry do usuário", async () => {
 test("getKiloMcpOverride: sem arquivo ⇒ undefined (registro implícito)", () => {
   const dir = mkdtempSync(join(tmpdir(), "graph-mcp-empty-"));
   try {
-    assert.equal(getKiloMcpOverride(dir, "memtier"), undefined);
+    assert.equal(isMcpDefinedInKiloConfig(dir, "memtier"), false);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// --- D-3: vírgula final (trailing comma) ------------------------------------
+
+test("stripTrailingCommas: remove vírgula final de objeto e array", () => {
+  assert.equal(stripTrailingCommas('{"a":1,}'), '{"a":1}');
+  assert.equal(stripTrailingCommas("[1,2,]"), "[1,2]");
+  assert.equal(stripTrailingCommas('{"a":[1,],}'), '{"a":[1]}');
+});
+
+test("stripTrailingCommas: preserva vírgula dentro de string", () => {
+  assert.equal(stripTrailingCommas('{"a":"x,}"}'), '{"a":"x,}"}');
+});
+
+test("trailing_comma_override: D-3 kilo.jsonc com vírgula final ⇒ override honrado", async () => {
+  const { client, calls } = fakeMcp();
+  await withKiloConfig(
+    `{\n  "mcp": {\n    "memtier": { "type": "remote", "url": "http://u:1/v1/mcp" },\n  },\n}`,
+    async (dir) => {
+      await registerMemtierMcp(client, cfg({ directory: dir }));
+    },
+  );
+  assert.deepEqual(calls, [], "override com vírgula final deve bloquear o registro");
+});
+
+test("trailing_comma_parse: stripJsoncComments+stripTrailingCommas parseiam", () => {
+  const raw = `{ \n "mcp": { "memtier": { }, }, // fim\n }`;
+  const parsed = JSON.parse(
+    stripTrailingCommas(stripJsoncComments(raw)),
+  ) as { mcp: Record<string, unknown> };
+  assert.ok(parsed.mcp.memtier);
+});
+
+// --- D-4: precedência entre arquivos ----------------------------------------
+
+test("config_falls_through: D-4 arquivo existente sem mcp não sombreia", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "graph-mcp-precedence-"));
+  try {
+    mkdirSync(join(dir, ".kilo"), { recursive: true });
+    // `.kilo/kilo.jsonc` existe mas não tem `mcp`; a raiz `kilo.jsonc` define.
+    writeFileSync(join(dir, ".kilo", "kilo.jsonc"), `{ "foo": 1 }`);
+    writeFileSync(
+      join(dir, "kilo.jsonc"),
+      `{ "mcp": { "memtier": { "type": "remote" } } }`,
+    );
+    assert.equal(
+      isMcpDefinedInKiloConfig(dir, "memtier"),
+      true,
+      "o override da raiz não pode ser sombreado",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("config_falls_through_invalid: D-4 arquivo inválido não sombreia", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "graph-mcp-invalid-"));
+  try {
+    mkdirSync(join(dir, ".kilo"), { recursive: true });
+    writeFileSync(join(dir, ".kilo", "kilo.jsonc"), `{ this is not json ]`);
+    writeFileSync(
+      join(dir, "kilo.jsonc"),
+      `{ "mcp": { "memtier": {} } }`,
+    );
+    assert.equal(isMcpDefinedInKiloConfig(dir, "memtier"), true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- D-10: valor `false`/`null` bloqueia ------------------------------------
+
+test("memtier_false_blocks: D-10 mcp.memtier=false ⇒ não registra", async () => {
+  const { client, calls } = fakeMcp();
+  await withKiloConfig(`{ "mcp": { "memtier": false } }`, async (dir) => {
+    await registerMemtierMcp(client, cfg({ directory: dir }));
+  });
+  assert.deepEqual(calls, [], "false é intenção explícita de desligar");
+});
+
+test("memtier_null_blocks: D-10 mcp.memtier=null ⇒ não registra", async () => {
+  const { client, calls } = fakeMcp();
+  await withKiloConfig(`{ "mcp": { "memtier": null } }`, async (dir) => {
+    await registerMemtierMcp(client, cfg({ directory: dir }));
+  });
+  assert.deepEqual(calls, []);
 });

@@ -20,7 +20,7 @@
  */
 
 import { debug, log, logFatal } from "../logger.ts";
-import { getKiloMcpOverride } from "./kilo-config.ts";
+import { isMcpDefinedInKiloConfig } from "./kilo-config.ts";
 
 /** Entrada remota de MCP como o Kilo a aceita (`McpRemoteConfig` do SDK). */
 export interface McpRemoteConfig {
@@ -44,16 +44,34 @@ export interface McpCallResult<T> {
 }
 
 /**
- * Um registro precisa de refresh quando está `failed` (o comando/URL mudou, ou
- * o processo morreu) ou quando o erro menciona `ENOENT` (binário/rota sumiu).
- * Idêntico a `shouldRefreshMcpRegistration` do antecessor
- * (`openviking-memory.js:1770`). `connected`/`disabled` não refrescam.
+ * Um registro precisa de refresh quando **não** está conectado (qualquer estado
+ * que não seja `connected`: `failed`, `disabled`, `connecting` preso,
+ * `disconnected`, `error`). Regressão corrigida (defeito D-6): o antecessor
+ * desconectava em **qualquer** estado não-conectado; tratá-los como "já
+ * registrado, ignorar" deixava o MCP morto e mudo (0 tools, nenhum erro).
  */
 export function shouldRefreshMcpRegistration(existing: KiloMcpStatus | undefined): boolean {
   if (!existing) return false;
-  if (existing.status === "failed") return true;
+  if (existing.status !== "connected") return true;
+  // `connected` com `ENOENT` é estado inconsistente (binário/rota sumiu):
+  // refresca mesmo assim.
   if (existing.error?.includes("ENOENT")) return true;
   return false;
+}
+
+/**
+ * Nome de MCP válido: não-vazio, sem barra/barra-invertida/ponto-sequência
+ * (evita traversal e segmento de path no SDK), sem espaço. Regressão corrigida
+ * (defeito D-8): o `name` ia **cru** para os path params de `add`/`connect`.
+ */
+export function isValidMcpName(name: string): boolean {
+  if (typeof name !== "string") return false;
+  const trimmed = name.trim();
+  if (trimmed === "" || trimmed !== name) return false;
+  if (name.includes("/") || name.includes("\\")) return false;
+  if (name.includes("..")) return false;
+  // Espaço interno também é suspeito num nome de servidor MCP.
+  return !/\s/.test(name);
 }
 
 /** Porta do `client.mcp` do Kilo — implementada pelo SDK; fake nos testes. */
@@ -97,22 +115,69 @@ export interface McpRegisterConfig {
 }
 
 /**
- * Monta o `McpRemoteConfig` a partir da config efetiva. **Puro**. O header
- * `Authorization` só entra quando há token (a borda responde 401 sem ele — o
- * memtier MCP é rota protegida).
+ * Monta o `McpRemoteConfig` a partir da config efetiva. **Puro**.
+ *
+ * A URL é unida com o `URL` nativo (defeito D-5 corrigido): concatenar
+ * `${base}/v1/mcp` corrompia base com `?query`/`#fragment` (o sufixo ia parar
+ * **depois** do `?`) e base vazia virava `/v1/mcp` relativo. O `URL` resolve o
+ * path corretamente e descarta query/fragment ao setar `pathname`.
+ *
+ * O header `Authorization` só entra quando há token **efetivo** (truthy após
+ * `trim` — defeito D-9: um token só-espaços gerava `Bearer    `).
  */
 export function buildMcpConfig(
   cfg: Pick<McpRegisterConfig, "url" | "token" | "timeout_ms">,
 ): McpRemoteConfig {
-  const base = cfg.url.replace(/\/+$/, "");
+  const url = new URL("v1/mcp", ensureBaseUrl(cfg.url)).toString();
   const config: McpRemoteConfig = {
     type: "remote",
-    url: `${base}/v1/mcp`,
+    url,
     enabled: true,
     timeout: cfg.timeout_ms,
   };
-  if (cfg.token) config.headers = { Authorization: `Bearer ${cfg.token}` };
+  const token = cfg.token.trim();
+  if (token) config.headers = { Authorization: `Bearer ${token}` };
   return config;
+}
+
+/**
+ * Normaliza a base do memtier para uma URL absoluta terminada em `/`, base para
+ * o `new URL("v1/mcp", …)`. Sem host (ex.: `""` ou só path) ⇒ lança — o
+ * chamador (`registerMemtierMcp`) degrada com log (FR-604).
+ */
+function ensureBaseUrl(raw: string): string {
+  const trimmed = raw.trim();
+  if (trimmed === "") throw new Error("mcp: daemon.url vazia");
+  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)
+    ? trimmed
+    : `http://${trimmed}`;
+  // Termina em `/` para que o path relativo seja resolvido sob a base (o `URL`
+  // preserva o último segmento sem a barra).
+  return withScheme.endsWith("/") ? withScheme : `${withScheme}/`;
+}
+
+/** Status HTTP de um erro do SDK, quando houver (`{status:409,...}`). */
+function errorStatus(error: unknown): number | undefined {
+  if (error && typeof error === "object" && "status" in error) {
+    const status = (error as { status?: unknown }).status;
+    return typeof status === "number" ? status : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * `true` quando o erro do `add` significa "o nome já existe" — `409` de
+ * concorrência (dois boots) ou detalhe `already exists`. Nesse caso o registro
+ * do **outro** boot venceu e basta tentar o `connect` (defeito D-7: antes isso
+ * virava FATAL e o perdedor ficava sem conectar).
+ */
+function isAlreadyExists(error: unknown): boolean {
+  if (errorStatus(error) === 409) return true;
+  const detail =
+    error && typeof error === "object" && "detail" in error
+      ? (error as { detail?: unknown }).detail
+      : undefined;
+  return typeof detail === "string" && /already exists|já existe/i.test(detail);
 }
 
 /**
@@ -138,11 +203,28 @@ export async function registerMemtierMcp(
 
   const directory = cfg.directory;
 
-  // Idempotência (FR-602): se o usuário já definiu `mcp.<name>` no kilo.jsonc,
-  // o plugin NÃO registra por cima — o que está lá é a vontade dele.
-  const override = getKiloMcpOverride(directory, cfg.name);
-  if (override) {
+  // Valida o nome antes de usá-lo em path params (defeito D-8): nome vazio, com
+  // `/`, `..` ou espaço vira segmento de path/traversal no SDK.
+  if (!isValidMcpName(cfg.name)) {
+    log(`mcp: nome inválido (${JSON.stringify(cfg.name)}); registro ignorado`);
+    return;
+  }
+
+  // Idempotência (FR-602): se **algum** kilo.jsonc define `mcp.<name>` (com
+  // qualquer valor, inclusive `false`), o plugin NÃO registra por cima — o que
+  // está lá é a vontade dele. Cobre D-4 (precedência) e D-10 (`false` bloqueia).
+  if (isMcpDefinedInKiloConfig(directory, cfg.name)) {
     debug(`mcp "${cfg.name}" já definido no kilo.jsonc — registro do plugin ignorado`);
+    return;
+  }
+
+  let config: McpRemoteConfig;
+  try {
+    config = buildMcpConfig(cfg);
+  } catch (err) {
+    // `daemon.url` vazia/inválida: degrada sem tentar o registro (FR-604).
+    log(`mcp: URL inválida (${JSON.stringify(cfg.url)}); registro ignorado`);
+    debug(`mcp buildMcpConfig: ${err instanceof Error ? err.message : String(err)}`);
     return;
   }
 
@@ -154,16 +236,18 @@ export async function registerMemtierMcp(
     }
 
     const existing = status.data?.[cfg.name];
-    if (existing?.status === "connected" && !shouldRefreshMcpRegistration(existing)) {
+    // Já conectado e saudável: nada a fazer.
+    if (existing && !shouldRefreshMcpRegistration(existing)) {
       debug(`mcp "${cfg.name}" já conectado — registro ignorado`);
       return;
     }
 
-    const config = buildMcpConfig(cfg);
-    if (existing && shouldRefreshMcpRegistration(existing)) {
-      // Registro falho (status failed / ENOENT): derruba o antigo antes de
-      // re-adicionar — o `add` sobre um nome existente falharia.
-      debug(`mcp "${cfg.name}" refresh após falha (status=${existing.status})`);
+    if (existing) {
+      // Qualquer estado não-conectado (failed/disabled/connecting/disconnected/
+      // error): derruba o antigo e re-registra — sem isso o MCP ficaria morto e
+      // mudo (defeito D-6). O `add` sobre um nome existente falharia, daí o
+      // `disconnect` antes.
+      debug(`mcp "${cfg.name}" refresh (status=${existing.status})`);
       const disconnect = await mcp.disconnect({
         path: { name: cfg.name },
         query: { directory },
@@ -171,17 +255,17 @@ export async function registerMemtierMcp(
       if (disconnect.error) {
         log(`mcp: disconnect falhou: ${JSON.stringify(disconnect.error)}`);
       }
-    } else if (existing) {
-      // Já registrado e num estado que não é `connected` nem falho (ex.:
-      // `disabled`): não duplicar.
-      debug(`mcp "${cfg.name}" já registrado (status=${existing.status}) — ignorado`);
-      return;
     }
 
     const add = await mcp.add({ body: { name: cfg.name, config }, query: { directory } });
-    if (add.error) {
+    if (add.error && !isAlreadyExists(add.error)) {
       logFatal("mcp add", new Error(JSON.stringify(add.error)));
       return;
+    }
+    if (add.error) {
+      // 409 de concorrência (dois boots) ou registro prévio: o nome já existe —
+      // não é fatal. Segue para o `connect` (defeito D-7).
+      log(`mcp: add retornou "já existe" (${errorStatus(add.error)}); tentando conectar`);
     }
 
     const connect = await mcp.connect({

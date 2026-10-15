@@ -65,7 +65,7 @@ Convenções válidas para todas as epics:
 - [x] **E3b-S1** — Tracer bullet: registrar o MCP remoto no boot (`status`→`add`→`connect`)
 - [x] **E3b-S2** — Endurecer: idempotência (não duplicar se já definido), degradação não-fatal
 - [x] **E3b-S3** — Fechamento: prova de tools listáveis/chamáveis, docs, zero marcadores
-- [ ] **E3b-S4** — **Corrigir os defeitos da revisão adversarial postergada** (D-1..D-10): vírgula final no JSONC derruba o override (D-3); precedência de `kilo.jsonc` sombreia o override (D-4); MCP fica morto e mudo em `disabled`/`connecting`/`disconnected`/`error` — regressão face ao antecessor (D-6); `409` de concorrência vira FATAL sem retry (D-7); `mcp.name` cru nos path params (D-8); token só-espaços vira header (D-9); `memtier: false` não bloqueia (D-10); junção ingênua de URL corrompe base com query/fragment (D-5)
+- [x] **E3b-S4** — **Corrigir os defeitos da revisão adversarial postergada** (D-1..D-10): vírgula final no JSONC derruba o override (D-3); precedência de `kilo.jsonc` sombreia o override (D-4); MCP fica morto e mudo em `disabled`/`connecting`/`disconnected`/`error` — regressão face ao antecessor (D-6); `409` de concorrência vira FATAL sem retry (D-7); `mcp.name` cru nos path params (D-8); token só-espaços vira header (D-9); `memtier: false` não bloqueia (D-10); junção ingênua de URL corrompe base com query/fragment (D-5)
 - [ ] **E3b-S5** — **Fechamento do E3b-S4**: comando E2E documentado tem de ser verde com o token certo (D-1/D-2 — `e2e-tok-a` é escopo `alfa`, não o workspace do teste); cobrir `scheduleMcpRegistration` (D-11), o caso negativo "já definido ⇒ não registra" ponta-a-ponta (D-12) e o `timeout`/`enabled` do `add` (D-13)
 
 ### E3c — Injeção de código
@@ -437,3 +437,34 @@ redescobertas no meio do loop.
     **D-9** token só-espaços vira header; **D-10** `memtier: false` não bloqueia.
   Escopo aberto: **`E3b-S4`** (corrigir D-1..D-10) e **`E3b-S5`** (fechamento:
   comando E2E verde com o token certo + cobrir D-11/D-12/D-13).
+
+- **2026-10-15 — E3b-S4 (correção dos defeitos D-3..D-10).** Correções sobre a
+  mesma base do E3b, sem rewrite. D-1/D-2 (E2E) e D-11/D-12/D-13 (cobertura)
+  ficam para a **E3b-S5** — a S4 corrige os **8 defeitos de código**:
+  1. **D-3** (`kilo-config.ts`): novo `stripTrailingCommas` (respeita strings e
+     escapes), aplicado **depois** de `stripJsoncComments`; vírgula final de JSONC
+     não derruba mais o override (FR-602).
+  2. **D-4**: `isMcpDefinedInKiloConfig` varre **todos** os arquivos de config —
+     um `.kilo/kilo.jsonc` sem `mcp` (ou que não parseia) não sombreia mais um
+     `kilo.jsonc` da raiz que o define.
+  3. **D-10**: `mcp.<name>` definido com **qualquer** valor (`false`/`null`/`[]`)
+     bloqueia o registro via `hasOwnProperty` — antes só `object` contava.
+  4. **D-5** (`register.ts`): URL unida com `URL` nativo (`new URL("v1/mcp",
+     base/)`) — base com `?query`/`#fragment`/subpath deixa de corromper; base
+     vazia lança e o chamador degrada (FR-604).
+  5. **D-6**: `shouldRefreshMcpRegistration` agora é `status !== "connected"`
+     (preservando `ENOENT` sobre `connected`); o fluxo desconecta e re-registra
+     qualquer estado não-conectado — o MCP não fica mais morto e mudo.
+  6. **D-7**: `409`/`already exists` do `add` é tratado como não-fatal e **segue
+     para o `connect`**; só erro real vira FATAL.
+  7. **D-8**: `isValidMcpName` rejeita nome vazio, com `/`, `\`, `..` ou espaço
+     antes de usá-lo nos path params do SDK.
+  8. **D-9**: token é `trim()`ado; só-espaços vira sem-header (não `Bearer    `).
+  `getKiloMcpOverride`/`readKiloConfig` foram substituídos por
+  `isMcpDefinedInKiloConfig` (a API retornava `object|undefined`, incapaz de
+  expressar `false`/`null` — era a raiz de D-10). Testes: `tests/mcp.test.ts`
+  45/45 (14 casos novos cobrindo D-3..D-10 + D-13). Unit **225 · 216 pass ·
+  0 fail · 9 skip**; `tsc --noEmit` limpo; E2E do MCP 2/2. Revisão adversarial
+  por subagente não rodou (infra `litellm:4000` fora do ar) — revisão inline com
+  sondagem de bordas (strings com `,]`, aspas escapadas, `?query`/`#fragment`,
+  `ENOENT` sobre `connected`).
