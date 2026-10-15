@@ -69,7 +69,7 @@ Convenções válidas para todas as epics:
 ### E3c — Injeção de código
 - [x] **E3c-S1** — Tracer bullet: `code_search` → bloco de código no `messages.transform` (part separado)
 - [x] **E3c-S2** — Endurecer: paralelismo com o recall, orçamento do total (`maxChars`), dedup do chunk
-- [ ] **E3c-S3** — Fechamento: E2E real contra o memtier, docs, zero marcadores
+- [x] **E3c-S3** — Fechamento: E2E real contra o memtier, docs, zero marcadores
 
 ### Segunda onda (spec sob demanda)
 - [ ] **E4** — Ingestão assíncrona (fila por sessão, debounce)
@@ -361,3 +361,38 @@ redescobertas no meio do loop.
      — fora do escopo da E3b.)
   6. Bloqueio registrado mantido: `neighbors` **não** é tool MCP — a E3b não
      promete navegação (README/ADR-006).
+
+- **2026-10-15 — E3c fechada (S1/S2/S3):** injeção de código entregue sobre a
+  base tracer-bullet (S1 → S2 → S3, sem rewrite). Entrega:
+  1. `src/inject/code.ts` (`formatCodeBlock`/`chunkIdentity`, `CodeInjector`
+     com dedup por turno), `client.searchCode`, `config` (`inject.code_enabled`,
+     `inject.max_code_chunks`) e `hooks/messages.ts` (`injectContextIntoMessages`
+     orquestra as duas famílias). O bloco de código é um **segundo part** no
+     MESMO `messages.transform` (não um segundo hook), com sentinela própria
+     `graph-code` e procedência por chunk `[CÓDIGO RELEVANTE — path:ini-fim]`.
+  2. **Paralelismo:** recall e `code/search` partem com `Promise.allSettled`,
+     cada um com seu `AbortSignal` — `inject.timeout_ms` vale para **cada**
+     chamada. É o que sustenta o teto de 4s do hook (sem somar latências).
+  3. **Orçamento do TOTAL** (`applyJointBudget`): `maxChars` é o teto de
+     memória+código; corta fatos inteiros de memória **primeiro** (do fim), só
+     então chunks inteiros de código — código prioritário; chunk nunca pela
+     metade (ADR-004).
+  4. **Dedup por turno compartilhado:** memória e código usam o MESMO `turnoId`
+     (`id` da `UserMessage`); identidade do chunk = `path:start_line-end_line`
+     (a rota não devolve `chunk_md5`). Um turno injeta no máximo um bloco de cada
+     família; `transform` 2× não acumula.
+  5. **Sanitização** do `code`/`path` (`<`/`>` → `&lt;`/`&gt;`) **preservando**
+     quebras de linha e indentação (a lição D-3 do E2, adaptada: código não pode
+     ser achatado como o fato).
+  6. **E2E real** `tests/e2e/test_e2e_inject_code.test.ts` (gated `E2E=1`):
+     indexer → sync → `code_search` acha o símbolo único → o plugin bootado
+     injeta `<context graph-code="true">` com o caminho REAL. Exige
+     `E2E_CODE_TOKEN` (em `E2E=1` sem token, **falha** — nunca skip silencioso);
+     medido 1/1 verde contra o memtier (`alfa`, ~1,6s).
+  7. **Config — exceção consciente:** as duas chaves novas
+     (`inject.code_enabled`, `inject.max_code_chunks`) foram declaradas pela E3c
+     porque o E1 fechou antes da E3c ser especada (a segunda onda era "spec sob
+     demanda"). Sem churn: a E3c **lê** (não redeclara) `inject.enabled`,
+     `inject.timeout_ms`, `inject.max_chars` e `daemon.*`.
+  8. `rg "TODO\(tracer-bullet\)" src/` → **zero**. Unit 195 verdes; E2E gated
+     (9 casos skip sem `E2E=1`). `tsc --noEmit` limpo.

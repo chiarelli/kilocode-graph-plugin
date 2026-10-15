@@ -1,11 +1,12 @@
 # kilocode-graph-plugin — src
 
-Estado: **E1 (fundação), E2 (injeção de memória), E3a (coletor de código) e E3b
-(registro do MCP) implementadas**; a segunda onda ainda é forma e contratos. O
-mapa abaixo é o alvo; o que existe hoje em `src/` é `index.ts`, `config.ts`,
-`client.ts`, `workspace.ts`, `logger.ts`, `types.ts`, `hooks/{messages,collect}.ts`,
-`inject/{memory,budget}.ts`, `index/{runner,collector,edges,manifest,trigger}.ts`
-e `mcp/{register,kilo-config}.ts`.
+Estado: **E1 (fundação), E2 (injeção de memória), E3a (coletor de código), E3b
+(registro do MCP) e E3c (injeção de código) implementadas**; a segunda onda
+(E4–E7) ainda é forma e contratos. O mapa abaixo é o alvo; o que existe hoje em
+`src/` é `index.ts`, `config.ts`, `client.ts`, `workspace.ts`, `logger.ts`,
+`types.ts`, `hooks/{messages,collect}.ts`, `inject/{memory,code,budget}.ts`,
+`index/{runner,collector,edges,manifest,trigger}.ts` e
+`mcp/{register,kilo-config}.ts`.
 
 ```
 src/
@@ -37,18 +38,20 @@ src/
 
 ## Assinaturas esperadas
 
-### `client.ts` (E1 + `recall` da E2 + `syncCode` da E3a — implementado)
+### `client.ts` (E1 + `recall` da E2 + `searchCode` da E3c + `syncCode` da E3a — implementado)
 ```ts
 class MemtierClient {
   recall(query: string, opts?: { limit?; maxTokens?; signal? }): Promise<RecallResult>
+  searchCode(query: string, opts?: { limit?; maxTokens?; signal? }): Promise<SearchCodeResult>  // ≤50; sem labels
   syncCode(files, edges?, signal?): Promise<SyncResult>  // pagina ≤100 arquivos, ≤5000 arestas
   health(signal?): Promise<HealthReport>   // nunca lança (NFR-03)
-  // searchCode/ingest entram com E3c/E4.
+  // ingest entra com E4.
 }
 // identidade (`workspace`/`program`) vem do construtor; `max_tokens` é o
 // orçamento A1 no servidor. Erros HTTP viram tipos (AuthError 401/403,
 // InfraError 503) — o hook degrada, não propaga. `syncCode` faz fallback 422
-// (reenvia sem arestas) e usa `sync_timeout_ms` (default 120000).
+// (reenvia sem arestas) e usa `sync_timeout_ms` (default 120000). `searchCode`
+// fatia `limit` em 50 (MAX_SEARCH_LIMIT) e NUNCA envia `labels` (lista vazia é 422).
 ```
 
 ### `index/` (E3a — implementado)
@@ -83,27 +86,52 @@ function shouldRefreshMcpRegistration(existing): boolean        // failed/ENOENT
 // code_sync) — navegação não é prometida (ADR-006).
 ```
 
-### `inject/budget.ts` (E2 — implementado)
+### `inject/budget.ts` (E2 + joint budget da E3c — implementado)
 ```ts
 function applyBudget(facts: Fact[], cfg: Budget, render?: (f: Fact[]) => string): Fact[]
 // corta por fato INTEIRO: maxMemories (nº) e maxChars (teto do bloco renderizado).
 // `render` é injetado por memory.ts só para medir (evita ciclo de import).
+function applyJointBudget(facts, chunks, cfg, renderTotal): { facts; chunks }
+// E3c: maxChars = teto do TOTAL (memória+código). Corta fatos INTEIROS de
+// memória primeiro (do fim); só então chunks INTEIROS de código (do fim) —
+// código prioritário; chunk nunca pela metade.
 ```
 
-### `inject/memory.ts` (E2 — implementado)
+### `inject/memory.ts` (E2 + prepare/commit da E3c — implementado)
 ```ts
 function formatMemoryBlock(facts: Fact[]): string | null   // null ⇒ não injeta
 async function recallAndFormat(client, cfg, query, signal?): Promise<string | null>
 class MemoryInjector {                                    // dedup por turno (FR-104)
   inject(query): Promise<InjectionResult | null>          // { block, facts, chars, recallMs }
+  prepare(turnoId, query): Promise<MemoryPrep | null>     // E3c: sem commit (paralelismo)
+  commit(prep, facts): InjectionResult | null             // E3c: dedup + formatação
 }
 // observabilidade do turno (base E7): loga `inject recall_ms=… facts=… injected_chars=…`
 ```
 
-### `hooks/messages.ts` (E2 — implementado)
+### `inject/code.ts` (E3c — implementado)
+```ts
+function formatCodeBlock(chunks: CodeChunkHit[]): string | null  // null ⇒ não injeta
+function chunkIdentity(chunk): string                     // `path:start-end` (sem chunk_md5)
+async function searchAndFormat(client, cfg, query, signal?): Promise<string | null>
+class CodeInjector {                                      // dedup por turno (mesmo turnoId da memória)
+  prepare(turnoId, query): Promise<CodePrep | null>       // busca + dedup, sem commit
+  commit(prep, chunks): CodeInjectionResult | null        // formata o bloco `graph-code`
+}
+// sentinela própria `graph-code` (distinta de `graph-memory`); procedência por
+// chunk `[CÓDIGO RELEVANTE — path:ini-fim]`; sanitiza `<`/`>` preservando
+// quebras de linha/indentação. Nunca busca com `limit:0` (422 no servidor).
+```
+
+### `hooks/messages.ts` (E2 + E3c — implementado)
 ```ts
 function messagesHook(rt: InjectRuntime): { "experimental.chat.messages.transform": fn }
-// thin: liga o transform do Kilo ao MemoryInjector; nunca lança (NFR-03).
+// thin: liga o transform do Kilo aos dois injetores; nunca lança (NFR-03).
+async function injectContextIntoMessages(messages, rt): Promise<void>
+// E3c: memória e código em PARALELO (Promise.allSettled, cada um com seu
+// AbortSignal); orçamento do TOTAL (`applyJointBudget`, código prioritário);
+// memória ANTES do código; um bloco de cada família por turno. Código desligado
+// ⇒ delega ao caminho E2.
 ```
 
 ### `ingest/debounce.ts`

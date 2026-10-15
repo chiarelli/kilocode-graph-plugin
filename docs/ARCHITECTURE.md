@@ -278,16 +278,20 @@ sessão e enfileira um job a cada N mensagens ou T segundos, o que vier primeiro
 1. usuário envia o prompt
 2. hook chat.message        → guarda o texto (não bloqueia)
 3. hook messages.transform  → [SÍNCRONO, orçamento 4s]
-      ├── POST /v1/recall       (memória)
-      └── POST /v1/code/search  (código)
-      └── injeta bloco no turno
+      ├── POST /v1/recall       (memória) ─┐
+      └── POST /v1/code/search  (código) ─┴─ EM PARALELO (allSettled,
+                                              AbortSignal por chamada)
+      └── orçamento do TOTAL (maxChars; código prioritário)
+      └── injeta 1 part por família (memória antes do código)
 4. LLM responde (pode usar tools MCP — pull)
 5. hook chat.message        → acumula para ingestão
 6. debounce atinge o limiar → POST /v1/ingest (202)
 ```
 
 **Só o passo 3 está no caminho crítico.** Se ele estourar o timeout, o turno
-segue sem contexto (E5).
+segue sem contexto (E5). As duas buscas rodam em **paralelo** justamente para não
+somar as latências: `inject.timeout_ms` vale para **cada** chamada, não para a
+soma.
 
 ### Fluxo de coleta de código (fora do turno)
 
@@ -313,18 +317,45 @@ segue; a próxima busca simplesmente não acha o código novo ainda.
 ## 5. Formato do contexto injetado
 
 Blocos distintos, com procedência (FR-105) — o modelo precisa saber o que é fato
-de memória e o que é código do repo:
+de memória e o que é código do repo. Cada família vira um **part separado** no
+mesmo turno (não há um segundo `transform`), com **sentinela própria**.
+
+Memória (sentinela `graph-memory`):
 
 ```
+<context graph-memory="true">
 [CONTEXTO DE MEMÓRIA]
 - O backend do Atlas roda em PostgreSQL 16 (válido desde 2026-04-22)
 - O timeout de conexão foi ajustado para 30s
+</context>
+```
 
+Código (sentinela `graph-code`), com procedência **por chunk** — um cabeçalho
+`[CÓDIGO RELEVANTE — path:inicio-fim]` antes de cada trecho:
+
+```
+<context graph-code="true">
 [CÓDIGO RELEVANTE — internal/billing/store.go:42-55]
 func SaveInvoice(ctx context.Context, inv *Invoice) error {
     return db.Insert(ctx, "invoices", inv)
 }
+</context>
 ```
+
+> **Ordem e orçamento.** A memória é injetada **antes** do código. `maxChars` é o
+> teto do **total** (memória + código): quando estoura, corta fatos **inteiros**
+> de memória primeiro (do fim); só então chunks **inteiros** de código — o código
+> tem prioridade (chunk truncado não compila). Um chunk nunca é cortado pela
+> metade.
+>
+> **Sanitização.** Tanto o `fact` quanto o `code` vêm de fora (grafo/repo). O
+> texto é neutralizado (`<`/`>` → `&lt;`/`&gt;`) para que nenhum conteúdo possa
+> abrir ou fechar a sentinela. No código, as quebras de linha e a indentação são
+> **preservadas** (são o conteúdo); no fato, viram espaço (um fato é uma linha).
+>
+> **Paralelismo.** Recall e `code/search` partem em **paralelo**
+> (`Promise.allSettled`), cada um com seu `AbortSignal`: `inject.timeout_ms` vale
+> para **cada** chamada, não para a soma — é o que sustenta o teto de 4s do hook.
 
 ## 6. Configuração
 
@@ -351,7 +382,9 @@ Nada hardcoded no script (FR-303). **JSON** + env vars, precedência:
     "max_memories": 5,
     "max_chars": 3000,                    // KILOCODE_GRAPH_INJECT_MAX_CHARS
     "max_tokens": 2000,                   // A1 — orçamento de resposta no servidor
-    "timeout_ms": 4000                    // orçamento do hook
+    "timeout_ms": 4000,                   // orçamento do hook (por chamada)
+    "code_enabled": false,                // E3c — injeção de código (desligada)
+    "max_code_chunks": 3                  // E3c — nº de chunks de código
   },
   "code_index": {                         // E3a — o coletor
     "enabled": false,                     // ativado por flag, como hoje
@@ -368,7 +401,8 @@ Nada hardcoded no script (FR-303). **JSON** + env vars, precedência:
 
 > **Envs** (todas `KILOCODE_GRAPH_*`): `URL`, `TOKEN`, `TOKEN_FILE`, `PROGRAM`,
 > `INJECT_ENABLED`, `INJECT_MAX_MEMORIES`, `INJECT_MAX_CHARS`,
-> `INJECT_MAX_TOKENS`, `INJECT_TIMEOUT_MS`, `INDEX_ENABLED`, `INDEXER_BIN`,
+> `INJECT_MAX_TOKENS`, `INJECT_TIMEOUT_MS`, `INJECT_CODE_ENABLED`,
+> `INJECT_MAX_CODE_CHUNKS`, `INDEX_ENABLED`, `INDEXER_BIN`,
 > `INDEX_SYNC_TIMEOUT_MS`, `MCP_ENABLED`, `MCP_NAME`, `DEBUG`. O prefixo da env
 > de config é `KILOCODE_GRAPH_` (o `openviking` do antecessor mudou).
 
@@ -376,9 +410,12 @@ Nada hardcoded no script (FR-303). **JSON** + env vars, precedência:
 > do dono no plugin atual.
 >
 > **Escopo das chaves:** este bloco lista a config fixada pela **E1** (a tabela
-> de chaves da `specs/e1-stories.md` §2) mais `code_index.sync_timeout_ms`
-> (E3a-S4). Chaves de segunda onda — `ingest.*` (E4) — entram quando suas epics
-> forem especificadas; declarar antes seria contrato fantasma.
+> de chaves da `specs/e1-stories.md` §2), `code_index.sync_timeout_ms` (E3a-S4) e
+> `inject.code_enabled`/`inject.max_code_chunks` (E3c). Estas duas últimas são a
+> **exceção consciente**: o E3c não estava specado quando o E1 fechou (a segunda
+> onda era "spec sob demanda"), então a epic dona as declara e a exceção é
+> registrada no histórico do BACKLOG. Chaves de `ingest.*` (E4) entram quando sua
+> epic for especificada; declarar antes seria contrato fantasma.
 
 
 ## 7. Adaptadores multi-CLI
