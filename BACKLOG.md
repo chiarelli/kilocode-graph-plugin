@@ -73,8 +73,16 @@ Convenções válidas para todas as epics:
 - [x] **E3c-S2** — Endurecer: paralelismo com o recall, orçamento do total (`maxChars`), dedup do chunk
 - [x] **E3c-S3** — Fechamento: E2E real contra o memtier, docs, zero marcadores
 
-### Segunda onda (spec sob demanda)
-- [ ] **E4** — Ingestão assíncrona (fila por sessão, debounce)
+### E4 — Ingestão assíncrona
+> **Decisão de produto resolvida** (2026-10-15): gatilho, rotina, cursor e
+> idempotência estão em **`docs/adr/007`** e **`docs/adr/008`**; a decomposição
+> em **`specs/e4-stories.md`**. O memtier **não muda**.
+- [ ] **E4-S1** — Tracer bullet: ler o `kilo.db` (user+assistant) → 1 lote real → `/v1/ingest`
+- [ ] **E4-S2** — Endurecer: cursor por `(time_created, id)` + `sentBatchHashes` (idempotência)
+- [ ] **E4-S3** — `session.idle` drena tudo + o resto (mesma rotina; trava por sessão)
+- [ ] **E4-S4** — Limitações L-1/L-2/L-3 como critério de aceite (decisão do dono)
+- [ ] **E4-S5** — Fechamento: E2E real, docs coerentes, zero marcadores
+
       **DECIDIDO (2026-10-15):** batch por **VALOR de config** (não por mensagem);
       `reference_time` = **mensagem mais atual do batch**.
       **MEDIDO:** batch=20 custa **10 s** vs **1.405 s** do batch=1 para qualidade
@@ -85,16 +93,23 @@ Convenções válidas para todas as epics:
       **GARGALO observado:** o worker consome **1 job por ciclo** (serial) ⇒ ~70 s
       por episódio, ~23 min para 20. **Decisão de concorrência do MEMTIER**, não
       deste plugin.
-      ⚠️ **Trigger em discussão (2026-10-15):** `chat.message` dispara por
-      mensagem do **USUÁRIO** — em sessão agêntica a razão user/assistant é
-      discrepante e conteúdo pode ficar **sem ingestão para sempre**. Ver
-      `docs/TRIGGER-INGESTAO.md`.
+      ⚠️ **Trigger RESOLVIDO (2026-10-15):** `chat.message` disparava por mensagem
+      do **USUÁRIO** (o lado do assistente nunca entrava; e a fila ficava presa).
+      Agora: **`message.updated` + `session.idle` acordam a MESMA rotina** — o
+      evento não ingere, só acorda; o conteúdo vem do **banco**. Medições e
+      decisões em `docs/TRIGGER-INGESTAO.md`, `docs/adr/007`, `docs/adr/008`.
+
+### E5 — Degradação
 - [ ] **E5** — Degradação (memtier/indexer fora do ar ⇒ turno segue)
+
+### E6 — Multi-CLI
 - [!] **E6** — Multi-CLI — **BLOQUEADA: só Kilocode é suficiente hoje**
       (decisão do dono, 2026-10-15). OpenCode e Claude Code **não estão
       instaladas** nesta máquina (SPIKE-FINDINGS: "não dá para validar sem
       instalar") e o Claude Code usa **outro mecanismo** (`UserPromptSubmit` →
       `additionalContext`). Não é "pendente de spec" — é **sem consumidor hoje**.
+
+### E7 — Observabilidade
 - [ ] **E7** — Observabilidade (log de recall/coleta, flag de debug)
 
 ---
