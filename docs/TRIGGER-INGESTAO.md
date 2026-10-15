@@ -73,11 +73,53 @@ pergunta que ele responde é *"o próximo batch já está pronto para envio?"*. 
   inócua), e o **batch fecha por valor** (limiar de config), não por evento;
 - quem decide enviar é o **estado do lote**, não a mensagem individual.
 
+### 2.2-bis Onde mora o CONTEÚDO (sonda 2, com uso de ferramenta)
+
+Segunda instrumentação, numa sessão **com ferramentas** (leitura de arquivo +
+escrita), para responder a pergunta do acumulador.
+
+**Achado 1 — `message.updated` é METADADO, não conteúdo.** Traz `info` com
+`role`/`id`/`time` — mas **sem `parts`**. Quem carrega o texto é
+**`message.part.updated`**. Consequência direta: o trigger default
+(`message.updated`) **não consegue** montar o lote sozinho — ele precisa do
+`message.part.updated` para ter o conteúdo.
+
+**Achado 2 — o conteúdo é construído INCREMENTALMENTE (confirmado).** Mesmo `id`,
+mesmo `part`, vários anúncios com texto crescente:
+
+```
+seq=31  id=msg_13fe1271b…  len=  0   sha=e3b0c44298fc  tail=''            ← parte vazia
+seq=32  id=msg_13fe1271b…  len=130   sha=65db35698c53  tail='…/out.txt.'  ← texto final
+```
+
+O `sha` do vazio é `e3b0c44298fc` (= sha256 de `""`), então é **parte real, ainda
+sem texto** — não uma parte ausente. O texto chega **depois**, no mesmo `id`.
+
+⚠️ **Mas o acúmulo por delta NÃO veio por esse caminho.** Os 11
+`message.part.delta` (frequentes, em streaming) **não** apareceram nesta sonda —
+os eventos de texto chegaram **já concatenados** (0 chars → 130 chars), não
+caractere a caractere. Ou seja: há duas granularidades (delta × part-updated) e
+o teste exercitou a segunda. **Não medido:** se o delta também chega em sessões
+mais longas/streaming contínuo.
+
+**Consequência para o acumulador** (o que a pergunta pedia): **guardar o ÚLTIMO
+estado por `id`** — um `Map<messageID, {role, texto}>` onde cada
+`message.part.updated` de texto **substitui** o valor, nunca soma. Assim o lote
+nunca contém o texto parcial (len=0) nem uma concatenação dupla.
+
 ### 2.3 `experimental.chat.messages.transform` — viu **só** `['user']`
 
 ```
-messages.transform  roles = ['user']   parts = [{type:'text', len:40}]
+messages.transform  roles = ['user']                          parts = [{type:'text', len:176}]
+messages.transform  roles = ['user','assistant']              lens  = [176, 0]
+messages.transform  roles = ['user','assistant','assistant']   lens  = [176, 0, 0]
 ```
+
+⚠️ **Reconfirmado na sonda 2, e é pior do que "vê só o user":** o transform
+**enxerga** as mensagens do assistant (os roles aparecem), mas com **`len=0`** —
+o texto delas **não está lá**. Ele recebe a estrutura sem o conteúdo do
+assistant. Portanto o transform **não** serve como fonte de captura do
+assistant (o `message.part.updated` serve).
 
 ⚠️ **Contradiz a premissa de que o transform vê a conversa inteira.** Nesta
 execução ele recebeu apenas a mensagem do usuário. **Não** serve como fonte de
@@ -199,6 +241,22 @@ idempotência é do cliente**, e o `sentBatchHashes` é essa prova.
 indefinidamente. O antecessor **não** tem política de TTL/limite. Para o
 graph-plugin isso precisa ser decidido (é dívida latente, não bloqueio).
 
+### 4.3-bis Diferença entre os dois gatilhos (regra fixada pelo dono)
+
+Os dois gatilhos **não** fazem a mesma coisa:
+
+| gatilho | condição | quantos jobs |
+|---|---|---|
+| **`message.updated`** (default) | dispara **só se** o limiar de batch foi atingido | 1 job por limiar cruzado |
+| **`session.idle`** (fallback) | dispara **sempre** | **todos os batches necessários, inclusive o resto** |
+
+**Exemplo do dono:** batch = 20, `session.idle` dispara com **63 mensagens** não
+ingeridas ⇒ **3 jobs de 20 + 1 job de 3** (o resto). O fallback **drena tudo**;
+não deixa resíduo.
+
+Regra formal do fallback: `jobs = ceil(pendentes / batch)`, com o último job
+levando o resto (`pendentes mod batch`, se ≠ 0). Se `pendentes == 0`, não dispara.
+
 ### 4.3 Onde vive a idempotência — **DECIDIDO: no plugin**
 
 Decisão do dono (2026-10-15): *"Vamos deixar a responsabilidade da idempotência do
@@ -211,14 +269,50 @@ lado do plugin, não do memtier."*
 | **consequência** | o memtier **não muda**; nenhum contrato novo; o RFC-001 e este doc ficam como estão |
 | **por que faz sentido** | a decisão acompanha o desenho já existente (`specs/delecao-arquivo-removido-decisao.md`: *"o CLIENTE é responsável por declarar"*) — a mesma invariante de **órfão declarado** aplicada à ingestão: quem conhece o que já mandou é o cliente |
 
+## 6. Limitações conhecidas desta escolha — **anotadas, NÃO serão resolvidas agora**
+
+Decisão do dono (2026-10-15): registrar e deixar **sem resposta**.
+
+### L-1 — A confirmação de processamento é **otimista**
+
+A ingestão é **assíncrona** (`POST /v1/ingest` → 202 → fila → worker). O plugin
+**não** recebe confirmação de que o memtier efetivamente processou o batch.
+
+| | |
+|---|---|
+| **o que o plugin sabe** | que o **envio** foi aceito (202) e que ele gravou o hash em `sentBatchHashes` |
+| **o que o plugin NÃO sabe** | se o worker consumiu, se o `add_episode` teve sucesso, se o job foi para a DLQ |
+| **consequência** | o plugin pode considerar "processado" um batch que **falhou no servidor**. E como o hash já está gravado, ele **nunca reenviará** — a perda é **silenciosa e definitiva** |
+| **onde isso morde** | um `add_episode` que falha por motivo transitório (LLM/embedder) vira perda permanente de memória, sem retry do cliente |
+
+Caminhos possíveis (não decididos): consultar o `ingest:done:{job_id}` do servidor
+— hoje **inviável**, porque o `job_id` é gerado no servidor e não volta ao
+chamador; ou um endpoint de status por `idempotency_key` — hoje **descartado**
+(§4.3). **Fica sem resposta.**
+
+### L-2 — `sentBatchHashes` cresce sem expiração (herdado do antecessor)
+
+Um hash por lote enviado, sem TTL. O antecessor grava em disco
+(`.kilo/openviking-ingest.json`) e **não** tem política. Sem TTL/limite, o arquivo
+cresce indefinidamente. **Não resolvido agora.**
+
+### L-3 — O fallback depende do disco sobreviver
+
+A prova de idempotência vive no plugin (decisão §4.3). Se o arquivo de estado
+for apagado/corromper, `loadState()` degrada para vazio e o próximo
+`session.idle` **reenvia** o que já estava lá. É o custo aceito de manter a
+garantia no cliente.
+
 ## 5. Não medido (não afirmar)
 
 - Se `messages.transform` recebe a conversa inteira em **sessão longa** — nesta
   execução curta ele viu só `['user']`. Reconfirma antes de descartar o hook.
 - **Frequência real** de `session.idle` (se dispara por turno ou só com a sessão
   realmente ociosa) — 1 ocorrência nesta execução.
-- Se o `message.updated` repetido traz **conteúdo** diferente a cada vez (se
-  sim, o acumulador precisa guardar o **último estado** por `id`, não o primeiro).
+- ~~Se o `message.updated` repetido traz conteúdo diferente~~ — **MEDIDO (§2.2-bis)**:
+  o `message.updated` não traz conteúdo nenhum; o texto cresce em
+  `message.part.updated` (0 → 130 chars, mesmo `id`). Acumulador guarda o
+  **último estado por `id`**.
 - Política de expiração do `sentBatchHashes` — o antecessor **não tem** (cresce
   sem limite). Não medi o tamanho que atinge na prática.
 - Taxa de travamento da fila em sessões reais — o defeito é **de desenho**; não
