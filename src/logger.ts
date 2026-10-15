@@ -11,6 +11,14 @@ import { appendFileSync } from "node:fs";
 const LOG_PATH = "/tmp/kilocode-graph-plugin.log";
 const PREFIX = "[graph]";
 
+/**
+ * Teto do que `logFatal` serializa por linha. Um erro HTTP pode embutir o body
+ * inteiro (o memtier ecoa o `input` no detalhe do 422 → vários MB); emitir isso
+ * na UI/console trava o editor. Acima do teto, a linha é truncada com um sufixo
+ * explícito.
+ */
+const MAX_LOG_LINE_CHARS = 8_192;
+
 let debugEnabled = false;
 
 /**
@@ -56,11 +64,19 @@ export function debug(msg: string): void {
 /**
  * Log de erro com escopo. Não lança — o chamador decide se degrada ou para.
  * Usa `console.error` além do arquivo, para o erro ser visível na UI.
+ *
+ * A linha é **limitada** a `MAX_LOG_LINE_CHARS`: um erro cujo `message`/`stack`
+ * carrega um body HTTP inteiro (o caso do 422 com o `input` ecoado) não pode
+ * despejar megabytes no console — isso bloqueia a UI do editor.
  */
 export function logFatal(scope: string, error: unknown): void {
   const message = error instanceof Error ? error.message : String(error);
   const detail = error instanceof Error && error.stack ? `\n${error.stack}` : "";
-  const line = `FATAL ${scope}: ${message}${detail}`;
+  let line = `FATAL ${scope}: ${message}${detail}`;
+  if (line.length > MAX_LOG_LINE_CHARS) {
+    const omitted = line.length - MAX_LOG_LINE_CHARS;
+    line = `${line.slice(0, MAX_LOG_LINE_CHARS)}… [truncated ${omitted} chars]`;
+  }
   log(line);
   try {
     console.error(`${PREFIX} ${line}`);

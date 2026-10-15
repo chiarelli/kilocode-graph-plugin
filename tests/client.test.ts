@@ -10,6 +10,7 @@ import {
   InfraError,
   MemtierClient,
   MemtierHttpError,
+  extractHttpDetail,
   type FetchLike,
   type ReadFileLike,
 } from "../src/client.ts";
@@ -301,6 +302,40 @@ test("http_other_typed: request 422 ⇒ MemtierHttpError (não Auth/Infra)", asy
       !(err instanceof InfraError) &&
       err.status === 422,
   );
+});
+
+test("http_error_message_bounded: body gigante não vira message gigante", async () => {
+  // O memtier ecoa o `input` (body inteiro) no detalhe do 422. A `message` do
+  // erro não pode carregar isso — foi o que travou a UI (4,7 MB no console).
+  const huge = JSON.stringify({
+    detail: [{ type: "value_error", msg: "duplicidade de identidade: x:y", input: "z".repeat(4_000_000) }],
+  });
+  const client = new MemtierClient({ url: "http://memtier:8400", fetch: stubFetch(422, huge) });
+  await assert.rejects(
+    () => client.request("POST", "/v1/code/sync", {}),
+    (err: unknown) => {
+      assert.ok(err instanceof MemtierHttpError && err.status === 422);
+      assert.ok(
+        (err as Error).message.length < 4096,
+        `message tem ${(err as Error).message.length} chars — deveria ser limitada`,
+      );
+      // A parte útil (a msg do servidor) é preservada.
+      assert.ok((err as Error).message.includes("duplicidade de identidade"));
+      return true;
+    },
+  );
+});
+
+test("extractHttpDetail_non_json_truncates_raw", () => {
+  const raw = "e".repeat(10_000);
+  const out = extractHttpDetail(raw);
+  assert.ok(out.length <= 2_048 + 16, `len=${out.length}`);
+  assert.ok(out.includes("truncated"));
+});
+
+test("extractHttpDetail_small_json_unchanged", () => {
+  const raw = JSON.stringify({ detail: [{ msg: "boom", input: "x" }] });
+  assert.equal(extractHttpDetail(raw), raw);
 });
 
 test("program_in_identity: resolveIdentity devolve {workspace,program}", () => {
