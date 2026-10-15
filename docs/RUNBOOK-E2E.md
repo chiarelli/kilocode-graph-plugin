@@ -12,7 +12,7 @@ export PATH="$HOME/.bun/bin:$PATH"
 E2E=1 \
   E2E_TOKEN=e2e-tok-a \
   E2E_CODE_TOKEN=e2e-tok-b \
-  E2E_MCP_TOKEN="$(jq -r .token .kilo/graph-key.json)" \
+  E2E_MCP_TOKEN="$(python3 -c 'import json;print(json.load(open(".kilo/graph-key.json"))["token"])')" \
   node --test "tests/e2e/**/*.test.ts"
 # → # tests 10 / pass 10 / fail 0 / skipped 0
 ```
@@ -45,7 +45,8 @@ E2E=1 E2E_CODE_TOKEN=e2e-tok-b node --test tests/e2e/test_e2e_collector.test.ts 
 E2E=1 E2E_CODE_TOKEN=e2e-tok-b node --test tests/e2e/test_e2e_inject_code.test.ts # 1/1
 
 # bearer real do graph-key.json
-E2E=1 E2E_MCP_TOKEN="$(jq -r .token .kilo/graph-key.json)" node --test tests/e2e/test_e2e_mcp.test.ts  # 3/3
+E2E=1 E2E_MCP_TOKEN="$(python3 -c 'import json;print(json.load(open(".kilo/graph-key.json"))["token"])')" \
+  node --test tests/e2e/test_e2e_mcp.test.ts  # 3/3
 ```
 
 ## ⚠️ O que NÃO fazer

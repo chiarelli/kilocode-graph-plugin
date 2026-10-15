@@ -281,7 +281,10 @@ redescobertas no meio do loop.
 
 - **2026-10-14 — primeira onda especificada (E1, E2, E3a, E3b):** o memtier está
   implementado e o PRD/ARCH foram revisados para v0.2 (o plugin é o coletor).
-  Segunda onda (E3c, E4, E5, E6, E7) fica com spec sob demanda.
+  Segunda onda (E4, E5, E6, E7) fica com spec sob demanda.
+  *Correção (2026-10-15):* o **E3c entrou na primeira onda** (a ordem declarada na
+  linha 7 é `E1 → E2 → E3a → E3b → E3c`); foi especado e implementado em 15/10.
+  A menção original a "E3c" como segunda onda estava errada e foi corrigida.
 
 - **2026-10-14 — E2 fechada (S1/S2/S3):** injeção de memória entregue sobre a
   base tracer-bullet (S1 → S2, sem rewrite). E2-S3 fecha com:
