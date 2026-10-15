@@ -42,14 +42,25 @@ const WS = process.env.E2E_INGEST_WS ?? process.env.E2E_WS ?? "alfa";
 const PROGRAM = process.env.E2E_INGEST_PROGRAM ?? process.env.E2E_PROGRAM ?? "default";
 
 const BATCH = 20;
-/** Tempo máximo esperando o worker do memtier processar (backpressure serial). */
-const WORKER_TIMEOUT_MS = Number(process.env.E2E_INGEST_WORKER_MS ?? 180000);
+/**
+ * Tempo máximo esperando o worker do memtier processar. O worker é **serial** e
+ * COMPARTILHADO (`add_episode` ~70–115s/job; medido 2026-10-15): a suíte enfileira
+ * vários jobs que se somam, então o teto é generoso.
+ */
+const WORKER_TIMEOUT_MS = Number(process.env.E2E_INGEST_WORKER_MS ?? 480000);
 
-/** Cria um `kilo.db` real (node:sqlite) com `BATCH` mensagens user/assistant. */
+/**
+ * Cria um `kilo.db` real (node:sqlite) com `count` mensagens user/assistant.
+ * O `marker` entra na mensagem de índice `markerAt` (default 0) — a E4-S3 o põe
+ * no **resto** (última) para provar que o resto foi de fato ingerido.
+ */
 async function createKiloDb(
   path: string,
   sessionId: string,
   marker: string,
+  count = BATCH,
+  markerAt = 0,
+  markerSentence?: string,
 ): Promise<void> {
   const spec = "node:sqlite";
   const mod = (await import(spec)) as {
@@ -72,14 +83,20 @@ async function createKiloDb(
   const insPart = db.prepare(
     "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?,?,?,?,?,?)",
   );
-  const base = Date.now() - BATCH * 1000;
-  for (let i = 0; i < BATCH; i++) {
+  const base = Date.now() - count * 1000;
+  // O marcador nomeia um projeto ÚNICO por execução: sem isso, o fato "código
+  // secreto do projeto Orion" contradiz os de execuções anteriores e a
+  // supersessão do Graphiti o esconde do recall (o workspace `alfa` é
+  // compartilhado e acumula execuções).
+  const markerText =
+    markerSentence ?? `O codigo secreto do projeto ${marker} e ${marker}_42, decidido por Ana.`;
+  for (let i = 0; i < count; i++) {
     const id = `msg_e2e_${String(i).padStart(3, "0")}`;
     const ts = base + i * 1000;
     const role = i % 2 === 0 ? "user" : "assistant";
     const text =
-      i === 0
-        ? `O codigo secreto do projeto Orion e ${marker}, decidido por Ana.`
+      i === markerAt
+        ? markerText
         : `Mensagem ${i} da conversa de teste sobre o projeto Orion e seus servicos.`;
     insMsg.run(id, sessionId, ts, ts, JSON.stringify({ role, mode: "code" }));
     insPart.run(
@@ -100,7 +117,7 @@ async function waitForFact(marker: string): Promise<boolean> {
   const start = Date.now();
   while (Date.now() - start < WORKER_TIMEOUT_MS) {
     try {
-      const res = await client.recall(marker, { limit: 5 });
+      const res = await client.recall(marker, { limit: 10 });
       if (res.facts.some((f) => f.fact.includes(marker))) return true;
     } catch {
       // memtier momentaneamente fora — tenta de novo.
@@ -228,6 +245,81 @@ test(
       await new Promise((r) => setTimeout(r, 500));
       const after2 = readFileSync(statePath, "utf-8");
       assert.equal(JSON.parse(after2).sentBatchHashes.length, 1, "não deve reenviar");
+    } finally {
+      await hooks.dispose?.();
+      rmSync(base, { recursive: true, force: true });
+    }
+  },
+);
+
+/**
+ * E4-S3 — `session.idle` drena o **resto** (o que o `message.updated` não envia).
+ *
+ * Cria 23 mensagens com `batch_size=20`: o `message.updated` enviaria 1 lote de
+ * 20 e deixaria 3 presas (o defeito do antecessor — "concluído com resto").
+ * O `session.idle` drena tudo: 1 lote de 20 + 1 de 3, e o cursor cobre as 23
+ * (`pendentes == 0`). Prova o efeito do outro lado: o marcador do 3-mensagens
+ * aparece no grafo.
+ */
+test(
+  "e2e: session.idle drena o resto (23 msgs, batch 20 ⇒ 20 + 3; pendentes=0)",
+  { skip: !E2E },
+  async () => {
+    assert.ok(TOKEN, "E2E_INGEST_TOKEN (ou E2E_TOKEN) é obrigatório em E2E=1");
+
+    const base = mkdtempSync(join(tmpdir(), "graph-e2e-e4d-"));
+    const dir = join(base, WS);
+    const kiloDir = join(dir, ".kilo");
+    mkdirSync(kiloDir, { recursive: true });
+    const dbPath = join(kiloDir, "kilo.db");
+    const tokenFile = join(kiloDir, "graph-key.json");
+    writeFileSync(
+      tokenFile,
+      JSON.stringify({ token: TOKEN, workspace: WS, program: PROGRAM }),
+    );
+    const sessionId = `ses_e2e_${Date.now().toString(36)}`;
+    const marker = `VEGA_${Date.now().toString(36)}`;
+    // 23 mensagens; o marcador vai na ÚLTIMA (índice 22, dentro do resto de 3)
+    // para provar que o resto — e não só o lote cheio — foi ingerido.
+    await createKiloDb(dbPath, sessionId, marker, 23, 22);
+
+    const hooks = await pluginModule.server(
+      { directory: dir, worktree: null },
+      {
+        daemon: { url: MEMTIER_URL, token_file: tokenFile, program: PROGRAM, health_timeout_ms: 3000 },
+        ingest: { enabled: true, batch_size: 20, db_path: dbPath },
+        debug: true,
+      },
+    );
+
+    try {
+      const event = hooks.event!;
+      const statePath = join(dir, INGEST_STATE_REL_PATH);
+
+      // `message.updated` primeiro: envia 1 lote de 20, deixa 3 pendentes.
+      await event({
+        event: { type: "message.updated", properties: { info: { sessionID: sessionId } } },
+      });
+      const deadline1 = Date.now() + 20000;
+      while (loadState(statePath).sentBatchHashes.length === 0 && Date.now() < deadline1) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      assert.equal(loadState(statePath).sentBatchHashes.length, 1);
+      // Ainda há o resto: o cursor está em msg_e2e_019 (20 lidas), não em msg_e2e_022.
+      assert.equal(loadState(statePath).sessions[sessionId]!.last_id, "msg_e2e_019");
+
+      // `session.idle`: drena o resto (1 lote de 3) e zera os pendentes.
+      await event({
+        event: { type: "session.idle", properties: { sessionID: sessionId } },
+      });
+      const deadline2 = Date.now() + 20000;
+      while (loadState(statePath).sentBatchHashes.length < 2 && Date.now() < deadline2) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      const st = loadState(statePath);
+      assert.equal(st.sentBatchHashes.length, 2, "o resto deve ser enviado no idle");
+      assert.equal(st.sessions[sessionId]!.last_id, "msg_e2e_022", "cursor cobre as 23");
+      assert.ok(await waitForFact(marker), "o resto deve aparecer no grafo");
     } finally {
       await hooks.dispose?.();
       rmSync(base, { recursive: true, force: true });

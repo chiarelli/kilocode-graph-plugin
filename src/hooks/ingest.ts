@@ -57,8 +57,10 @@ export function sessionIdFromEvent(event: EventLike): string | null {
 }
 
 /**
- * Registra o gatilho `event`. Na S1 só `message.updated` acorda a rotina; o
- * `session.idle` (drenar tudo) entra na S3 apontando para a MESMA rotina.
+ * Registra o gatilho `event`. Os **dois** eventos apontam para a MESMA rotina
+ * (ADR-007): `message.updated` só envia com o lote cheio; `session.idle` drena
+ * tudo **inclusive o resto** (`drainAll`). A diferença é o parâmetro, não duas
+ * implementações.
  */
 export function ingestHook(rt: IngestHookRuntime) {
   const lock = rt.lock ?? new Set<string>();
@@ -84,7 +86,14 @@ export function ingestHook(rt: IngestHookRuntime) {
     event: async (input: { event: unknown }): Promise<void> => {
       if (!rt.cfg.enabled) return;
       const event = (input?.event ?? {}) as EventLike;
-      if (event.type !== "message.updated") return;
+      // Os dois gatilhos acordam a MESMA rotina; `session.idle` leva `drainAll`.
+      const drainAll =
+        event.type === "session.idle"
+          ? true
+          : event.type === "message.updated"
+            ? false
+            : null;
+      if (drainAll === null) return;
       const sessionId = sessionIdFromEvent(event);
       if (!sessionId) return;
       let backend: SqliteBackend;
@@ -94,10 +103,10 @@ export function ingestHook(rt: IngestHookRuntime) {
         // Já logado pelo `onError`; o próximo evento tenta abrir de novo.
         return;
       }
-      debug(`ingest wake session=${sessionId}`);
+      debug(`ingest wake session=${sessionId} type=${event.type} drain=${drainAll}`);
       // Background: o evento NUNCA espera a ingestão (FR-203). `runIngest`
       // engole os erros; a promessa não é drenada no shutdown.
-      void runIngest(routineRt, backend, sessionId);
+      void runIngest(routineRt, backend, sessionId, drainAll);
     },
     dispose: (): void => provider.close(),
   };

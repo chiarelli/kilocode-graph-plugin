@@ -80,7 +80,7 @@ Convenções válidas para todas as epics:
 > em **`specs/e4-stories.md`**. O memtier **não muda**.
 - [x] **E4-S1** — Tracer bullet: ler o `kilo.db` (user+assistant) → 1 lote real → `/v1/ingest`
 - [x] **E4-S2** — Endurecer: cursor por `(time_created, id)` + `sentBatchHashes` (idempotência)
-- [ ] **E4-S3** — `session.idle` drena tudo + o resto (mesma rotina; trava por sessão)
+- [x] **E4-S3** — `session.idle` drena tudo + o resto (mesma rotina; trava por sessão)
 - [ ] **E4-S4** — Limitações L-1/L-2/L-3 como critério de aceite (decisão do dono)
 - [ ] **E4-S5** — Fechamento: E2E real, docs coerentes, zero marcadores
 
@@ -612,4 +612,32 @@ redescobertas no meio do loop.
      e prova, pelo conjunto de **UUIDs de episódio** do `/v1/recall`, que o grafo
      não cresce. Mesma suíte: 3/3 verdes contra o memtier vivo.
   7. Unit **277 · 264 pass · 0 fail · 13 skip**; `tsc --noEmit` limpo.
+     `rg "TODO\(tracer-bullet\)" src/` → **1** (o reset do L-3, que é da S4).
+
+- **2026-10-15 — E4-S3 (`session.idle` drena tudo, inclusive o resto).** Sobre a
+  base das S1/S2, sem rewrite.
+  1. **Uma rotina, um parâmetro** (ADR-007): `ingestOnce`/`runIngest` ganham
+     `drainAll`. `message.updated` ⇒ `false` (respeita o limiar); `session.idle`
+     ⇒ `true` (o limiar **não** barra; o resto < lote é enviado). O hook resolve
+     o `drainAll` pelo `event.type` — não há duas implementações.
+  2. **Laço de dreno**: com `drainAll`, repete passadas até `pendentes == 0`
+     (decisão 4: "concluído" é nada pendente). Terminação garantida pelo avanço
+     do cursor; um passo sem progresso encerra o laço, e há teto (10.000) de
+     segurança. Corrige o defeito do antecessor (`caughtUp` com resto ⇒ mensagens
+     presas para sempre).
+  3. **Trava por sessão** cobre o dreno concorrente (`session.idle` pode repetir):
+     a trava serializa as passadas e o cursor não avança duas vezes.
+  4. **Unit**: exemplo do dono (`63 = 3×20 + 3`), `5 ⇒ 1 lote de 5`, `0 ⇒ não
+     dispara`, a **diferença dos gatilhos** (abaixo do limiar: `message.updated`
+     não envia / `session.idle` envia) e o dreno concorrente sem corrupção.
+  5. **E2E real** (gated): novo caso `session.idle` drena o **resto** — 23 msgs
+     com `batch_size=20` ⇒ 1 lote de 20 + 1 de 3, cursor cobre as 23
+     (`pendentes == 0`), e o marcador do **resto** (na última mensagem) aparece no
+     grafo. Medido **4/4** verdes contra o memtier vivo.
+     **Defeito de ambiente medido e contornado:** o worker do memtier é **serial
+     e compartilhado** (`add_episode` ~70–115 s/job) e o workspace `alfa` acumula
+     execuções; fatos de mesmo sentido **contradizem** e a supersessão os esconde
+     do recall. Correção no teste (não no produto): cada execução usa um projeto
+     **único** no marcador (sem contradição) e o teto de espera do worker subiu.
+  6. Unit **283 · 269 pass · 0 fail · 14 skip**; `tsc --noEmit` limpo.
      `rg "TODO\(tracer-bullet\)" src/` → **1** (o reset do L-3, que é da S4).

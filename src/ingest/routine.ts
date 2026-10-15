@@ -94,11 +94,17 @@ export function logIngestFailure(err: unknown): void {
  * Uma passada da rotina. **Pode lançar** no erro do client (HTTP/tipado) — a
  * política de degradação e a trava ficam em `runIngest`. Não avança o cursor
  * quando o envio falha (o próximo gatilho relê o mesmo lote).
+ *
+ * `drainAll` (E4-S3) é a **única** diferença entre os dois gatilhos: quando
+ * `true` (`session.idle`), o limiar não barra — o **resto** (< `batch_size`) é
+ * enviado, para nada ficar preso. Quando `false` (`message.updated`), só envia
+ * com o lote cheio (abaixo do limiar, não envia).
  */
 export async function ingestOnce(
   rt: IngestRuntime,
   backend: SqliteBackend,
   sessionId: string,
+  drainAll = false,
 ): Promise<IngestOutcome> {
   if (!rt.cfg.enabled) return { sent: false, rows: 0 };
 
@@ -118,7 +124,11 @@ export async function ingestOnce(
     debug(`ingest: sem pendências session=${sessionId}`);
     return { sent: false, rows: 0 };
   }
-  if (!shouldSend(rows, rt.cfg.batch_size)) {
+  // O limiar só barra o gatilho que NÃO drena (`message.updated`). No
+  // `session.idle`, o resto abaixo do limiar é enviado — é o que corrige o
+  // defeito do antecessor ("concluído" com resto < lote ⇒ mensagens presas para
+  // sempre; ADR-007 D-3).
+  if (!drainAll && !shouldSend(rows, rt.cfg.batch_size)) {
     debug(
       `ingest: pendentes=${rows} < batch=${rt.cfg.batch_size} ` +
         `session=${sessionId}; aguardando`,
@@ -163,14 +173,26 @@ export async function ingestOnce(
   return { sent: true, rows, hash: batch.hash, jobId: res.job_id, msgs: messages.length };
 }
 
+/** Assinatura do cursor de uma sessão (para detectar progresso no dreno). */
+function cursorSig(c: { last_ts: number; last_id: string } | undefined): string {
+  return c ? `${c.last_ts}:${c.last_id}` : "";
+}
+
 /**
- * Interface estável da rotina: adquire a trava por sessão, roda uma passada e
- * **nunca lança** (falha vira log). Chamada em background pelos gatilhos.
+ * Interface estável da rotina: adquire a trava por sessão, roda a passada (ou o
+ * **dreno completo**, quando `drainAll`) e **nunca lança** (falha vira log).
+ * Chamada em background pelos gatilhos.
+ *
+ * Com `drainAll = true` (`session.idle`), repete passadas até não sobrar nada
+ * (`pendentes == 0`, decisão 4 do ADR-007) — o último lote leva o resto. O
+ * avanço do cursor a cada passada garante a terminação; um passo sem progresso
+ * (nos casos patológicos) encerra o laço em vez de girar.
  */
 export async function runIngest(
   rt: IngestRuntime,
   backend: SqliteBackend,
   sessionId: string,
+  drainAll = false,
 ): Promise<void> {
   if (rt.lock.has(sessionId)) {
     debug(`ingest: execução concorrente ignorada session=${sessionId}`);
@@ -178,7 +200,28 @@ export async function runIngest(
   }
   rt.lock.add(sessionId);
   try {
-    await ingestOnce(rt, backend, sessionId);
+    let guard = 0;
+    while (true) {
+      const before = cursorSig(loadState(rt.statePath).sessions[sessionId]);
+      const outcome = await ingestOnce(rt, backend, sessionId, drainAll);
+      if (!drainAll) return; // `message.updated`: uma passada basta.
+      // Nada pendente ⇒ drenou (o resto, se havia, saiu no lote anterior).
+      if (outcome.rows === 0) {
+        debug(`ingest: drenado session=${sessionId}`);
+        return;
+      }
+      // Progresso esperado: o cursor avançou (send/dedup/sem-texto). Se não
+      // avançou e não enviou, para — não girar sobre o mesmo estado.
+      const after = cursorSig(loadState(rt.statePath).sessions[sessionId]);
+      if (after === before && !outcome.sent) {
+        debug(`ingest: dreno sem progresso session=${sessionId}; encerrando`);
+        return;
+      }
+      if (++guard > 10_000) {
+        logFatal("ingest guard", new Error(`dreno excedeu o teto de passadas session=${sessionId}`));
+        return;
+      }
+    }
   } catch (err) {
     logIngestFailure(err);
   } finally {

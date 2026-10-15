@@ -545,7 +545,7 @@ test("hook_message_updated: acorda a rotina em background (não bloqueia) e inge
   }
 });
 
-test("hook_ignores_other_events: session.idle (S3) não é tratado na S1", async () => {
+test("hook_ignores_unknown_events: eventos que não são os dois gatilhos são ignorados", async () => {
   const { statePath, cleanup } = tmpState();
   try {
     const { client, calls } = stubClient(async () => ({ job_id: "j" }));
@@ -556,7 +556,10 @@ test("hook_ignores_other_events: session.idle (S3) não é tratado na S1", async
       client,
       backend: makeBackend(genMsgs(20, 1000)),
     });
-    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "ses_a" } } });
+    await hooks.event({
+      event: { type: "message.part.updated", properties: { sessionID: "ses_a" } },
+    });
+    await hooks.event({ event: { type: "session.drained", properties: { sessionID: "ses_a" } } });
     await new Promise((r) => setTimeout(r, 20));
     assert.equal(calls.length, 0);
   } finally {
@@ -914,6 +917,119 @@ test("s2_hook_dispose_closes_backend: o hook expõe `dispose` que fecha o proved
     // acima.
     hooks.dispose();
     assert.equal(closed, 0);
+  } finally {
+    cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// E4-S3 — session.idle drena tudo (o resto) + message.updated respeita o limiar
+// ---------------------------------------------------------------------------
+
+/** Roda o dreno completo (`session.idle`) e devolve os corpos enviados. */
+async function drain(
+  statePath: string,
+  backend: SqliteBackend,
+  batchSize: number,
+): Promise<string[]> {
+  const { client, calls } = stubClient(async () => ({ job_id: "j" }));
+  await runIngest(rt(statePath, client, { batch_size: batchSize }), backend, "ses_a", true);
+  return calls.map((c) => c.body);
+}
+
+test("s3_owner_example_63_20: 63 pendentes ⇒ 3 lotes de 20 + 1 de 3 (exemplo do dono)", async () => {
+  const { statePath, cleanup } = tmpState();
+  try {
+    const backend = makeBackend(genMsgs(63, 1000));
+    const bodies = await drain(statePath, backend, 20);
+    assert.equal(bodies.length, 4, "3 lotes cheios + 1 resto");
+    assert.equal(bodies[0]!.split("\n\n").length, 20);
+    assert.equal(bodies[1]!.split("\n\n").length, 20);
+    assert.equal(bodies[2]!.split("\n\n").length, 20);
+    assert.equal(bodies[3]!.split("\n\n").length, 3, "o último lote leva o resto");
+    // Cursor final cobriu as 63 ⇒ próxima passada não tem pendentes.
+    const st = loadState(statePath);
+    assert.equal(st.sessions.ses_a!.last_id, "msg_062");
+    assert.equal(st.sentBatchHashes.length, 4);
+  } finally {
+    cleanup();
+  }
+});
+
+test("s3_remainder_5: 5 pendentes ⇒ 1 lote de 5 (não fica preso abaixo do limiar)", async () => {
+  const { statePath, cleanup } = tmpState();
+  try {
+    const backend = makeBackend(genMsgs(5, 1000));
+    const bodies = await drain(statePath, backend, 20);
+    assert.equal(bodies.length, 1);
+    assert.equal(bodies[0]!.split("\n\n").length, 5);
+    assert.equal(loadState(statePath).sessions.ses_a!.last_id, "msg_004");
+  } finally {
+    cleanup();
+  }
+});
+
+test("s3_zero_pendentes: nada pendente ⇒ não dispara (nem envia)", async () => {
+  const { statePath, cleanup } = tmpState();
+  try {
+    const backend = makeBackend([]);
+    const { client, calls } = stubClient(async () => ({ job_id: "j" }));
+    const outcome = await ingestOnce(rt(statePath, client), backend, "ses_a", true);
+    assert.equal(outcome.sent, false);
+    assert.equal(outcome.rows, 0);
+    assert.equal(calls.length, 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("s3_trigger_difference: message.updated NÃO envia abaixo do limiar; session.idle envia", async () => {
+  const { statePath, cleanup } = tmpState();
+  try {
+    const backend = makeBackend(genMsgs(5, 1000));
+    const updated = stubClient(async () => ({ job_id: "j" }));
+    const o1 = await ingestOnce(rt(statePath, updated.client), backend, "ses_a", false);
+    assert.equal(o1.sent, false, "message.updated abaixo do limiar não envia");
+    assert.equal(updated.calls.length, 0);
+
+    const idle = stubClient(async () => ({ job_id: "j" }));
+    await runIngest(rt(statePath, idle.client), backend, "ses_a", true);
+    assert.equal(idle.calls.length, 1, "session.idle drena o resto");
+  } finally {
+    cleanup();
+  }
+});
+
+test("s3_drain_cursor_concurrent: dois drenos concorrentes não corrompem o cursor", async () => {
+  const { statePath, cleanup } = tmpState();
+  try {
+    const backend = makeBackend(genMsgs(63, 1000));
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const calls: string[] = [];
+    const client = {
+      ingest: async (body: string) => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        calls.push(body);
+        await new Promise((r) => setTimeout(r, 5));
+        inFlight--;
+        return { job_id: "j" };
+      },
+    };
+    const lock = new Set<string>();
+    const runtime = rt(statePath, client, { batch_size: 20 });
+    runtime.lock = lock;
+    await Promise.all([
+      runIngest(runtime, backend, "ses_a", true),
+      runIngest(runtime, backend, "ses_a", true),
+    ]);
+    // A trava serializa: nenhuma sobreposição de envio e o cursor cobre tudo.
+    assert.equal(maxInFlight, 1, "envios não podem se sobrepor na mesma sessão");
+    const st = loadState(statePath);
+    assert.equal(st.sessions.ses_a!.last_id, "msg_062", "cursor cobriu as 63");
+    // Nenhum lote duplicado (hash distinto por lote).
+    assert.equal(new Set(st.sentBatchHashes).size, st.sentBatchHashes.length);
   } finally {
     cleanup();
   }
