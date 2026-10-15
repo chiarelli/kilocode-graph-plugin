@@ -90,10 +90,10 @@ O `kilo-openviking-plugin` funciona, mas tem três limitações herdadas do prov
 
 | ID | Requisito | Critério de aceite |
 |---|---|---|
-| FR-201 | Capturar a mensagem do usuário | Hook `chat.message` |
+| FR-201 | Capturar a mensagem do usuário | O conteúdo vem do **`kilo.db`** pelo gatilho `message.updated` (o payload do evento não é fonte — ADR-007) |
 | FR-202 | Enviar para a fila do daemon | `POST /v1/ingest` retorna 202 |
 | FR-203 | **Nunca** bloquear o turno | Latência do hook não cresce com o tamanho do lote |
-| FR-204 | Debounce por sessão | Não enfileira 1 job por mensagem |
+| FR-204 | Agrupar por sessão (limiar por lote, sem debounce por tempo) | Envia a cada `batch_size` linhas; o resto é drenado no `session.idle` (ADR-007) |
 | FR-205 | Preservar contexto na compactação | Hook `compacting` sobrevive à summarização |
 
 ### Coleta e sincronização de código (o coletor) — **novo no delta 0.2**
@@ -169,7 +169,7 @@ O `kilo-openviking-plugin` funciona, mas tem três limitações herdadas do prov
 | **E3a** | **Coletor de código** | Binário externo configurável; trigger híbrido (full→incremental); `chunk_emitted`→`files[]`; `import_edge`/`call_edge`→`edges[]`; **detecção de removido → `chunks: []`**; manifest por workspace; backpressure | `rust-ast-indexer` |
 | **E3b** | **Registro do MCP do memtier** | MCP remoto no Kilo (reuso de `registerOpenVikingMcp`); registro **implícito**; degradação | memtier MCP ✅ |
 | **E3c** | **Injeção de código** | `code_search` no `messages.transform`; bloco separado de memória | E1, E3a, memtier E6 |
-| **E4** | **Ingestão assíncrona** | Enfileira por sessão com debounce; zero bloqueio | E1, memtier E4 |
+| **E4** | **Ingestão assíncrona** | Gatilhos `message.updated`/`session.idle` sobre o `kilo.db` (cursor por identidade, idempotência no plugin); zero bloqueio (ADR-007/008) | E1, memtier E4 |
 | **E5** | **Degradação** | memtier ou indexer fora do ar ⇒ turno segue, com aviso discreto | E2, E3a |
 | **E6** | **Multi-CLI** | Adaptador OpenCode; adaptador Claude Code | E2, E3c |
 | **E7** | **Observabilidade** | Log de recall/coleta (acertos, latência, upserted/deleted/changed/skipped), flag de debug | E2, E3a |

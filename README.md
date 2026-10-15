@@ -56,12 +56,13 @@ Kilo Code ──hooks──▶ plugin ──HTTP──▶ memtier ──▶ Falk
 
 ## Hooks do Kilo usados
 
-Do plugin atual (a arquitetura se mantém):
+O plugin usa **hooks de evento** (não captura por `chat.message`):
 
 | Hook | Papel |
 |---|---|
-| `chat.message` | captura a mensagem do usuário → decide o que injetar |
-| `experimental.chat.messages.transform` | **injeção** no turno |
+| `event` (`message.updated`) | **acorda** a rotina de ingestão (o conteúdo vem do `kilo.db`, ADR-007) |
+| `event` (`session.idle`) | acorda a MESMA rotina com **dreno** (envia o resto — ADR-007) |
+| `experimental.chat.messages.transform` | **injeção** no turno (memória + código) |
 | `experimental.chat.system.transform` | contexto de sistema |
 | `experimental.session.compacting` | preservar memória na compactação |
 

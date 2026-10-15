@@ -246,14 +246,21 @@ function reconstructContent(
   for (const r of rows) {
     const raw = r.data;
     if (typeof raw !== "string") continue;
-    let p: { type?: unknown; text?: unknown };
+    let p: unknown;
     try {
-      p = JSON.parse(raw) as { type?: unknown; text?: unknown };
+      p = JSON.parse(raw);
     } catch {
       continue;
     }
-    if (p.type === "text" && typeof p.text === "string" && p.text.trim()) {
-      texts.push(p.text.trim());
+    // `JSON.parse` de `"null"`/`"123"`/`'"x"'` NÃO é um objeto: sem este guard,
+    // `p.type` lançaria `TypeError`, que `readBatch` classificaria como falha
+    // TRANSITÓRIA de leitura (`IngestReadError`) — o cursor nunca avançaria e a
+    // linha reprocessaria para sempre (achado da revisão adversarial). Não-objeto
+    // é linha de `part` corrompida: pula (é irrecuperável), não trava.
+    if (p === null || typeof p !== "object") continue;
+    const part = p as { type?: unknown; text?: unknown };
+    if (part.type === "text" && typeof part.text === "string" && part.text.trim()) {
+      texts.push(part.text.trim());
     }
   }
   if (texts.length > 0) return texts.join("\n");
@@ -299,8 +306,12 @@ export function readBatch(
   let last: SessionCursor | null = null;
   for (const row of rows) {
     const id = typeof row.id === "string" ? row.id : "";
-    const ts = typeof row.time_created === "number" ? row.time_created : Number(row.time_created);
-    if (!id || !Number.isFinite(ts)) continue;
+    // `time_created` é `integer NOT NULL` no banco real, mas `Number(null)===0`
+    // e `Number("")===0` são finitos — um valor ausente viraria epoch 0 e
+    // poluiria o `reference_time` do lote. Só aceita número ou string numérica
+    // (nunca `null`/vazio/booleano). Linha sem ts válido é pulada.
+    const ts = coerceEpoch(row.time_created);
+    if (!id || ts === null) continue;
 
     const raw = row.data;
     if (typeof raw !== "string") {
@@ -308,9 +319,9 @@ export function readBatch(
       last = { last_ts: ts, last_id: id };
       continue;
     }
-    let parsed: { role?: unknown; mode?: unknown; summary?: unknown };
+    let rawParsed: unknown;
     try {
-      parsed = JSON.parse(raw) as typeof parsed;
+      rawParsed = JSON.parse(raw);
     } catch {
       // Linha "veneno": o `data` não é JSON. Não é recuperável reprocessando
       // (o conteúdo é irrecuperável de fato), então o cursor avança — mas é
@@ -319,6 +330,15 @@ export function readBatch(
       onPoison?.(id);
       continue;
     }
+    // `"null"`/`"123"`/`'"x"'`/`"[]"` são JSON válido mas não-objeto: sem este
+    // guard, `parsed.role` lançaria `TypeError` FORA do `try` acima, e o cursor
+    // nunca avançaria (linha veneno reprocessada para sempre). Pula e registra.
+    if (rawParsed === null || typeof rawParsed !== "object" || Array.isArray(rawParsed)) {
+      last = { last_ts: ts, last_id: id };
+      onPoison?.(id);
+      continue;
+    }
+    const parsed = rawParsed as { role?: unknown; mode?: unknown; summary?: unknown };
     if (!isIngestRole(parsed.role)) {
       last = { last_ts: ts, last_id: id };
       continue;
@@ -343,6 +363,21 @@ export function readBatch(
 /** ID para mensagem de erro (o próprio id já é string; guarda contra vazio). */
 function msgIdSafe(id: string): string {
   return id || "?";
+}
+
+/**
+ * Converte `time_created` num epoch ms finito, ou `null` quando não há número
+ * confiável. Recusa explicitamente `null`/`undefined`/booleano/string vazia
+ * (cujo `Number(...)` é `0`, não um epoch real) — sem isso um valor ausente
+ * viraria epoch 0 e corromperia `reference_time` e a ordenação do cursor.
+ */
+function coerceEpoch(value: unknown): number | null {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string" && value.trim() !== "") {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
 }
 
 /** Leitor de arquivo injetável (mantido para testes/uso futuro). */

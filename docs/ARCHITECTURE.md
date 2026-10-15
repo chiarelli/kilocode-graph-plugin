@@ -22,7 +22,8 @@
 ┌──────────────────────────────────────────────────────────────┐
 │  KILO CODE                                                    │
 │                                                               │
-│  chat.message ──────────▶ captura o texto do usuário          │
+│  message.updated / session.idle ──▶ ACORDAM a rotina          │
+│                    (o conteúdo vem do kilo.db — não do evento)│
 │                              │                                │
 │  experimental.chat.messages.transform ◀── INJEÇÃO (push)      │
 │                              │                                │
@@ -169,15 +170,17 @@ Regras do contrato (memtier ARCH §2):
 
 ```json
 // request
-{ "workspace": "waweb", "program": "default", "session_id": "ses_...",
-  "messages": [...], "reference_time": "2026-10-06T12:00:00Z" }
+{ "workspace": "waweb", "program": "default",
+  "body": "user: ...\n\nassistant: ...", "reference_time": "2026-10-06T12:00:00Z" }
 
 // response — 202, imediato
 { "job_id": "...", "workspace": "waweb", "status": "queued" }
 ```
 
-> `reference_time` é a data da **mensagem**, não a do envio. Sem isso a
-> supersessão temporal grava a linha do tempo errada.
+> `reference_time` é a data da **mensagem mais atual do lote**, não a do envio.
+> Sem isso a supersessão temporal grava a linha do tempo errada. O `202` confirma
+> o **aceite**, não o processamento (L-1) — a incerteza é auditável.
+> Contrato medido no `graphiti-daemon/src/memtier/main.py` (`IngestBody`).
 
 ### `GET /v1/health`
 
@@ -203,9 +206,11 @@ src/
 │   ├── memory.ts         # formata o bloco de memória
 │   ├── code.ts           # formata o bloco de código
 │   └── budget.ts         # maxChars / maxMemories / maxCodeChunks
-├── ingest/
-│   ├── capture.ts        # hook chat.message
-│   └── debounce.ts       # agrupa por sessão antes de enfileirar
+├── ingest/               # ⬅ NOVO (E4) — a INGESTÃO (o conteúdo vem do banco)
+│   ├── db.ts             # localiza o kilo.db; lê message+part; cursor (ts,id)
+│   ├── batch.ts          # monta o lote, hash djb2, reference_time, limiar
+│   ├── state.ts          # .kilo/graph-ingest.json (sentBatchHashes + cursor)
+│   └── routine.ts        # a rotina única: lê, decide, envia; trava por sessão
 ├── index/                # ⬅ NOVO (E3a) — o COLETOR
 │   ├── runner.ts         # spawn do rust_indexer; consome JSONL; trata pause/resume
 │   ├── collector.ts      # eventos → files[]/edges[] (agrupa por arquivo)
@@ -275,26 +280,50 @@ maxCodeChunks: 3
 maxChars:      3000
 ```
 
-### `ingest/debounce.ts` — agrupamento
+### `ingest/` — a rotina de ingestão (E4)
 
-O plugin atual ingere por batch de ~20 mensagens. Mantém-se o padrão: acumula a
-sessão e enfileira um job a cada N mensagens ou T segundos, o que vier primeiro.
+Os dois eventos (`message.updated`, `session.idle`) **acordam a MESMA rotina** e
+o evento **nunca** é fonte de conteúdo (ADR-007) — a rotina lê o `kilo.db`. A
+diferença entre os gatilhos é **um parâmetro** (`drainAll`):
+
+| gatilho | `drainAll` | quantos lotes |
+|---|---|---|
+| `message.updated` | `false` | só com o lote cheio (`rows >= batch_size`) |
+| `session.idle` | `true` | **todos + o resto** (até `pendentes == 0`) |
+
+- **Cursor** por identidade `(time_created, id)` — **sem `OFFSET`** (ADR-008): o
+  cursor aponta para uma mensagem, não para uma posição; remover linhas antes
+  dele não pula nada.
+- **Idempotência no plugin**: `sentBatchHashes` (djb2 sobre `role\0content`),
+  persistido por workspace em `.kilo/graph-ingest.json` com escrita **atômica**.
+  O memtier **não muda**.
+- **`reference_time`** = mensagem mais atual do lote (a fila atrasa; a data do
+  envio quebraria a supersessão).
+- **Nunca bloqueia o turno**: o gatilho dispara a rotina em background
+  (`void runIngest`); falha degrada, nunca lança (NFR-03).
+- **Trava por sessão**: eventos repetidos (o `message.updated` dispara 2–3× por
+  mensagem) não avançam o cursor duas vezes.
 
 ## 4. Fluxo de um turno
 
 ```
 1. usuário envia o prompt
-2. hook chat.message        → guarda o texto (não bloqueia)
-3. hook messages.transform  → [SÍNCRONO, orçamento 4s]
+2. hook messages.transform  → [SÍNCRONO, orçamento 4s]
       ├── POST /v1/recall       (memória) ─┐
       └── POST /v1/code/search  (código) ─┴─ EM PARALELO (allSettled,
                                               AbortSignal por chamada)
       └── orçamento do TOTAL (maxChars; código prioritário)
       └── injeta 1 part por família (memória antes do código)
-4. LLM responde (pode usar tools MCP — pull)
-5. hook chat.message        → acumula para ingestão
-6. debounce atinge o limiar → POST /v1/ingest (202)
+3. LLM responde (pode usar tools MCP — pull)
+4. evento message.updated   → ACORDA a rotina (background; não bloqueia)
+      └── lê o kilo.db pelo cursor; se o lote encheu → POST /v1/ingest (202)
+5. evento session.idle      → ACORDA a MESMA rotina com drainAll
+      └── envia todos os lotes + o RESTO (até pendentes == 0)
 ```
+
+O evento **não** carrega conteúdo (medido: `parts` ausente / `len=0`); a fonte é
+o **banco** (ADR-007). Por isso nenhum passo da ingestão toca o caminho crítico
+do turno — só o passo 2 está nele.
 
 **Só o passo 3 está no caminho crítico.** Se ele estourar o timeout, o turno
 segue sem contexto (E5). As duas buscas rodam em **paralelo** justamente para não
@@ -411,8 +440,10 @@ Nada hardcoded no script (FR-303). **JSON** + env vars, precedência:
 > `INJECT_ENABLED`, `INJECT_MAX_MEMORIES`, `INJECT_MAX_CHARS`,
 > `INJECT_MAX_TOKENS`, `INJECT_TIMEOUT_MS`, `INJECT_CODE_ENABLED`,
 > `INJECT_MAX_CODE_CHUNKS`, `INDEX_ENABLED`, `INDEXER_BIN`,
-> `INDEX_SYNC_TIMEOUT_MS`, `MCP_ENABLED`, `MCP_NAME`, `DEBUG`. O prefixo da env
-> de config é `KILOCODE_GRAPH_` (o `openviking` do antecessor mudou).
+> `INDEX_SYNC_TIMEOUT_MS`, `MCP_ENABLED`, `MCP_NAME`, `DEBUG`,
+> `INGEST_ENABLED`, `INGEST_BATCH_SIZE`, `INGEST_MAX_HASHES`, `INGEST_TIMEOUT_MS`,
+> `INGEST_DB_PATH`. O prefixo da env de config é `KILOCODE_GRAPH_` (o
+> `openviking` do antecessor mudou).
 
 > **Defaults desligados** para indexação e injeção — é a preferência registrada
 > do dono no plugin atual.
@@ -422,15 +453,16 @@ Nada hardcoded no script (FR-303). **JSON** + env vars, precedência:
 > `inject.code_enabled`/`inject.max_code_chunks` (E3c). Estas duas últimas são a
 > **exceção consciente**: o E3c não estava specado quando o E1 fechou (a segunda
 > onda era "spec sob demanda"), então a epic dona as declara e a exceção é
-> registrada no histórico do BACKLOG. Chaves de `ingest.*` (E4) entram quando sua
-> epic for especificada; declarar antes seria contrato fantasma.
+> registrada no histórico do BACKLOG. As chaves de `ingest.*` foram declaradas
+> pela própria **E4** (`ingest.enabled`/`batch_size`/`max_hashes`/`timeout_ms`/
+> `db_path`; default `enabled=false`).
 
 
 ## 7. Adaptadores multi-CLI
 
 | CLI | Mecanismo | Status |
 |---|---|---|
-| **Kilo Code** | hooks JS (`chat.message`, `messages.transform`, `compacting`) | ✅ produção — arquitetura validada |
+| **Kilo Code** | hooks JS (`event` (`message.updated`/`session.idle`), `messages.transform`, `system.transform`, `compacting`) | ✅ produção — arquitetura validada (ADR-007: a ingestão não usa `chat.message`) |
 | **OpenCode** | mesmos hooks (Kilo é fork) | ⚠️ por documentação — **não testado** |
 | **Claude Code** | hook `UserPromptSubmit` → `additionalContext` | ⚠️ por documentação — **não testado** |
 
@@ -448,7 +480,9 @@ isso a separação em `adapters/`.
 |---|---|
 | `/health` falha | turno segue sem injeção; log discreto |
 | Recall estoura timeout | turno segue sem memória (code/search pode ter chegado) |
-| `/ingest` falha | job fica em retry local; nada bloqueia o turno |
+| `/ingest` falha | lote **não** é enviado nem marcado; o próximo gatilho relê (sem retry cego); nada bloqueia o turno |
+| **`kilo.db` ausente/ocupado** | ingestão não roda; loga; o próximo gatilho tenta de novo (nunca silencioso) |
+| **estado de ingestão perdido/corrompido** | degrada para vazio, **registra** o reset; o próximo `session.idle` reenvia (custo aceito, L-3) |
 | Token rejeitado (401/403) | log de erro visível; sem retry infinito |
 | **`indexer_bin` ausente** | coletor desligado (não é erro fatal); memória segue (FR-306) |
 | **Indexer trava em `pause`** | runner consome backpressure (`resume`); se persistir, aborta o job, turno segue |
@@ -464,7 +498,15 @@ Log estruturado por turno:
 
 ```json
 { "turn": "...", "recall_ms": 830, "facts": 5, "code_chunks": 2,
-  "injected_chars": 3120, "ingest_queued": true }
+  "injected_chars": 3120 }
+```
+
+Log por lote de ingestão (E4) — fora do turno:
+
+```json
+{ "ingest": "sent", "session": "ses_...", "rows": 20, "msgs": 2,
+  "hash": "1170267838", "job_id": "...", "reference_time": "...",
+  "accepted_not_confirmed": true }
 ```
 
 Log por ciclo de coleta (E3a) — separa o trabalho do turno:

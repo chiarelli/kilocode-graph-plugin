@@ -84,8 +84,26 @@ export function loadState(
     onReset?.(`ilegível: ${err instanceof Error ? err.message : String(err)}`);
     return emptyState();
   }
+  let parsedRaw: unknown;
   try {
-    const parsed = JSON.parse(raw) as Partial<IngestState>;
+    parsedRaw = JSON.parse(raw);
+  } catch (err) {
+    // JSON corrompido: degrada para vazio, mas **registra** (o cursor volta ao
+    // início e o próximo `session.idle` reenvia — comportamento do L-3, não
+    // surpresa).
+    onReset?.(`JSON corrompido: ${err instanceof Error ? err.message : String(err)}`);
+    return emptyState();
+  }
+  // JSON válido mas de shape errado (`[]`, `123`, `"x"`, `null`) é tão
+  // inutilizável quanto corrompido: o estado some (cursor ao início, reenvio) e,
+  // sem este guard, o reset passaria **silencioso** (fere o L-3). `null`/escalar
+  // lançaria ao ler `.sessions`; array devolveria `undefined` sem lançar.
+  if (parsedRaw === null || typeof parsedRaw !== "object" || Array.isArray(parsedRaw)) {
+    onReset?.(`shape inválido: ${Array.isArray(parsedRaw) ? "array" : typeof parsedRaw}`);
+    return emptyState();
+  }
+  {
+    const parsed = parsedRaw as Partial<IngestState>;
     const sessions: Record<string, SessionCursor> = {};
     if (parsed.sessions && typeof parsed.sessions === "object") {
       for (const [sid, cur] of Object.entries(parsed.sessions)) {
@@ -102,12 +120,6 @@ export function loadState(
         )
       : [];
     return { sessions, sentBatchHashes: hashes, sentBatches: audit };
-  } catch (err) {
-    // JSON corrompido: degrada para vazio, mas **registra** (o cursor volta ao
-    // início e o próximo `session.idle` reenvia — comportamento do L-3, não
-    // surpresa).
-    onReset?.(`JSON corrompido: ${err instanceof Error ? err.message : String(err)}`);
-    return emptyState();
   }
 }
 

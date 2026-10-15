@@ -1,16 +1,17 @@
 # kilocode-graph-plugin — src
 
 Estado: **E1 (fundação), E2 (injeção de memória), E3a (coletor de código), E3b
-(registro do MCP) e E3c (injeção de código) implementadas**; a segunda onda
-(E4–E7) ainda é forma e contratos. O mapa abaixo é o alvo; o que existe hoje em
-`src/` é `index.ts`, `config.ts`, `client.ts`, `workspace.ts`, `logger.ts`,
-`types.ts`, `hooks/{messages,collect}.ts`, `inject/{memory,code,budget}.ts`,
-`index/{runner,collector,edges,manifest,trigger}.ts` e
-`mcp/{register,kilo-config}.ts`.
+(registro do MCP), E3c (injeção de código) e E4 (ingestão assíncrona)
+implementadas**; a segunda onda (E5–E7) ainda é forma e contratos. O que existe
+hoje em `src/` é `index.ts`, `config.ts`, `client.ts`, `workspace.ts`,
+`logger.ts`, `types.ts`, `hooks/{messages,collect,ingest}.ts`,
+`inject/{memory,code,budget}.ts`,
+`index/{runner,collector,edges,manifest,trigger}.ts`,
+`ingest/{db,batch,state,routine}.ts` e `mcp/{register,kilo-config}.ts`.
 
 ```
 src/
-├── index.ts              # registro dos 4 hooks + disparo do coletor + registro MCP
+├── index.ts              # registro dos hooks + disparo do coletor + registro MCP
 ├── config.ts             # graph-plugin.json + env vars
 ├── client.ts             # HTTP client do memtier
 ├── workspace.ts          # diretório → nome lógico
@@ -18,9 +19,11 @@ src/
 │   ├── memory.ts
 │   ├── code.ts
 │   └── budget.ts
-├── ingest/
-│   ├── capture.ts
-│   └── debounce.ts
+├── ingest/               # ⬅ NOVO (E4) — a INGESTÃO (conteúdo vem do kilo.db)
+│   ├── db.ts             # localiza o kilo.db; lê message+part; cursor (ts,id)
+│   ├── batch.ts          # lote, hash djb2, reference_time, limiar
+│   ├── state.ts          # .kilo/graph-ingest.json (hashes + cursor; atômico)
+│   └── routine.ts        # a rotina única: lê, decide, envia; trava por sessão
 ├── index/                # ⬅ NOVO (E3a) — o COLETOR
 │   ├── runner.ts         # spawn do rust_indexer; JSONL; pause/resume
 │   ├── collector.ts      # eventos → files[]/edges[]
@@ -139,9 +142,34 @@ async function injectContextIntoMessages(messages, rt): Promise<void>
 // ⇒ delega ao caminho E2.
 ```
 
-### `ingest/debounce.ts`
+### `ingest/` (E4 — implementado)
 ```ts
-function shouldFlush(sessionId: string, cfg: IngestCfg): boolean
+// db.ts — fonte de verdade (o evento NUNCA carrega conteúdo, ADR-007).
+findKiloDb(projectDir, exists?): string            // .kilo/kilo.db … global
+readBatch(backend, sessionId, cursor, limit, onPoison?): ReadBatch
+//   cursor = { last_ts, last_id } — (time_created, id), SEM OFFSET (ADR-008);
+//   lança `IngestReadError` em falha transitória (não avança o cursor).
+
+// batch.ts — puro.
+buildBatch(messages): { body, hash, referenceTime }  // reference_time = msg + atual
+batchHash(messages): string                          // djb2 role\0content
+shouldSend(rows, batchSize): boolean                 // limiar por LINHAS
+
+// state.ts — .kilo/graph-ingest.json (write+rename atômico).
+loadState(path, readFile?, onReset?): IngestState     // L-3: reset é logado
+markBatchSent(state, hash, maxHashes?)                // L-2: teto FIFO
+markBatchAccepted(state, audit, maxHashes?)           // L-1: aceite ≠ confirmação
+
+// routine.ts — a rotina única.
+ingestOnce(rt, backend, sessionId, drainAll?): IngestOutcome
+runIngest(rt, backend, sessionId, drainAll?)          // trava por sessão; nunca lança
+//   `drainAll=false` (message.updated): respeita o limiar.
+//   `drainAll=true`  (session.idle):    drena tudo + o resto (pendentes==0).
+
+// hooks/ingest.ts
+function ingestHook(rt): { event, dispose }
+//   os dois eventos acordam a MESMA rotina (o hook resolve `drainAll`) em
+//   background; `dispose` fecha o handle do SQLite. Nunca bloqueia o turno.
 ```
 
 ## Regras
@@ -150,10 +178,11 @@ function shouldFlush(sessionId: string, cfg: IngestCfg): boolean
    adicionar trabalho pesado aí.
 2. **A coleta de código é fora do turno.** Spawn do indexer + sync nunca no
    caminho crítico (FR-510).
-3. **`reference_time` = data da mensagem**, não do envio (quebra supersessão).
+3. **`reference_time` = data da mensagem MAIS ATUAL do lote**, não do envio
+   (quebra supersessão).
 4. **Ingestão nunca é await no caminho do turno** — 202 e segue.
 5. **Nenhum valor hardcoded** — config via `.kilo/graph-plugin.json`/env (PRD FR-303).
-6. **Defaults desligados** para indexação e injeção (preferência do dono).
+6. **Defaults desligados** para indexação, injeção e ingestão (preferência do dono).
 7. **Arquivo removido exige `chunks: []`** — o memtier não auto-deleta (FR-504).
    - Só o **FULL** detecta removidos (`removed=[]` no incremental); o FULL só
      ocorre no 1º uso do workspace. "Repo esvaziado" não é representável

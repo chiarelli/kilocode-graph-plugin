@@ -52,7 +52,45 @@ const resetLogged = new Set<string>();
 
 /** Extrai a classe do reset do motivo (para a chave de dedup do log). */
 function resetClass(reason: string): string {
-  return reason.startsWith("JSON corrompido") ? "corrupt" : "missing";
+  if (reason.startsWith("JSON corrompido")) return "corrupt";
+  if (reason.startsWith("shape inválido")) return "shape";
+  return "missing";
+}
+
+/**
+ * Mutex assíncrono **por workspace** (caminho do estado) em torno de uma passada
+ * da rotina. A trava do `IngestRuntime` é **por sessão** (ADR-007 D-7), mas o
+ * arquivo de estado é do **workspace**: duas sessões diferentes rodando em
+ * paralelo fariam `loadState`→`saveState` e a última escrita perderia a da outra
+ * (cursor/hash perdidos ⇒ reenvio). Este mutex serializa a transação
+ * ler-modificar-gravar por workspace (achado da revisão adversarial). Sessões
+ * DIFERENTES continuam permitidas; elas apenas enfileiram na seção crítica.
+ */
+const wsMutex = new Map<string, Promise<void>>();
+
+/**
+ * Sessões com um dreno (`session.idle`) **pedido** enquanto outra passada
+ * segurava a trava. Consumido por quem detém a trava (não descartado) — garante
+ * que o resto seja drenado mesmo se o `session.idle` chegar no meio de uma
+ * passada de `message.updated` (decisão 4; achado da revisão adversarial).
+ */
+const pendingDrain = new Set<string>();
+
+async function withWorkspaceLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
+  const prev = wsMutex.get(path) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const chained = prev.then(() => gate);
+  wsMutex.set(path, chained);
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (wsMutex.get(path) === chained) wsMutex.delete(path);
+  }
 }
 
 /** Dependências da rotina (injetáveis para teste, sem banco/rede reais). */
@@ -74,6 +112,13 @@ export interface IngestOutcome {
   hash?: string;
   jobId?: string;
   msgs?: number;
+  /**
+   * `false` quando a passada **não** avançou o cursor (o dreno deve parar, não
+   * girar). `undefined`/`true` = houve progresso ou nada a fazer. É medido
+   * dentro da seção crítica (não relendo o arquivo), para não confundir um
+   * avanço de outra sessão com o desta.
+   */
+  cursorAdvanced?: boolean;
 }
 
 /**
@@ -144,7 +189,7 @@ export async function ingestOnce(
 
   if (rows === 0) {
     debug(`ingest: sem pendências session=${sessionId}`);
-    return { sent: false, rows: 0 };
+    return { sent: false, rows: 0, cursorAdvanced: false };
   }
   // O limiar só barra o gatilho que NÃO drena (`message.updated`). No
   // `session.idle`, o resto abaixo do limiar é enviado — é o que corrige o
@@ -155,7 +200,7 @@ export async function ingestOnce(
       `ingest: pendentes=${rows} < batch=${rt.cfg.batch_size} ` +
         `session=${sessionId}; aguardando`,
     );
-    return { sent: false, rows };
+    return { sent: false, rows, cursorAdvanced: false };
   }
 
   // Lote cheio de LINHAS, mas nenhuma com texto: não há episódio a ingerir.
@@ -165,9 +210,13 @@ export async function ingestOnce(
     if (last) {
       setCursor(state, sessionId, last);
       saveState(rt.statePath, state);
+    } else {
+      // Nenhuma linha avançável (id/ts inválidos na janela): não trava o dreno,
+      // mas registra — nunca silencioso.
+      log(`ingest: ${rows} linhas sem id/ts válidos session=${sessionId}`);
     }
     debug(`ingest: lote de ${rows} linhas sem texto session=${sessionId}`);
-    return { sent: false, rows };
+    return { sent: false, rows, cursorAdvanced: last !== null };
   }
 
   const batch = buildBatch(messages);
@@ -177,7 +226,7 @@ export async function ingestOnce(
       saveState(rt.statePath, state);
     }
     debug(`ingest: lote ${batch.hash} já enviado (dedup) session=${sessionId}`);
-    return { sent: false, rows, hash: batch.hash };
+    return { sent: false, rows, hash: batch.hash, cursorAdvanced: last !== null };
   }
 
   const res = await rt.client.ingest(batch.body, batch.referenceTime);
@@ -206,12 +255,14 @@ export async function ingestOnce(
       `hash=${batch.hash} job_id=${res.job_id ?? "?"} status=${res.status ?? "?"} ` +
       `reference_time=${batch.referenceTime} accepted_not_confirmed=true`,
   );
-  return { sent: true, rows, hash: batch.hash, jobId: res.job_id, msgs: messages.length };
-}
-
-/** Assinatura do cursor de uma sessão (para detectar progresso no dreno). */
-function cursorSig(c: { last_ts: number; last_id: string } | undefined): string {
-  return c ? `${c.last_ts}:${c.last_id}` : "";
+  return {
+    sent: true,
+    rows,
+    hash: batch.hash,
+    jobId: res.job_id,
+    msgs: messages.length,
+    cursorAdvanced: true,
+  };
 }
 
 /**
@@ -230,17 +281,39 @@ export async function runIngest(
   sessionId: string,
   drainAll = false,
 ): Promise<void> {
+  // Uma passada "não-dreno" segurando a trava por sessão (I/O de banco + estado)
+  // não pode fazer um `session.idle` que chega nesse intervalo ser DESCARTADO —
+  // senão o resto < lote fica preso até o próximo evento (fere a decisão 4). O
+  // pedido de dreno é **consolidado** (`pendingDrain`), não perdido: quem segura
+  // a trava o absorve ao terminar.
   if (rt.lock.has(sessionId)) {
-    debug(`ingest: execução concorrente ignorada session=${sessionId}`);
+    if (drainAll) {
+      pendingDrain.add(sessionId);
+      debug(`ingest: dreno pendente registrado session=${sessionId}`);
+    } else {
+      debug(`ingest: execução concorrente ignorada session=${sessionId}`);
+    }
     return;
   }
   rt.lock.add(sessionId);
   try {
     let guard = 0;
+    let drain = drainAll;
     while (true) {
-      const before = cursorSig(loadState(rt.statePath).sessions[sessionId]);
-      const outcome = await ingestOnce(rt, backend, sessionId, drainAll);
-      if (!drainAll) return; // `message.updated`: uma passada basta.
+      // O mutex por workspace serializa a transação ler-modificar-gravar do
+      // arquivo de estado (duas sessões não podem se sobrescrever).
+      const outcome = await withWorkspaceLock(rt.statePath, () =>
+        ingestOnce(rt, backend, sessionId, drain),
+      );
+      if (!drain) {
+        // Consome um dreno pedido por um `session.idle` que chegou durante esta
+        // passada — uma vez só, sem laço extra.
+        if (pendingDrain.delete(sessionId)) {
+          drain = true;
+          continue;
+        }
+        return;
+      }
       // Nada pendente ⇒ drenou (o resto, se havia, saiu no lote anterior).
       if (outcome.rows === 0) {
         debug(`ingest: drenado session=${sessionId}`);
@@ -248,8 +321,7 @@ export async function runIngest(
       }
       // Progresso esperado: o cursor avançou (send/dedup/sem-texto). Se não
       // avançou e não enviou, para — não girar sobre o mesmo estado.
-      const after = cursorSig(loadState(rt.statePath).sessions[sessionId]);
-      if (after === before && !outcome.sent) {
+      if (outcome.cursorAdvanced === false) {
         debug(`ingest: dreno sem progresso session=${sessionId}; encerrando`);
         return;
       }

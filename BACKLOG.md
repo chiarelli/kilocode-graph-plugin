@@ -82,7 +82,7 @@ Convenções válidas para todas as epics:
 - [x] **E4-S2** — Endurecer: cursor por `(time_created, id)` + `sentBatchHashes` (idempotência)
 - [x] **E4-S3** — `session.idle` drena tudo + o resto (mesma rotina; trava por sessão)
 - [x] **E4-S4** — Limitações L-1/L-2/L-3 como critério de aceite (decisão do dono)
-- [ ] **E4-S5** — Fechamento: E2E real, docs coerentes, zero marcadores
+- [x] **E4-S5** — Fechamento: E2E real, docs coerentes, zero marcadores
 
       **DECIDIDO (2026-10-15):** batch por **VALOR de config** (não por mensagem);
       `reference_time` = **mensagem mais atual do batch**.
@@ -663,3 +663,47 @@ redescobertas no meio do loop.
      definido (estado perdido ⇒ reenvio, consequência documentada — não defeito).
   4. Unit **290 · 276 pass · 0 fail · 14 skip**; `tsc --noEmit` limpo.
      `rg "TODO\(tracer-bullet\)" src/` → **zero**.
+
+- **2026-10-15 — E4-S5 (fechamento: prova viva + docs + revisão adversarial).**
+  1. **Revisão adversarial (3 perfis paralelos, agentes nomeados):** BLIND-HUNTER,
+     EDGE-CASE-HUNTER e VERIFICATION-GAP. Achados materiais **corrigidos na
+     mesma base** (sem rewrite), cada um com teste de discriminação:
+     - `part.data`/`message.data` = `null`/JSON escalar lançava `TypeError` →
+       virava `IngestReadError` ("transitório") ⇒ **cursor travado para sempre**.
+       Agora não-objeto é linha veneno: pula, avança e reporta.
+     - `time_created` `NULL` virava epoch **0** (`Number(null)`) ⇒ `reference_time`
+       de 1970. Agora só número/string numérica; `NULL` é pulado.
+     - `batch_size` `<=0` passava na config (`LIMIT 0`/`LIMIT -n` = varredura/trava).
+       Novo `resolvePositiveInt`: `<=0`/inválido cai no default.
+     - `session.idle` chegando **durante** uma passada de `message.updated` era
+       **descartado** (trava por sessão) ⇒ resto preso (fere a decisão 4). Agora o
+       dreno é **consolidado** (`pendingDrain`) e absorvido por quem tem a trava.
+     - Corrida de estado entre **sessões diferentes** (trava só por sessão;
+       `loadState`→`saveState` não atômico entre elas) perdia cursor/hash. Novo
+       **mutex por workspace** serializa a transação ler-modificar-gravar.
+     - `loadState` com JSON válido de shape errado (`[]`, `123`, `"x"`) resetava
+       **em silêncio** (fere o L-3). Agora reporta `shape inválido`.
+     - **Discriminação do `OFFSET`**: o teste antigo não reprovava (o fake ignorava
+       `OFFSET`). O teste real-sqlite agora deleta **estritamente antes** do cursor
+       + guarda de **shape do SQL** (falha se `readBatch` emitir `OFFSET`).
+  2. **Lacunas de verificação fechadas com teste:** emissão do log L-1
+     (`accepted_not_confirmed=true`) e do L-3 (linha de reset, com dedup);
+     encanamento `config→ingestOnce` do `max_hashes` (FIFO medido pela rotina);
+     `ingest.*` na `config.test.ts` (defaults, env, clamp). Novo sink de log
+     injetável (`__setLogSink`) só para teste — produção segue escrevendo no `/tmp`.
+  3. **Aceito e documentado (não reabre ADR):** dedup por conteúdo é
+     **global por workspace** (hash = djb2 `role\0content`, ADR-008 §3) — dois
+     lotes de conteúdo idêntico em sessões distintas são deduplicados (sanção, não
+     defeito); a janela entre o `202` e o `saveState` pode duplicar num crash
+     (sem idempotência no servidor — ADR-008 rejeitou `idempotency_key`).
+  4. **Docs coerentes:** `ARCHITECTURE.md` (§1 diagrama, §2 corpo do `/v1/ingest`,
+     §3 árvore, §4 fluxo, §6 envs, §7 adaptador, §8 degradação, §9 log),
+     `src/README.md` e o **README raiz**/**PRD** deixaram de descrever
+     `chat.message`+debounce. `RUNBOOK-E2E.md`: token da suíte `ingest`, nota do
+     worker serial e contagem **14/14** (medida).
+  5. **Prova viva:** E2E canônico do RUNBOOK **14/14** contra a stack real
+     (memtier vivo + worker): lote real ⇒ grafo; `message.updated` abaixo do
+     limiar não reenvia; `session.idle` drena o resto; reprocessar não cria
+     episódio novo.
+  6. Unit **304 · 290 pass · 0 fail · 14 skip**; `tsc --noEmit` limpo;
+     `rg "TODO\(tracer-bullet\)" src/` → **zero**. **Épico E4 FECHADO.**

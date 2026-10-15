@@ -13,6 +13,18 @@ const PREFIX = "[graph]";
 
 let debugEnabled = false;
 
+/**
+ * Sink de log injetável (teste). `null` ⇒ escreve no arquivo (produção). Não é
+ * API de produção — existe para os testes afirmarem a **emissão** da linha
+ * (L-1/L-3) sem tocar no `/tmp` nem fazer parsing de arquivo.
+ */
+let testSink: ((line: string) => void) | null = null;
+
+/** Instala (ou remove, com `null`) um sink de teste. Só em teste. */
+export function __setLogSink(sink: ((line: string) => void) | null): void {
+  testSink = sink;
+}
+
 /** Liga/desliga o log verboso (chamado no boot com `config.debug`). */
 export function setDebug(enabled: boolean): void {
   debugEnabled = enabled;
@@ -20,8 +32,17 @@ export function setDebug(enabled: boolean): void {
 
 /** Log incondicional (boot, degradação, erro). */
 export function log(msg: string): void {
+  const line = `[${new Date().toISOString()}] ${PREFIX} ${msg}`;
+  if (testSink) {
+    try {
+      testSink(line);
+    } catch {
+      // Sink de teste nunca derruba o plugin.
+    }
+    return;
+  }
   try {
-    appendFileSync(LOG_PATH, `[${new Date().toISOString()}] ${PREFIX} ${msg}\n`);
+    appendFileSync(LOG_PATH, `${line}\n`);
   } catch {
     // Log nunca derruba o plugin.
   }

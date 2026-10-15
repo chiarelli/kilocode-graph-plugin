@@ -116,6 +116,17 @@ function resolveInt(raw: string | undefined, fallback: number): number {
   return Number.isFinite(n) && Number.isInteger(n) ? n : fallback;
 }
 
+/**
+ * Inteiro estritamente **positivo**; `<= 0` (ou inválido) cai no default. Usado
+ * onde `0`/negativo seria um modo degenerado silencioso — p.ex. `ingest.batch_size`
+ * com `LIMIT 0`/`LIMIT -n` (que no SQLite significa "sem limite") travaria ou
+ * varreria a tabela.
+ */
+function resolvePositiveInt(raw: string | undefined, fallback: number): number {
+  const n = resolveInt(raw, fallback);
+  return n > 0 ? n : fallback;
+}
+
 function globalConfigDir(): string {
   const xdg = process.env.XDG_CONFIG_HOME;
   if (xdg) return join(xdg, "kilo");
@@ -287,7 +298,7 @@ export function loadConfig(options?: PluginOptions): Config {
         ),
         DEFAULTS.ingest.enabled,
       ),
-      batch_size: resolveInt(
+      batch_size: resolvePositiveInt(
         resolve(
           "ingest.batch_size",
           "KILOCODE_GRAPH_INGEST_BATCH_SIZE",

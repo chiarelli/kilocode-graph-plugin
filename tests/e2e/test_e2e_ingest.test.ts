@@ -328,13 +328,20 @@ test(
 );
 
 /**
- * E4-S2 — PoE do ADR-008: **reprocessar o mesmo lote NÃO aumenta o grafo**.
+ * E4-S2 — PoE do ADR-008: **reprocessar o mesmo lote NÃO gera um novo episódio**.
  *
- * O memtier não deduplica arestas (medido: 9→11 ao ingerir 2×). A garantia é do
- * plugin, via `sentBatchHashes`. Aqui forçamos o cenário do L-3 (cursor voltado
- * ao início como se o estado tivesse sido perdido) com o hash **preservado**: o
- * lote é relido do banco, o hash barra o reenvio e as `facts` do `/v1/recall`
- * não crescem — prova real de que o grafo não duplicou.
+ * Escopo honesto desta prova: o memtier **não** deduplica arestas (medido no
+ * ADR-008: `RELATES_TO` 9→11 ao ingerir 2×; episódios 1→2 sempre crescem). A
+ * garantia do plugin (`sentBatchHashes`) impede o **reenvio**, então nenhuma
+ * aresta nova pode nascer — a ausência de reenvio é o invariante provado aqui.
+ *
+ * O teste força o cenário do L-3 (cursor ao início com o hash **preservado**): o
+ * lote é relido do banco, o hash barra o envio, e o **conjunto de UUIDs de
+ * episódio** do `/v1/recall` fica estável. Comparar o conjunto de episódios
+ * detecta a duplicação (um reenvio criaria episódio NOVO — 1→2); não medimos a
+ * contagem de arestas diretamente (o `/v1/recall` não as expõe), mas um reenvio
+ * seria visível como episódio novo. É a discriminação que o contrato do memtier
+ * permite.
  */
 test(
   "e2e: reprocessar o mesmo lote NÃO duplica o grafo (sentBatchHashes barra)",

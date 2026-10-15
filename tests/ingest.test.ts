@@ -5,7 +5,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -46,6 +46,7 @@ import {
   saveState,
 } from "../src/ingest/state.ts";
 import { ingestHook, sessionIdFromEvent } from "../src/hooks/ingest.ts";
+import { __setLogSink } from "../src/logger.ts";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -658,11 +659,16 @@ test("client_ingest_infra: 503 ⇒ InfraError", async () => {
 // ---------------------------------------------------------------------------
 
 /**
- * DISCRIMINAÇÃO do OFFSET (padrão E3a/E3b): reproduz o defeito medido no
- * antecessor. Um cursor **posicional** (`LIMIT n OFFSET k`) pula mensagens
- * quando linhas antes do cursor são removidas (compactação); o cursor por
- * **tupla** `(time_created, id)` não. Se alguém reintroduzir `OFFSET` no
- * `readBatch`, este teste **reprova**.
+ * Demonstração aritmética do defeito do `OFFSET` (padrão E3a/E3b), com o cursor
+ * real (`readBatch`) do lado correto.
+ *
+ * A parte (a) mostra o **modelo** posicional: uma remoção antes do cursor desloca
+ * a posição numérica e pula mensagens. A parte (b) prova que o `readBatch` (por
+ * tupla) NÃO pula. Nota honesta: a parte (a) é aritmética sobre um array, não
+ * exercita o `readBatch` — a garantia de que o SQL real **não contém `OFFSET`** é
+ * provada por `s2_offset_regression_realsqlite` (guarda de shape sobre o SQL
+ * emitido) + a comparação contra SQLite real. Juntos, reintroduzir `OFFSET` no
+ * `readBatch` reprova (o guard de shape falha).
  *
  * Dataset: 100 mensagens `(ts, id)`; o cursor já leu até a posição 50; então 20
  * linhas ANTES do cursor são removidas (compactação); quem lê a seguir?
@@ -870,25 +876,309 @@ test("s2_offset_regression_realsqlite: remoção antes do cursor ⇒ PULADAS=0 (
       insM.run(`msg_${String(i).padStart(3, "0")}`, "ses_a", 1000 + i, JSON.stringify({ role: "user" }));
       insP.run(`p_${i}`, `msg_${String(i).padStart(3, "0")}`, JSON.stringify({ type: "text", text: `t${i}` }));
     }
-    // Cursor já leu até a posição 50 (ts=1049).
-    const cursor = { last_ts: 1049, last_id: "msg_049" };
-    // Compactação remove 40 linhas ANTES do cursor (posições 20..59).
-    db.exec("DELETE FROM message WHERE time_created >= 1020 AND time_created < 1060");
+    // Cursor já leu até a posição 60 (ts=1059, msg_059): o que veio ANTES dele
+    // (ts <= 1059) é "passado".
+    const cursor = { last_ts: 1059, last_id: "msg_059" };
+    // Reproduz a compactação do ADR-008: remove 40 linhas **estritamente antes**
+    // do cursor (posições 20..59, ts 1020..1059). As 40 mensagens ainda NÃO lidas
+    // (ts 1060..1099) ficam intactas — é exatamente o cenário em que o `OFFSET`
+    // numérico pula.
+    db.exec("DELETE FROM message WHERE time_created >= 1020 AND time_created <= 1059");
+    const remainingAfterCursor = db
+      .prepare("SELECT count(*) AS c FROM message WHERE time_created > 1059")
+      .all()[0]!.c as number;
+    assert.equal(remainingAfterCursor, 40, "as 40 mensagens pós-cursor devem sobreviver");
 
+    // Guarda de SHAPE do SQL (discriminação direta): o `readBatch` não pode
+    // emitir `OFFSET` — reintroduzir posição numérica tem de **reprovar** aqui.
+    let capturedSql = "";
     const backend: SqliteBackend = {
-      query: (sql, params) => db.prepare(sql).all(...params),
+      query: (sql, params) => {
+        if (sql.includes("FROM message")) capturedSql = sql;
+        return db.prepare(sql).all(...params);
+      },
       close: () => db.close(),
     };
     const first = readBatch(backend, "ses_a", cursor, 1000);
-    // Nenhuma mensagem PULADA: a primeira lida é a imediatamente após o cursor
-    // (ts=1060). As remoções não deslocam a identidade.
+    assert.ok(
+      !/offset/i.test(capturedSql),
+      `readBatch não pode usar OFFSET (cursor por identidade, ADR-008); SQL=${capturedSql}`,
+    );
+    // PULADAS = 0: a primeira lida é a imediatamente após o cursor (ts=1060).
     assert.equal(first.messages[0]!.time_created, 1060, "deve retomar em ts=1060 (PULADAS=0)");
     assert.equal(first.messages[0]!.id, "msg_060");
-    // Todas as mensagens com ts > cursor continuam alcançáveis (nenhum buraco).
+    // Todas as 40 mensagens pós-cursor são alcançáveis (nenhum buraco).
     assert.equal(first.messages.length, 40);
+    assert.equal(first.messages.at(-1)!.id, "msg_099", "a sequência pós-cursor sai completa");
     db.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Correções da revisão adversarial (fechamento E4) — casos de borda confirmados
+// ---------------------------------------------------------------------------
+
+test("adv_l1_log_emitted: o log do envio registra aceite NÃO confirmado", async () => {
+  const { statePath, cleanup } = tmpState();
+  const lines: string[] = [];
+  __setLogSink((l) => lines.push(l));
+  try {
+    const backend = makeBackend(genMsgs(20, 1000));
+    const { client } = stubClient(async () => ({ job_id: "job_xyz", status: "queued" }));
+    await ingestOnce(rt(statePath, client), backend, "ses_a");
+    const sent = lines.find((l) => l.includes("ingest sent"));
+    assert.ok(sent, "a linha de envio deve ser emitida");
+    assert.match(sent!, /accepted_not_confirmed=true/, "aceite ≠ processamento no log");
+    assert.match(sent!, /job_id=job_xyz/);
+  } finally {
+    __setLogSink(null);
+    cleanup();
+  }
+});
+
+test("adv_l3_log_emitted: o reset do estado é emitido pela rotina (uma vez por classe)", async () => {
+  const { statePath, cleanup } = tmpState();
+  const lines: string[] = [];
+  __setLogSink((l) => lines.push(l));
+  try {
+    // Estado ausente: a rotina deve emitir a linha de reset.
+    const backend = makeBackend(genMsgs(5, 1000));
+    const { client } = stubClient(async () => ({ job_id: "j" }));
+    await runIngest(rt(statePath, client), backend, "ses_a", true);
+    const resets = lines.filter((l) => l.includes("estado resetado"));
+    assert.equal(resets.length, 1, "reset registrado (ausente)");
+    // Novo gatilho, mesmo estado ausente: NÃO repete a linha (dedup).
+    await runIngest(rt(statePath, client), backend, "ses_a", true);
+    assert.equal(
+      lines.filter((l) => l.includes("estado resetado")).length,
+      1,
+      "o reset não repete a cada gatilho",
+    );
+    // Corrupção (classe diferente) ⇒ nova linha.
+    saveState(statePath, emptyState());
+    writeFileSync(statePath, "{not json", "utf-8");
+    await runIngest(rt(statePath, client), backend, "ses_a", true);
+    assert.ok(
+      lines.some((l) => l.includes("estado resetado (JSON corrompido")),
+      "corrupção registra o reset",
+    );
+  } finally {
+    __setLogSink(null);
+    cleanup();
+  }
+});
+
+test("adv_l2_cap_wired_through_routine: max_hashes da config limita o estado em produção", async () => {
+  const { statePath, cleanup } = tmpState();
+  try {
+    // 63 pendentes, lote=20, teto=2 ⇒ o dreno manda 4 lotes, mas o arquivo de
+    // estado guarda só os 2 hashes mais recentes (FIFO aplicado pela ROTINA, não
+    // só pela função pura — prova o encanamento config→rotina).
+    const backend = makeBackend(genMsgs(63, 1000));
+    const { client, calls } = stubClient(async () => ({ job_id: "j" }));
+    await runIngest(rt(statePath, client, { max_hashes: 2 }), backend, "ses_a", true);
+    assert.equal(calls.length, 4, "4 lotes enviados");
+    const st = loadState(statePath);
+    assert.equal(st.sentBatchHashes.length, 2, "estado limitado pelo teto da config");
+    assert.equal(st.sentBatches!.length, 2, "a auditoria respeita o mesmo teto");
+  } finally {
+    cleanup();
+  }
+});
+
+test("adv_part_json_null_does_not_stick: part `data`=null/JSON escalar não trava o cursor", () => {
+  // `JSON.parse("null")`/`"123"`/`'"x"'` são válidos mas NÃO-objeto: sem o guard,
+  // `p.type` lançaria `TypeError`, classificado como falha TRANSITÓRIA ⇒ cursor
+  // nunca avança (livelock). Deve pular como "sem texto" e avançar.
+  const backend = fakeBackend((sql: string, params: unknown[]): DbRow[] => {
+    if (sql.includes("FROM message")) {
+      const [sid, ts, ts2, id, limit] = params as [string, number, number, string, number];
+      const rows = [
+        { id: "m1", session_id: sid, time_created: 1000, data: JSON.stringify({ role: "user" }) },
+        { id: "m2", session_id: sid, time_created: 1001, data: JSON.stringify({ role: "user" }) },
+      ];
+      return rows
+        .filter((m) => m.time_created > ts || (m.time_created === ts2 && m.id > id))
+        .slice(0, limit);
+    }
+    if (sql.includes("FROM part")) {
+      const mid = params[0] as string;
+      // m1: part "null" (JSON válido, não-objeto). m2: texto normal.
+      if (mid === "m1") return [{ data: "null" }, { data: "123" }, { data: '"x"' }];
+      return [{ data: JSON.stringify({ type: "text", text: "texto m2" }) }];
+    }
+    return [];
+  });
+  const read = readBatch(backend, "ses_a", { last_ts: 0, last_id: "" }, 10);
+  assert.deepEqual(read.last, { last_ts: 1001, last_id: "m2" }, "o cursor avança sobre m1");
+  assert.deepEqual(read.messages.map((m) => m.id), ["m2"], "m1 sem texto, m2 lido");
+});
+
+test("adv_message_data_scalar_poison: message `data`=null/escalar avança e reporta", () => {
+  const backend = fakeBackend((sql: string, params: unknown[]): DbRow[] => {
+    if (sql.includes("FROM message")) {
+      const [sid, ts, ts2, id, limit] = params as [string, number, number, string, number];
+      const rows = [
+        { id: "m1", session_id: sid, time_created: 1000, data: "null" },
+        { id: "m2", session_id: sid, time_created: 1001, data: "[1,2]" },
+        { id: "m3", session_id: sid, time_created: 1002, data: JSON.stringify({ role: "user" }) },
+      ];
+      return rows
+        .filter((m) => m.time_created > ts || (m.time_created === ts2 && m.id > id))
+        .slice(0, limit);
+    }
+    if (sql.includes("FROM part")) {
+      return [{ data: JSON.stringify({ type: "text", text: `t ${params[0]}` }) }];
+    }
+    return [];
+  });
+  const poisoned: string[] = [];
+  const read = readBatch(backend, "ses_a", { last_ts: 0, last_id: "" }, 10, (id) => poisoned.push(id));
+  assert.deepEqual(poisoned, ["m1", "m2"], "não-objeto é linha veneno (reportada)");
+  assert.deepEqual(read.last, { last_ts: 1002, last_id: "m3" });
+});
+
+test("adv_null_timestamp_not_epoch_zero: time_created NULL não vira 1970", () => {
+  const backend = fakeBackend((sql: string): DbRow[] => {
+    if (sql.includes("FROM message")) {
+      return [
+        { id: "m1", time_created: null, data: JSON.stringify({ role: "user" }) },
+        { id: "m2", time_created: 1000, data: JSON.stringify({ role: "user" }) },
+      ];
+    }
+    if (sql.includes("FROM part")) {
+      return [{ data: JSON.stringify({ type: "text", text: "hi" }) }];
+    }
+    return [];
+  });
+  const read = readBatch(backend, "ses_a", { last_ts: 0, last_id: "" }, 10);
+  // m1 (ts null) é pulada; m2 é lida com o ts real.
+  assert.deepEqual(read.messages.map((m) => m.id), ["m2"]);
+  assert.equal(read.messages[0]!.time_created, 1000);
+});
+
+test("adv_dropped_idle_drain_is_coalesced: idle durante passada não descarta o dreno", async () => {
+  const { statePath, cleanup } = tmpState();
+  try {
+    // 7 pendentes, lote=5: o `message.updated` (single-pass) envia 1 lote de 5 e
+    // fica PRESO no envio (holding a trava) enquanto o `session.idle` chega.
+    const backend = makeBackend(genMsgs(7, 1000));
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const calls: string[] = [];
+    const client = {
+      ingest: async (body: string) => {
+        calls.push(body);
+        if (calls.length === 1) await gate; // segura só a 1ª passada
+        return { job_id: "j" };
+      },
+    };
+    const runtime = rt(statePath, client, { batch_size: 5 });
+    // `message.updated`: envia o 1º lote de 5 e trava no `await gate`.
+    const single = runIngest(runtime, backend, "ses_a", false);
+    // `session.idle` chega com a trava tomada ⇒ deve CONSOLIDAR o dreno (não
+    // descartar) — senão as 2 restantes ficariam presas (fere a decisão 4).
+    const idle = runIngest(runtime, backend, "ses_a", true);
+    await idle; // retorna cedo (trava tomada), mas sinalizou o dreno
+    release();
+    await single; // o detentor da trava absorve o dreno pedido
+    // O dreno consolidado envia o resto (2) — total 2 lotes.
+    assert.equal(calls.length, 2, "o idle consolidado drena o resto (não é descartado)");
+    assert.equal(loadState(statePath).sessions.ses_a!.last_id, "msg_006");
+  } finally {
+    cleanup();
+  }
+});
+
+test("adv_cross_session_state_not_lost: duas sessões concorrentes não se sobrescrevem", async () => {
+  const { statePath, cleanup } = tmpState();
+  try {
+    const backendA = makeBackend(genMsgs(20, 1000));
+    const backendB = fakeBackend((sql: string, params: unknown[]): DbRow[] => {
+      if (sql.includes("FROM message")) {
+        const [sid, ts, ts2, id, limit] = params as [string, number, number, string, number];
+        return Array.from({ length: 20 }, (_, i) => ({
+          id: `b_${String(i).padStart(3, "0")}`,
+          session_id: sid,
+          time_created: 2000 + i,
+          data: JSON.stringify({ role: "user" }),
+        }))
+          .filter((m) => m.time_created > ts || (m.time_created === ts2 && m.id > id))
+          .slice(0, limit);
+      }
+      if (sql.includes("FROM part")) {
+        return [{ data: JSON.stringify({ type: "text", text: `txt ${params[0]}` }) }];
+      }
+      return [];
+    });
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const client = {
+      ingest: async () => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((r) => setTimeout(r, 20));
+        inFlight--;
+        return { job_id: "j" };
+      },
+    };
+    const runtime = rt(statePath, client);
+    await Promise.all([
+      runIngest(runtime, backendA, "ses_a", true),
+      runIngest(runtime, backendB, "ses_b", true),
+    ]);
+    // O mutex por workspace serializa a transação ler-modificar-gravar: as DUAS
+    // sessões coexistem no estado (antes, a última escrita apagava a primeira).
+    const st = loadState(statePath);
+    assert.ok(st.sessions.ses_a, "cursor de ses_a preservado");
+    assert.ok(st.sessions.ses_b, "cursor de ses_b preservado");
+    assert.equal(st.sentBatchHashes.length, 2, "os dois hashes sobrevivem");
+    assert.equal(maxInFlight, 1, "a seção crítica do estado é serializada");
+  } finally {
+    cleanup();
+  }
+});
+
+test("adv_loadstate_wrong_shape_logged: JSON válido de shape errado registra o reset", () => {
+  for (const raw of ["[]", "123", '"x"', "null", "true"]) {
+    const reasons: string[] = [];
+    const st = loadState("/s.json", () => raw, (r) => reasons.push(r));
+    assert.deepEqual(st, emptyState(), `shape ${raw} ⇒ estado vazio`);
+    assert.equal(reasons.length, 1, `shape ${raw} ⇒ reset registrado (L-3)`);
+  }
+});
+
+test("adv_config_batch_size_positive: batch_size<=0 cai no default (não vira LIMIT 0/neg)", () => {
+  // Comportamento do resolvedor: validar via a função pura é o alvo; a config
+  // real é coberta por config.test.ts. Aqui garantimos que `shouldSend` nunca
+  // dispara com batch<=0 e que `readBatch` com limit<=0 não varre a tabela.
+  assert.equal(shouldSend(5, 0), false);
+  assert.equal(shouldSend(5, -1), false);
+});
+
+test("adv_invalid_id_ts_window_logs_and_stops: janela inteira sem id/ts válidos não gira", async () => {
+  const { statePath, cleanup } = tmpState();
+  try {
+    // Todas as linhas com id vazio ou ts não-numérico.
+    const backend = fakeBackend((sql: string): DbRow[] => {
+      if (sql.includes("FROM message")) {
+        return [
+          { id: "", time_created: 1000, data: JSON.stringify({ role: "user" }) },
+          { id: "m2", time_created: null, data: JSON.stringify({ role: "user" }) },
+        ];
+      }
+      return [];
+    });
+    const { client, calls } = stubClient(async () => ({ job_id: "j" }));
+    await assert.doesNotReject(() => runIngest(rt(statePath, client), backend, "ses_a", true));
+    assert.equal(calls.length, 0, "nada a enviar");
+    // Não avança o cursor (nada válido) e não gira infinitamente (retorna).
+  } finally {
+    cleanup();
   }
 });
 

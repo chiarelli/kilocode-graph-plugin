@@ -105,3 +105,43 @@ test("config_code_sync_timeout: default 120000 e env honrada", () => {
   process.env.KILOCODE_GRAPH_INDEX_SYNC_TIMEOUT_MS = "5000";
   assert.equal(loadConfig().code_index.sync_timeout_ms, 5000);
 });
+
+test("config_ingest_defaults: as chaves de `ingest.*` (E4) têm os defaults declarados", () => {
+  clearEnv();
+  const cfg = loadConfig();
+  assert.equal(cfg.ingest.enabled, false, "ingestão desligada por default (preferência do dono)");
+  assert.equal(cfg.ingest.batch_size, 20);
+  assert.equal(cfg.ingest.max_hashes, 5000);
+  assert.equal(cfg.ingest.timeout_ms, 15000);
+  assert.equal(cfg.ingest.db_path, "");
+});
+
+test("config_ingest_env: `KILOCODE_GRAPH_INGEST_*` são honradas end-to-end", () => {
+  clearEnv();
+  process.env.KILOCODE_GRAPH_INGEST_ENABLED = "true";
+  process.env.KILOCODE_GRAPH_INGEST_BATCH_SIZE = "7";
+  process.env.KILOCODE_GRAPH_INGEST_MAX_HASHES = "123";
+  process.env.KILOCODE_GRAPH_INGEST_TIMEOUT_MS = "9000";
+  process.env.KILOCODE_GRAPH_INGEST_DB_PATH = "/tmp/x.db";
+  const cfg = loadConfig();
+  assert.equal(cfg.ingest.enabled, true);
+  assert.equal(cfg.ingest.batch_size, 7);
+  assert.equal(cfg.ingest.max_hashes, 123);
+  assert.equal(cfg.ingest.timeout_ms, 9000);
+  assert.equal(cfg.ingest.db_path, "/tmp/x.db");
+});
+
+test("config_ingest_batch_size_positive: 0/negativo/ inválido cai no default (não vira LIMIT 0/-n)", () => {
+  clearEnv();
+  for (const bad of ["0", "-5", "abc", "2.5"]) {
+    process.env.KILOCODE_GRAPH_INGEST_BATCH_SIZE = bad;
+    assert.equal(
+      loadConfig().ingest.batch_size,
+      20,
+      `batch_size=${bad} deve cair no default (senão LIMIT 0/-n varre/para a leitura)`,
+    );
+  }
+  // Um positivo válido passa.
+  process.env.KILOCODE_GRAPH_INGEST_BATCH_SIZE = "1";
+  assert.equal(loadConfig().ingest.batch_size, 1);
+});

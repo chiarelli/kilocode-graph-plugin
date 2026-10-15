@@ -14,7 +14,7 @@ E2E=1 \
   E2E_CODE_TOKEN=e2e-tok-b \
   E2E_MCP_TOKEN="$(python3 -c 'import json;print(json.load(open(".kilo/graph-key.json"))["token"])')" \
   node --test "tests/e2e/**/*.test.ts"
-# → # tests 10 / pass 10 / fail 0 / skipped 0
+# → # tests 14 / pass 14 / fail 0 / skipped 0   (medido 2026-10-15, pós E4; ~7 min)
 ```
 
 Cada suíte usa um token de escopo **distinto**; por isso há **três** variáveis
@@ -25,10 +25,15 @@ D-1/D-2 abaixo).
 
 | variável | token | workspace/program | quem consome |
 |---|---|---|---|
-| `E2E_TOKEN` | `e2e-tok-a` | `alfa` / `default` | `lifecycle`, `recall_inject` |
+| `E2E_TOKEN` | `e2e-tok-a` | `alfa` / `default` | `lifecycle`, `recall_inject`, `ingest` |
+| `E2E_INGEST_TOKEN` | (fallback `E2E_TOKEN`) | `alfa` / `default` | `ingest` (opcional; o padrão cai em `E2E_TOKEN`) |
 | `E2E_CODE_TOKEN` | `e2e-tok-b` | `beta` / `default` | `collector`, `inject_code` |
 | `E2E_MCP_TOKEN` | bearer de `.kilo/graph-key.json` | `kilocode-graph-plugin` / `graphplugin` | `mcp` |
 | — | — | — | `health` (sem token) |
+
+> ⚠️ **A suíte `ingest` é lenta** (o worker do memtier é **serial**,
+> `add_episode` ~70–115 s/job) e enfileira vários jobs: reserve ~5–10 min para
+> ela. `E2E_INGEST_WORKER_MS` sobe o teto de espera do worker.
 
 ## Comandos por arquivo (isolado)
 
@@ -39,6 +44,8 @@ E2E=1 node --test tests/e2e/test_e2e_health.test.ts            # 2/2
 # alfa
 E2E=1 E2E_TOKEN=e2e-tok-a node --test tests/e2e/test_e2e_lifecycle.test.ts      # 1/1
 E2E=1 E2E_TOKEN=e2e-tok-a node --test tests/e2e/test_e2e_recall_inject.test.ts  # 2/2
+# ingest (E4): 4 casos; lento (worker serial) — ~5 min
+E2E=1 E2E_INGEST_TOKEN=e2e-tok-a node --test tests/e2e/test_e2e_ingest.test.ts  # 4/4
 
 # beta
 E2E=1 E2E_CODE_TOKEN=e2e-tok-b node --test tests/e2e/test_e2e_collector.test.ts   # 1/1
@@ -66,6 +73,18 @@ real / `E2E_CODE_TOKEN`.
 - binário do indexer: `rust_indexer/target/release/rust_indexer` (a suíte
   `collector` e `inject_code` o usam; `E2E_INDEXER` sobrescreve).
 - `.kilo/graph-key.json` (mode 600) para a suíte do MCP, lido via `E2E_MCP_TOKEN`.
+- **worker do memtier de pé** para a suíte `ingest` (E4): a ingestão é
+  assíncrona; sem o worker, o `202` chega mas nada aparece no grafo. É **serial**
+  (~70–115 s/job) — a suíte enfileira vários e leva minutos.
+
+## Suíte `ingest` (E4) — notas
+
+- 4 casos: (1) lote real ⇒ grafo; (2) `message.updated` abaixo do limiar não
+  reenvia; (3) `session.idle` drena o resto; (4) reprocessar não duplica.
+- O workspace é o mesmo (`alfa`) das suítes de memória e **acumula execuções**;
+  o teste usa um **projeto único por execução** no marcador para evitar que a
+  supersessão (fato contraditório) esconda o marcador do recall.
+- O teto de espera do worker é `E2E_INGEST_WORKER_MS` (default 480000).
 
 ## Correções ligadas a este runbook (E3b-S5)
 
