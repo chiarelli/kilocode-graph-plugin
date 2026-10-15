@@ -33,6 +33,10 @@ export const DEFAULTS = {
     max_chars: 3000,
     max_tokens: 2000,
     timeout_ms: 4000,
+    // E3c — injeção de código (segunda onda; declarada pela epic dona, pois o
+    // E1 fechou antes da E3c ser especada — ver histórico do BACKLOG).
+    code_enabled: false,
+    max_code_chunks: 3,
   },
   code_index: {
     enabled: false,
@@ -220,6 +224,22 @@ export function loadConfig(options?: PluginOptions): Config {
           String(DEFAULTS.inject.timeout_ms),
         ),
         DEFAULTS.inject.timeout_ms,
+      ),
+      code_enabled: resolveBool(
+        resolve(
+          "inject.code_enabled",
+          "KILOCODE_GRAPH_INJECT_CODE_ENABLED",
+          String(DEFAULTS.inject.code_enabled),
+        ),
+        DEFAULTS.inject.code_enabled,
+      ),
+      max_code_chunks: resolveInt(
+        resolve(
+          "inject.max_code_chunks",
+          "KILOCODE_GRAPH_INJECT_MAX_CODE_CHUNKS",
+          String(DEFAULTS.inject.max_code_chunks),
+        ),
+        DEFAULTS.inject.max_code_chunks,
       ),
     },
     code_index: {

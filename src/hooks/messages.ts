@@ -27,6 +27,11 @@ import {
   type RecallClient,
   type RecallConfig,
 } from "../inject/memory.ts";
+import {
+  searchAndFormat,
+  type CodeConfig,
+  type SearchClient,
+} from "../inject/code.ts";
 
 /** Um `Part` do turno, na forma mínima que a injeção consome. */
 export interface TransformPart {
@@ -43,9 +48,15 @@ export interface TransformMessage {
 
 /** Dependências do hook, injetáveis para teste (sem rede real). */
 export interface InjectRuntime {
+  /** Liga a injeção de MEMÓRIA (`inject.enabled`). */
   enabled: boolean;
+  /** Config da injeção de memória (orcamento/limites). */
   cfg: RecallConfig;
-  client: RecallClient;
+  /** Liga a injeção de CÓDIGO (`inject.code_enabled`, E3c). */
+  codeEnabled: boolean;
+  /** Config da injeção de código (E3c). */
+  codeCfg: CodeConfig;
+  client: RecallClient & SearchClient;
 }
 
 /** Índice da última mensagem do usuário, ou `-1` se não houver (forma do antecessor). */
@@ -151,9 +162,75 @@ export async function injectMemoryIntoMessages(
 }
 
 /**
+ * Corpo da injeção de CÓDIGO (E3c-S1): busca híbrida no memtier e injeta o bloco
+ * como **part separado** (sentinela `graph-code`). **Nunca lança** — qualquer
+ * falha vira "segue sem código" (NFR-03).
+ *
+ * TODO(tracer-bullet): rodar em PARALELO com o recall (`Promise.allSettled`) e o
+ * dedup por turno do chunk entram na E3c-S2; aqui a busca é sequencial e sem
+ * estado.
+ */
+export async function injectCodeIntoMessages(
+  messages: TransformMessage[],
+  codeEnabled: boolean,
+  client: SearchClient,
+  cfg: CodeConfig,
+): Promise<void> {
+  if (!codeEnabled) return;
+
+  const lastUserIdx = lastUserMessageIndex(messages);
+  if (lastUserIdx === -1) return;
+
+  const parts = messages[lastUserIdx]?.parts;
+  if (!parts) return;
+
+  const text = extractUserText(parts);
+  if (!text.trim()) return;
+
+  let block: string | null;
+  try {
+    block = await searchAndFormat(client, cfg, text);
+  } catch (err) {
+    logCodeFailure(err);
+    return;
+  }
+  if (!block) return;
+
+  debug("messages.transform: injetando contexto de código");
+  appendContextPart(parts, block);
+}
+
+/** Classifica a falha da busca de código para o log correto (nunca propaga). */
+function logCodeFailure(err: unknown): void {
+  if (isAbort(err)) {
+    debug(
+      `code_search abortado por timeout: ${err instanceof Error ? err.message : err}`,
+    );
+    return;
+  }
+  if (err instanceof AuthError) {
+    logFatal(`code_search auth (${err.status})`, err);
+    return;
+  }
+  if (err instanceof InfraError) {
+    log(`code_search: memtier indisponível (${err.status}); seguindo sem código`);
+    return;
+  }
+  logFatal("code_search", err);
+}
+
+/**
  * Registra o hook no formato do Kilo (`{ "hook.name": fn }`). Monta o
  * `MemoryInjector` (estado de dedup por turno) uma única vez — o hook é
  * registrado no boot e reutilizado em todos os turnos.
+ *
+ * E3c (S1): o bloco de código é um **segundo part** no mesmo turno, com o
+ * `inject/code.ts`. Hoje o código é injetado **depois** da memória (sequencial);
+ * o paralelismo e o dedup do chunk entram na S2.
+ *
+ * TODO(tracer-bullet): a S2 troca a ordem sequencial por `Promise.allSettled`
+ * (memória e código em paralelo, cada um com seu `AbortSignal`) e passa a
+ * injetar a memória ANTES do código no mesmo `transform`.
  */
 export function messagesHook(rt: InjectRuntime) {
   const injector = new MemoryInjector(rt.client, rt.cfg);
@@ -163,6 +240,12 @@ export function messagesHook(rt: InjectRuntime) {
       output: { messages: TransformMessage[] },
     ): Promise<void> => {
       await injectMemoryIntoMessages(output.messages, rt.enabled, injector);
+      await injectCodeIntoMessages(
+        output.messages,
+        rt.codeEnabled,
+        rt.client,
+        rt.codeCfg,
+      );
     },
   };
 }

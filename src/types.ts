@@ -109,6 +109,10 @@ export interface Config {
     max_chars: number;
     max_tokens: number;
     timeout_ms: number;
+    /** E3c — liga a injeção do bloco de código (default `false`). */
+    code_enabled: boolean;
+    /** E3c — nº máx. de chunks de código injetados (default 3). */
+    max_code_chunks: number;
   };
   code_index: {
     enabled: boolean;

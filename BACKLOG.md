@@ -67,7 +67,7 @@ Convenções válidas para todas as epics:
 - [x] **E3b-S3** — Fechamento: prova de tools listáveis/chamáveis, docs, zero marcadores
 
 ### E3c — Injeção de código
-- [ ] **E3c-S1** — Tracer bullet: `code_search` → bloco de código no `messages.transform` (part separado)
+- [x] **E3c-S1** — Tracer bullet: `code_search` → bloco de código no `messages.transform` (part separado)
 - [ ] **E3c-S2** — Endurecer: paralelismo com o recall, orçamento do total (`maxChars`), dedup do chunk
 - [ ] **E3c-S3** — Fechamento: E2E real contra o memtier, docs, zero marcadores
 

@@ -45,6 +45,7 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
     timeout_ms: config.daemon.health_timeout_ms,
     health_timeout_ms: config.daemon.health_timeout_ms,
     recall_timeout_ms: config.inject.timeout_ms,
+    search_timeout_ms: config.inject.timeout_ms,
     sync_timeout_ms: config.code_index.sync_timeout_ms,
   });
 
@@ -101,6 +102,8 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
   return {
     // E2: injeção de memória no turno (`messages.transform`). Só quando
     // `inject.enabled` (default `false`); o hook degrada sem quebrar o turno.
+    // E3c: o bloco de código é um segundo part no MESMO hook (sentinela
+    // `graph-code`), ligado por `inject.code_enabled` (default `false`).
     ...messagesHook({
       enabled: config.inject.enabled,
       cfg: {
@@ -111,6 +114,12 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
         // Health gate é opcional (spec §E2-S2): desligado para não dobrar o
         // round-trip no caminho crítico — um 503 do próprio recall já degrada.
         healthGate: false,
+      },
+      codeEnabled: config.inject.code_enabled,
+      codeCfg: {
+        maxCodeChunks: config.inject.max_code_chunks,
+        maxTokens: config.inject.max_tokens,
+        timeoutMs: config.inject.timeout_ms,
       },
       client,
     }),

@@ -41,6 +41,8 @@ export interface MemtierClientOptions {
   health_timeout_ms?: number;
   /** Timeout do recall (ms) — default 4000 (orçamento do hook). */
   recall_timeout_ms?: number;
+  /** Timeout da busca de código (ms) — default 4000 (orçamento do hook). */
+  search_timeout_ms?: number;
   /** Timeout do sync de código (ms) — default 120000 (embedding é lento). */
   sync_timeout_ms?: number;
   /** `fetch` injetável (default `globalThis.fetch`). */
@@ -52,11 +54,15 @@ export interface MemtierClientOptions {
 const DEFAULT_TIMEOUT_MS = 2000;
 const DEFAULT_HEALTH_TIMEOUT_MS = 2000;
 const DEFAULT_RECALL_TIMEOUT_MS = 4000;
+const DEFAULT_SEARCH_TIMEOUT_MS = 4000;
 const DEFAULT_SYNC_TIMEOUT_MS = 120000;
 
 /** Limites do `POST /v1/code/sync` (memtier `code.py`, NFR-09). */
 const MAX_FILES_PER_REQUEST = 100;
 const MAX_EDGES_PER_REQUEST = 5000;
+
+/** Limite de `limit` em `POST /v1/code/search` (memtier `code.py:131`). */
+const MAX_SEARCH_LIMIT = 50;
 
 /** Erro HTTP base — carrega o status para o chamador decidir. */
 export class MemtierHttpError extends Error {
@@ -159,6 +165,53 @@ export interface RecallResult {
   truncated?: boolean;
 }
 
+/**
+ * Um chunk de código devolvido por `POST /v1/code/search` (E3c). Espelha o
+ * contrato do memtier (`main.py:execute_code_search`): `path`/`symbol` identificam
+ * o trecho, `start_line`/`end_line` dão a procedência, `code` é o texto,
+ * `score`/`match` a relevância (`match ∈ vector|fulltext|hybrid`). Não há
+ * `chunk_md5` — a identidade do chunk no cliente é `path:start-end` (spec §6).
+ */
+export interface CodeChunkHit {
+  path: string;
+  symbol: string | null;
+  start_line: number;
+  end_line: number;
+  code: string;
+  score: number;
+  match: string;
+}
+
+/** Opções da busca de código (E3c). `maxTokens` liga o orçamento A1 no servidor. */
+export interface SearchCodeOpts {
+  limit?: number;
+  maxTokens?: number;
+  signal?: AbortSignal;
+}
+
+/** Resultado da busca — `tokensEstimated`/`truncated` só com `maxTokens`. */
+export interface SearchCodeResult {
+  chunks: CodeChunkHit[];
+  tokensEstimated?: number;
+  truncated?: boolean;
+}
+
+/** Corpo de `POST /v1/code/search` (aditivo E11: `program`). Nunca `labels: []`. */
+interface CodeSearchBody {
+  workspace: string;
+  program: string;
+  query: string;
+  limit?: number;
+  max_tokens?: number;
+}
+
+/** Resposta crua de `POST /v1/code/search` (snake_case do memtier). */
+interface CodeSearchResponse {
+  chunks?: CodeChunkHit[];
+  tokens_estimated?: number;
+  truncated?: boolean;
+}
+
 /** Corpo de `POST /v1/recall` (aditivo E11: `program`). */
 interface RecallBody {
   workspace: string;
@@ -184,6 +237,7 @@ export class MemtierClient {
   private readonly timeoutMs: number;
   private readonly healthTimeoutMs: number;
   private readonly recallTimeoutMs: number;
+  private readonly searchTimeoutMs: number;
   private readonly syncTimeoutMs: number;
   private readonly fetchImpl: FetchLike;
   private readonly readFileImpl: ReadFileLike;
@@ -199,6 +253,7 @@ export class MemtierClient {
     this.timeoutMs = options.timeout_ms ?? DEFAULT_TIMEOUT_MS;
     this.healthTimeoutMs = options.health_timeout_ms ?? DEFAULT_HEALTH_TIMEOUT_MS;
     this.recallTimeoutMs = options.recall_timeout_ms ?? DEFAULT_RECALL_TIMEOUT_MS;
+    this.searchTimeoutMs = options.search_timeout_ms ?? DEFAULT_SEARCH_TIMEOUT_MS;
     this.syncTimeoutMs = options.sync_timeout_ms ?? DEFAULT_SYNC_TIMEOUT_MS;
     this.fetchImpl = options.fetch ?? (globalThis.fetch as FetchLike);
     this.readFileImpl =
@@ -341,6 +396,46 @@ export class MemtierClient {
 
     const facts = Array.isArray(res.facts) ? res.facts : [];
     const result: RecallResult = { facts };
+    if (typeof res.tokens_estimated === "number") {
+      result.tokensEstimated = res.tokens_estimated;
+    }
+    if (typeof res.truncated === "boolean") result.truncated = res.truncated;
+    return result;
+  }
+
+  /**
+   * `POST /v1/code/search` (E3c-S1). Busca híbrida read-only do workspace.
+   * `limit` é limitado a `MAX_SEARCH_LIMIT` (50) — o servidor devolve **422**
+   * acima disso, então o cliente nunca manda. `labels` **nunca** é enviado (o
+   * omitir pede o default; lista vazia explícita é 422 — spec §8). Quando
+   * houver `maxTokens`, envia `max_tokens` (orçamento A1 no servidor).
+   * Lança erro tipado no HTTP não-2xx — quem chama (o hook) degrada.
+   */
+  async searchCode(
+    query: string,
+    opts: SearchCodeOpts = {},
+  ): Promise<SearchCodeResult> {
+    const identity = this.resolveIdentity();
+    const body: CodeSearchBody = {
+      workspace: identity.workspace,
+      program: identity.program,
+      query,
+    };
+    if (opts.limit !== undefined) {
+      body.limit = Math.min(opts.limit, MAX_SEARCH_LIMIT);
+    }
+    if (opts.maxTokens !== undefined) body.max_tokens = opts.maxTokens;
+
+    const res = await this.sendJson<CodeSearchResponse>(
+      "POST",
+      "/v1/code/search",
+      body,
+      this.searchTimeoutMs,
+      opts.signal,
+    );
+
+    const chunks = Array.isArray(res.chunks) ? res.chunks : [];
+    const result: SearchCodeResult = { chunks };
     if (typeof res.tokens_estimated === "number") {
       result.tokensEstimated = res.tokens_estimated;
     }
