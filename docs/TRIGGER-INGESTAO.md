@@ -278,7 +278,7 @@ idempotência é do cliente**, e o `sentBatchHashes` é essa prova.
 indefinidamente. O antecessor **não** tem política de TTL/limite. Para o
 graph-plugin isso precisa ser decidido (é dívida latente, não bloqueio).
 
-### 4.3-bis Diferença entre os dois gatilhos (regra fixada pelo dono)
+### 4.4 Os dois gatilhos acordam a MESMA rotina (regra do dono)
 
 Os dois gatilhos **não** fazem a mesma coisa:
 
@@ -481,6 +481,45 @@ nunca é processada. Confirmado no estado real, não em teoria.
   no JSON) — o gap pode ser maior.
 - Se algum mecanismo fora do arquivo reabre o `caughtUp` em runtime (procurei no
   código: `ensureBackfill` é o único, e ele exige `delta >= batchSize`).
+
+### 4.6-bis Correção factual — o OpenViking **não** protege o caso das deletadas
+
+
+#### ⚠️ Correção factual — o OpenViking **não** protege o caso das deletadas
+
+O dono afirmou: *"o `id` na `ORDER BY` resolve as mensagens deletadas, o OpenVinc
+já faz isso"*. **Medido com a query literal do OV** — não confere:
+
+```sql
+-- openviking-memory.js:1159 — o que ele realmente executa
+SELECT id, time_created, data FROM message
+WHERE session_id = ? ORDER BY time_created ASC, id ASC LIMIT n OFFSET k
+```
+
+O `id` está no `ORDER BY` (é **tiebreak** — desempata `time_created` iguais), mas o
+**avanço é `OFFSET` numérico**, isto é, **posição**. Um `OFFSET` não se importa com
+o `id`; ele conta linhas.
+
+Rodei a query exata sobre a sessão real ($n = 1.366$), com 40 linhas removidas
+antes do cursor:
+
+```
+OFFSET=100, sem remoção   → leria msg_f4b1c90f9… (pos 100)
+OFFSET=100, após remover  → leria msg_f4b2ee295… (pos 140)
+*** PULADAS PARA SEMPRE = 40 ***
+
+CONTROLE, cursor por (time_created,id) → PULADAS = 0
+```
+
+**Conclusão:** o `ORDER BY time_created, id` do OV é **melhor que nada** (evita
+empates em `time_created`), mas **não** resolve a deleção — o `OFFSET` numérico
+continua convertendo identidade em posição. A proteção real só existe se o
+`WHERE` filtrar por `(time_created, id) > (último_ts, último_id)`, sem `OFFSET`.
+
+**Impacto prático:** a lacuna é pequena **por medição** — a compactação remove do
+**fim** (histórico antigo), não do meio, e por isso o gap real observado (45 msgs)
+tem outra causa (o `caughtUp`, §4.6). Mas a classe do defeito é real e o
+graph-plugin deve usar o cursor por tupla, como o §4.5 recomendou.
 
 ## 6. Limitações conhecidas desta escolha — **anotadas, NÃO serão resolvidas agora**
 
