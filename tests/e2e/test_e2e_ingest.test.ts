@@ -27,7 +27,7 @@ import { test } from "node:test";
 
 import { MemtierClient } from "../../src/client.ts";
 import pluginModule from "../../src/index.ts";
-import { INGEST_STATE_REL_PATH, loadState } from "../../src/ingest/state.ts";
+import { INGEST_STATE_REL_PATH, loadState, saveState } from "../../src/ingest/state.ts";
 import { workspaceName } from "../../src/workspace.ts";
 
 const E2E = process.env.E2E === "1";
@@ -228,6 +228,132 @@ test(
       await new Promise((r) => setTimeout(r, 500));
       const after2 = readFileSync(statePath, "utf-8");
       assert.equal(JSON.parse(after2).sentBatchHashes.length, 1, "não deve reenviar");
+    } finally {
+      await hooks.dispose?.();
+      rmSync(base, { recursive: true, force: true });
+    }
+  },
+);
+
+/**
+ * E4-S2 — PoE do ADR-008: **reprocessar o mesmo lote NÃO aumenta o grafo**.
+ *
+ * O memtier não deduplica arestas (medido: 9→11 ao ingerir 2×). A garantia é do
+ * plugin, via `sentBatchHashes`. Aqui forçamos o cenário do L-3 (cursor voltado
+ * ao início como se o estado tivesse sido perdido) com o hash **preservado**: o
+ * lote é relido do banco, o hash barra o reenvio e as `facts` do `/v1/recall`
+ * não crescem — prova real de que o grafo não duplicou.
+ */
+test(
+  "e2e: reprocessar o mesmo lote NÃO duplica o grafo (sentBatchHashes barra)",
+  { skip: !E2E },
+  async () => {
+    assert.ok(TOKEN, "E2E_INGEST_TOKEN (ou E2E_TOKEN) é obrigatório em E2E=1");
+
+    const base = mkdtempSync(join(tmpdir(), "graph-e2e-e4c-"));
+    const dir = join(base, WS);
+    const kiloDir = join(dir, ".kilo");
+    mkdirSync(kiloDir, { recursive: true });
+    const dbPath = join(kiloDir, "kilo.db");
+    const tokenFile = join(kiloDir, "graph-key.json");
+    writeFileSync(
+      tokenFile,
+      JSON.stringify({ token: TOKEN, workspace: WS, program: PROGRAM }),
+    );
+    const sessionId = `ses_e2e_${Date.now().toString(36)}`;
+    const marker = `ZENITH_${Date.now().toString(36)}`;
+    await createKiloDb(dbPath, sessionId, marker);
+
+    const hooks = await pluginModule.server(
+      { directory: dir, worktree: null },
+      {
+        daemon: { url: MEMTIER_URL, token_file: tokenFile, program: PROGRAM, health_timeout_ms: 3000 },
+        ingest: { enabled: true, batch_size: BATCH, db_path: dbPath },
+        debug: true,
+      },
+    );
+
+    try {
+      const event = hooks.event!;
+      const statePath = join(dir, INGEST_STATE_REL_PATH);
+      const waitHash = async () => {
+        const deadline = Date.now() + 20000;
+        while (loadState(statePath).sentBatchHashes.length === 0 && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      };
+
+      // 1º envio (aceito). Espera o worker processar (efeito do outro lado).
+      await event({
+        event: { type: "message.updated", properties: { info: { sessionID: sessionId } } },
+      });
+      await waitHash();
+      const st1 = loadState(statePath);
+      assert.equal(st1.sentBatchHashes.length, 1);
+      const hash = st1.sentBatchHashes[0]!;
+      assert.ok(await waitForFact(marker), "o episódio deve aparecer no grafo");
+
+      const client = new MemtierClient({
+        url: MEMTIER_URL,
+        workspace: WS,
+        program: PROGRAM,
+        token: TOKEN,
+      });
+      // Identidade do episódio (UUIDs): reingestão das mesmas mensagens cria um
+      // episódio NOVO (ADR-008: episódios 1→2). Comparar o CONJUNTO de UUIDs é
+      // robusto a extração ainda em voo (a mesma mensagem reusa o mesmo
+      // episódio); uma duplicação introduz um UUID novo.
+      const episodeSet = async (): Promise<string[]> => {
+        const res = await client.recall(marker, { limit: 20 });
+        const ids = new Set<string>();
+        for (const f of res.facts as Array<{ episodes?: string[] }>) {
+          for (const e of f.episodes ?? []) ids.add(e);
+        }
+        return [...ids].sort();
+      };
+      // Estabiliza: o worker forma o episódio/arestas de forma assíncrona.
+      let before = await episodeSet();
+      for (let i = 0; i < 6 && before.length === 0; i++) {
+        await new Promise((r) => setTimeout(r, 10000));
+        before = await episodeSet();
+      }
+      let stable = before;
+      for (let i = 0; i < 3; i++) {
+        await new Promise((r) => setTimeout(r, 10000));
+        const s = await episodeSet();
+        if (JSON.stringify(s) === JSON.stringify(stable)) break;
+        stable = s;
+      }
+      before = stable;
+      assert.ok(before.length >= 1, "o episódio deve existir antes da releitura");
+
+      // Simula L-3 parcial: o CURSOR volta ao início (estado "perdido"), mas o
+      // `sentBatchHashes` sobrevive — é a prova de idempotência. O lote é
+      // relido; o hash barra o reenvio.
+      saveState(statePath, { sessions: {}, sentBatchHashes: [hash] });
+
+      await event({
+        event: { type: "message.updated", properties: { info: { sessionID: sessionId } } },
+      });
+      // Espera a rotina terminar (cursor volta a avançar sobre o lote).
+      const deadline = Date.now() + 20000;
+      while (!loadState(statePath).sessions[sessionId] && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      const st2 = loadState(statePath);
+      assert.equal(
+        st2.sentBatchHashes.length,
+        1,
+        "o hash já conhecido NÃO deve gerar novo envio",
+      );
+
+      // O grafo não cresceu: o mesmo conjunto de episódios (nenhum UUID novo).
+      const after = await episodeSet();
+      assert.deepEqual(
+        after,
+        before,
+        `episódios mudaram: [${before}] → [${after}] (duplicou)`,
+      );
     } finally {
       await hooks.dispose?.();
       rmSync(base, { recursive: true, force: true });

@@ -12,7 +12,11 @@
  */
 
 import { debug, logFatal } from "../logger.ts";
-import { openSqliteBackend, type SqliteBackend } from "../ingest/db.ts";
+import {
+  createBackendProvider,
+  type BackendProvider,
+  type SqliteBackend,
+} from "../ingest/db.ts";
 import {
   runIngest,
   type IngestClient,
@@ -65,24 +69,16 @@ export function ingestHook(rt: IngestHookRuntime) {
     lock,
   };
 
-  // TODO(tracer-bullet): a promessa do backend é cacheada para sempre — uma
-  // falha transitória no 1º evento (banco ainda não criado, SQLITE_BUSY) só é
-  // recuperada reiniciando o plugin, e o handle nunca é fechado no `dispose`
-  // (fd fica aberto). Retry da abertura + `close()` no shutdown é o
-  // endurecimento da E4-S2.
-  let backendPromise: Promise<SqliteBackend | null> | null = null;
-  const getBackend = (): Promise<SqliteBackend | null> => {
-    if (rt.backend) return Promise.resolve(rt.backend);
-    if (!backendPromise) {
-      backendPromise = openSqliteBackend(rt.dbPath).catch((err) => {
-        // Degradação explícita (ADR-007): sem banco, a ingestão não roda — mas
+  // Backend lazy e **retentável** (revisão adversarial da E4-S1): falha de
+  // abertura não é cacheada, e o handle é fechado no `dispose`. Backend
+  // injetado (teste) tem precedência e é embrulhado num provedor trivial.
+  const provider: BackendProvider = rt.backend
+    ? { get: async () => rt.backend!, close: () => {} }
+    : createBackendProvider(rt.dbPath, {
+        // Degradação explícita (ADR-007): sem banco a ingestão não roda — mas
         // nunca é silencioso.
-        logFatal(`ingest open db (${rt.dbPath})`, err);
-        return null;
+        onError: (err) => logFatal(`ingest open db (${rt.dbPath})`, err),
       });
-    }
-    return backendPromise;
-  };
 
   return {
     event: async (input: { event: unknown }): Promise<void> => {
@@ -91,12 +87,18 @@ export function ingestHook(rt: IngestHookRuntime) {
       if (event.type !== "message.updated") return;
       const sessionId = sessionIdFromEvent(event);
       if (!sessionId) return;
-      const backend = await getBackend();
-      if (!backend) return;
+      let backend: SqliteBackend;
+      try {
+        backend = await provider.get();
+      } catch {
+        // Já logado pelo `onError`; o próximo evento tenta abrir de novo.
+        return;
+      }
       debug(`ingest wake session=${sessionId}`);
       // Background: o evento NUNCA espera a ingestão (FR-203). `runIngest`
       // engole os erros; a promessa não é drenada no shutdown.
       void runIngest(routineRt, backend, sessionId);
     },
+    dispose: (): void => provider.close(),
   };
 }

@@ -21,7 +21,7 @@ import {
 } from "../client.ts";
 import { debug, log, logFatal } from "../logger.ts";
 import { buildBatch, shouldSend } from "./batch.ts";
-import { readBatch, type SqliteBackend } from "./db.ts";
+import { IngestReadError, readBatch, type SqliteBackend } from "./db.ts";
 import {
   hasSentBatch,
   loadState,
@@ -81,6 +81,12 @@ export function logIngestFailure(err: unknown): void {
     logFatal(`ingest (${err.status})`, err);
     return;
   }
+  if (err instanceof IngestReadError) {
+    // Leitura do banco falhou (transitório): nada foi enviado nem perdido — o
+    // próximo gatilho relê. Degrada em log, nunca fatal (NFR-03).
+    log("ingest: banco indisponível; lote não enviado (retry no próximo gatilho)");
+    return;
+  }
   logFatal("ingest", err);
 }
 
@@ -103,6 +109,9 @@ export async function ingestOnce(
     sessionId,
     prev,
     rt.cfg.batch_size,
+    // Linha "veneno" (`data` não-JSON): avança o cursor (é irrecuperável), mas
+    // deixa rastro — nunca silenciosa (revisão adversarial da E4-S1).
+    (msgId) => log(`ingest: linha ilegível ignorada id=${msgId} session=${sessionId}`),
   );
 
   if (rows === 0) {

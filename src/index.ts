@@ -103,6 +103,19 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
     timeout_ms: config.mcp.timeout_ms,
   });
 
+  // E4: ingestion hooks. Construído fora do objeto de retorno para que o
+  // `dispose` (que fecha o handle do SQLite) seja referenciável no shutdown.
+  const ingestHooks = ingestHook({
+    cfg: {
+      enabled: config.ingest.enabled,
+      batch_size: config.ingest.batch_size,
+      max_hashes: config.ingest.max_hashes,
+    },
+    dbPath: config.ingest.db_path || findKiloDb(dir),
+    statePath: join(dir, INGEST_STATE_REL_PATH),
+    client,
+  });
+
   return {
     // E2: injeção de memória no turno (`messages.transform`). Só quando
     // `inject.enabled` (default `false`); o hook degrada sem quebrar o turno.
@@ -130,22 +143,14 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
     // E4: ingestão assíncrona — `message.updated` (S1) e `session.idle` (S3)
     // acordam a MESMA rotina; o conteúdo vem do `kilo.db` (ADR-007). O evento
     // nunca é `await` (não bloqueia o turno, FR-203). Desligado por default.
-    ...ingestHook({
-      cfg: {
-        enabled: config.ingest.enabled,
-        batch_size: config.ingest.batch_size,
-        max_hashes: config.ingest.max_hashes,
-      },
-      dbPath: config.ingest.db_path || findKiloDb(dir),
-      statePath: join(dir, INGEST_STATE_REL_PATH),
-      client,
-    }),
-    // `dispose` drena o health do boot (curto, com `AbortSignal.timeout`). A
-    // coleta (E3a) é background e NÃO é drenada — o job do indexer pode ser
-    // longo (FR-510). O registro do MCP (E3b) também é background: não é
-    // drenado (não segura o shutdown). Ingestão (E4) entra na sua epic.
+    ...ingestHooks,
+    // `dispose` drena o health do boot (curto, com `AbortSignal.timeout`) e
+    // fecha o handle do SQLite da ingestão (E4). A coleta (E3a) é background e
+    // NÃO é drenada — o job do indexer pode ser longo (FR-510). O registro do
+    // MCP (E3b) também é background: não é drenado (não segura o shutdown).
     dispose: async () => {
       debug("dispose");
+      ingestHooks.dispose();
       // A coleta é background (FR-510): o dispose não a espera — drenar o job
       // do indexer poderia segurar o shutdown por todo o timeout do job. O
       // health do boot é curto e tem `AbortSignal.timeout`, então é drenado.

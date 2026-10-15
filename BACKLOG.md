@@ -79,7 +79,7 @@ Convenções válidas para todas as epics:
 > idempotência estão em **`docs/adr/007`** e **`docs/adr/008`**; a decomposição
 > em **`specs/e4-stories.md`**. O memtier **não muda**.
 - [x] **E4-S1** — Tracer bullet: ler o `kilo.db` (user+assistant) → 1 lote real → `/v1/ingest`
-- [ ] **E4-S2** — Endurecer: cursor por `(time_created, id)` + `sentBatchHashes` (idempotência)
+- [x] **E4-S2** — Endurecer: cursor por `(time_created, id)` + `sentBatchHashes` (idempotência)
 - [ ] **E4-S3** — `session.idle` drena tudo + o resto (mesma rotina; trava por sessão)
 - [ ] **E4-S4** — Limitações L-1/L-2/L-3 como critério de aceite (decisão do dono)
 - [ ] **E4-S5** — Fechamento: E2E real, docs coerentes, zero marcadores
@@ -585,3 +585,31 @@ redescobertas no meio do loop.
      mínima por desenho.
   7. `rg "TODO\(tracer-bullet\)" src/` → **6** marcadores (todos da E4, cada um
      mapeado à story que o resolve). O épico só fecha quando zerar.
+
+- **2026-10-15 — E4-S2 (endurecer cursor + idempotência).** Sobre a base da S1,
+  sem rewrite.
+  1. **Discriminação do `OFFSET`** (padrão E3a/E3b): dois testes provam que o
+     cursor por `(time_created, id)` não pula. O de banco **falso** reproduz o
+     defeito medido (remover 20 linhas antes do cursor ⇒ o `OFFSET` numérico
+     retoma 20 posições adiante; o cursor por tupla retoma na linha seguinte). O
+     de **SQLite real** (`node:sqlite`) reproduz a prova do ADR-008: 40 linhas
+     removidas antes do cursor ⇒ `PULADAS = 0`.
+  2. **Falha de leitura transitória** (defeito da revisão adversarial da S1):
+     `readBatch` agora **lança** `IngestReadError` quando a query de `message`
+     ou de `part` falha (SQLITE_BUSY/WAL), em vez de tratar como "sem texto" e
+     avançar o cursor — a mensagem é relida no próximo gatilho. A rotina degrada
+     em log (nunca fatal) e **não envia** lote incompleto.
+  3. **Linha veneno** (`data` não-JSON): avança (é irrecuperável) mas é
+     **registrada** (`ingest: linha ilegível ignorada id=…`), nunca silenciosa.
+  4. **Backend retentável + `close()`**: `createBackendProvider` não cacheia
+     falha de abertura (o próximo evento tenta de novo — antes ficava inutilizado
+     até um restart) e o `dispose` do plugin fecha o handle. (Defeitos F6/F10 da
+     revisão.)
+  5. **Semântica do limiar** (`rows`, não mensagens com texto) **pinada por
+     teste** e documentada como sanção do ADR-007 §4.4 (idêntica ao antecessor).
+  6. **E2E real** (gated `E2E=1`): novo caso "reprocessar o mesmo lote NÃO
+     duplica o grafo" — força o cenário do L-3 (cursor ao início, hash preservado)
+     e prova, pelo conjunto de **UUIDs de episódio** do `/v1/recall`, que o grafo
+     não cresce. Mesma suíte: 3/3 verdes contra o memtier vivo.
+  7. Unit **277 · 264 pass · 0 fail · 13 skip**; `tsc --noEmit` limpo.
+     `rg "TODO\(tracer-bullet\)" src/` → **1** (o reset do L-3, que é da S4).

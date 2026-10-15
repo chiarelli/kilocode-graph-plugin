@@ -73,14 +73,15 @@ export function buildBatch(messages: IngestMessage[]): Batch {
 /**
  * Limiar do gatilho `message.updated`: só envia quando o banco tem lote **cheio**
  * (`rows >= batchSize`). Abaixo do limiar, nada é enviado — o resto é drenado no
- * `session.idle` (E4-S3). `rows` é o nº de LINHAS lidas, não de mensagens com
- * texto (senão uma janela de mensagens sem texto travaria o gatilho).
+ * `session.idle` (E4-S3).
  *
- * TODO(tracer-bullet): o `batch_size` do dono é "**20 mensagens**", mas medido no
- * banco real uma janela de 20 LINHAS traz só ~2 com texto (assistant:user ≈ 18:1,
- * 7.998/16.728 com `text`) ⇒ o lote enviado sai bem menor que 20. Decidir se o
- * limiar conta linhas (avança) ou mensagens com texto (acumula até 20) é o
- * endurecimento da E4-S2 — o `readBatch` da S2 precisa ler adiante.
+ * `rows` é o nº de **LINHAS** lidas (`message`), não de mensagens com texto —
+ * sanção do ADR-007 §4.4 ("pendentes" = mensagens da sessão menos o cursor) e
+ * idêntico ao antecessor (`messagesFromDb` lê linhas; `buildBatchItems` descarta
+ * as sem texto **depois**). Contar só as com texto travaria o gatilho numa janela
+ * sem texto. Consequência medida no `kilo.db` real (assistant:user ≈ 18:1; só
+ * 7.998/16.728 linhas têm `text`): uma janela de 20 linhas costuma render ~2
+ * mensagens no episódio — comportamento do antecessor, pinado por teste.
  */
 export function shouldSend(rows: number, batchSize: number): boolean {
   return batchSize > 0 && rows >= batchSize;

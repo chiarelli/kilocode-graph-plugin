@@ -25,9 +25,11 @@ import {
   shouldSend,
 } from "../src/ingest/batch.ts";
 import {
+  createBackendProvider,
   DEFAULT_DB_PATH,
   fakeBackend,
   findKiloDb,
+  IngestReadError,
   readBatch,
   type DbRow,
   type IngestMessage,
@@ -616,6 +618,313 @@ test("client_ingest_infra: 503 ⇒ InfraError", async () => {
     fetch: stubFetch(503, { detail: "fila down" }),
   });
   await assert.rejects(() => client.ingest("x"), (e: unknown) => e instanceof InfraError);
+});
+
+// ---------------------------------------------------------------------------
+// E4-S2 — cursor por identidade + idempotência
+// ---------------------------------------------------------------------------
+
+/**
+ * DISCRIMINAÇÃO do OFFSET (padrão E3a/E3b): reproduz o defeito medido no
+ * antecessor. Um cursor **posicional** (`LIMIT n OFFSET k`) pula mensagens
+ * quando linhas antes do cursor são removidas (compactação); o cursor por
+ * **tupla** `(time_created, id)` não. Se alguém reintroduzir `OFFSET` no
+ * `readBatch`, este teste **reprova**.
+ *
+ * Dataset: 100 mensagens `(ts, id)`; o cursor já leu até a posição 50; então 20
+ * linhas ANTES do cursor são removidas (compactação); quem lê a seguir?
+ */
+test("s2_offset_regression: cursor posicional PULA após remoção; tupla NÃO (discriminação)", () => {
+  const all = genMsgs(100, 1000);
+  const readCursor = { last_ts: all[49]!.time_created, last_id: all[49]!.id };
+
+  // Cenário: 20 linhas antes do cursor foram removidas (compactação).
+  const remaining = all.filter((m) => !(m.time_created >= 1030 && m.time_created < 1050));
+
+  // (a) Abordagem DEFEITUOSA: posição numérica. O cursor está em "posição 50";
+  // ao remover 20 linhas antes dele, a posição 50 do conjunto encolhido aponta
+  // 20 mensagens ADIANTE ⇒ as mensagens logo após o cursor são puladas.
+  const posRead = remaining.slice(50, 55); // o OV avança `OFFSET` numérico
+  assert.deepEqual(
+    posRead.map((m) => m.time_created),
+    [1070, 1071, 1072, 1073, 1074],
+    "OFFSET numérico retoma 20 posições adiante (defeito medido): as 5 seguintes saíram",
+  );
+  const posSkipped = remaining.filter(
+    (m) => m.time_created > readCursor.last_ts && m.time_created < posRead[0]!.time_created,
+  );
+  assert.equal(posSkipped.length, 20, "OFFSET numérico PULA 20 mensagens (defeito medido)");
+
+  // (b) Abordagem CORRETA: tupla `(time_created, id)`. Nada é pulado.
+  const backend = makeBackend(remaining);
+  const read = readBatch(backend, "ses_a", readCursor, 5);
+  assert.deepEqual(
+    read.messages.map((m) => m.time_created),
+    [1050, 1051, 1052, 1053, 1054],
+    "o cursor por tupla retoma exatamente na linha seguinte ao cursor",
+  );
+});
+
+test("s2_read_error_does_not_advance: falha ao ler os `part` NÃO avança o cursor", () => {
+  const base = makeBackend(genMsgs(20, 1000));
+  let partCalls = 0;
+  // Primeira leitura dos `part` falha (SQLITE_BUSY/WAL); as seguintes funcionam.
+  const flaky: SqliteBackend = {
+    query: (sql, params) => {
+      if (sql.includes("FROM part")) {
+        partCalls++;
+        if (partCalls === 1) throw new Error("SQLITE_BUSY: database is locked");
+      }
+      return base.query(sql, params);
+    },
+    close: () => {},
+  };
+
+  assert.throws(
+    () => readBatch(flaky, "ses_a", { last_ts: 0, last_id: "" }, 20),
+    (e: unknown) => e instanceof IngestReadError,
+    "leitura de `part` indisponível deve lançar IngestReadError (transitório)",
+  );
+
+  // A retentativa (agora o banco respondeu) recupera as MESMAS mensagens —
+  // prova de que o cursor não avançou sobre o lote que falhou.
+  const read = readBatch(flaky, "ses_a", { last_ts: 0, last_id: "" }, 20);
+  assert.equal(read.messages.length, 20);
+  assert.equal(read.messages[0]!.content, "texto 0");
+});
+
+test("s2_ingest_read_error_degrades_without_sending: rotina loga e não envia", async () => {
+  const { statePath, cleanup } = tmpState();
+  try {
+    const base = makeBackend(genMsgs(20, 1000));
+    const flaky: SqliteBackend = {
+      query: (sql, params) => {
+        if (sql.includes("FROM part")) throw new Error("disk I/O error");
+        return base.query(sql, params);
+      },
+      close: () => {},
+    };
+    const { client, calls } = stubClient(async () => ({ job_id: "j" }));
+    await assert.doesNotReject(() => runIngest(rt(statePath, client), flaky, "ses_a"));
+    assert.equal(calls.length, 0, "lote incompleto não pode ser enviado");
+    assert.deepEqual(loadState(statePath).sessions, {}, "cursor não avançou");
+  } finally {
+    cleanup();
+  }
+});
+
+test("s2_poison_row_logged: linha com `data` não-JSON avança mas deixa rastro", () => {
+  const msgs = genMsgs(3, 1000);
+  const backend = fakeBackend((sql: string, params: unknown[]): DbRow[] => {
+    if (sql.includes("FROM message")) {
+      const [sid, ts, ts2, id, limit] = params as [string, number, number, string, number];
+      const rows = [
+        { id: msgs[0]!.id, session_id: sid, time_created: 1000, data: JSON.stringify({ role: "user" }) },
+        { id: "msg_poison", session_id: sid, time_created: 1001, data: "{nao-e-json" },
+        { id: msgs[2]!.id, session_id: sid, time_created: 1002, data: JSON.stringify({ role: "assistant" }) },
+      ];
+      return rows
+        .filter(
+          (m) =>
+            (m.time_created as number) > ts ||
+            ((m.time_created as number) === ts2 && (m.id as string) > id),
+        )
+        .slice(0, limit);
+    }
+    if (sql.includes("FROM part")) {
+      const mid = params[0] as string;
+      return [{ data: JSON.stringify({ type: "text", text: `txt ${mid}` }) }];
+    }
+    return [];
+  });
+  const poisoned: string[] = [];
+  const read = readBatch(backend, "ses_a", { last_ts: 0, last_id: "" }, 10, (id) =>
+    poisoned.push(id),
+  );
+  assert.deepEqual(poisoned, ["msg_poison"], "a linha veneno deve ser reportada");
+  // Avança o cursor (irrecuperável) e não vira mensagem.
+  assert.deepEqual(read.last, { last_ts: 1002, last_id: msgs[2]!.id });
+  assert.equal(read.messages.some((m) => m.id === "msg_poison"), false);
+  // Segundo run não relê a veneno (cursor já passou) — não é retrabalho eterno.
+  const again = readBatch(backend, "ses_a", read.last!, 10, (id) => poisoned.push(id));
+  assert.deepEqual(poisoned, ["msg_poison"]);
+  assert.equal(again.rows, 0);
+});
+
+test("s2_restart_no_resend: estado em disco ⇒ novo runtime NÃO reenvia o já enviado", async () => {
+  const { statePath, cleanup } = tmpState();
+  try {
+    const backend = makeBackend(genMsgs(20, 1000));
+    const first = stubClient(async () => ({ job_id: "j1" }));
+    const firstOutcome = await ingestOnce(rt(statePath, first.client), backend, "ses_a");
+    assert.equal(firstOutcome.sent, true);
+    assert.equal(first.calls.length, 1);
+
+    // Simula RESTART: runtime e trava novos, MESMO arquivo de estado. O cursor
+    // já cobriu as 20 mensagens ⇒ nenhum pendente ⇒ nenhum envio.
+    const second = stubClient(async () => ({ job_id: "j2" }));
+    const secondOutcome = await runIngest(rt(statePath, second.client), backend, "ses_a");
+    void secondOutcome;
+    assert.equal(second.calls.length, 0, "restart não pode reenviar o lote já aceito");
+
+    // E mesmo reenviando um gatilho abaixo do limiar, nada sai.
+    await runIngest(rt(statePath, second.client), backend, "ses_a");
+    assert.equal(second.calls.length, 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("s2_hash_recorded_only_after_accept: falha do envio não grava hash (retry possível)", async () => {
+  const { statePath, cleanup } = tmpState();
+  try {
+    const backend = makeBackend(genMsgs(20, 1000));
+    let fail = true;
+    const calls: string[] = [];
+    const client = {
+      ingest: async (body: string) => {
+        calls.push(body);
+        if (fail) throw new InfraError(503, "fila down");
+        return { job_id: "j" };
+      },
+    };
+    await assert.doesNotReject(() => runIngest(rt(statePath, client), backend, "ses_a"));
+    assert.equal(calls.length, 1);
+    // Nada persistido: sem hash e sem cursor ⇒ o próximo gatilho relê e reenvia.
+    assert.deepEqual(loadState(statePath), emptyState());
+
+    fail = false;
+    await runIngest(rt(statePath, client), backend, "ses_a");
+    assert.equal(calls.length, 2, "após o 202 o mesmo lote é reenviado (nada foi gravado)");
+    const st = loadState(statePath);
+    assert.equal(st.sentBatchHashes.length, 1, "hash gravado só após o aceite");
+    assert.ok(st.sessions.ses_a, "cursor avança junto com o hash");
+  } finally {
+    cleanup();
+  }
+});
+
+/**
+ * DISCRIMINAÇÃO do OFFSET contra SQLite REAL (`node:sqlite`): a prova do
+ * ADR-008 reproduzida — remover 40 linhas ANTES do cursor. Com cursor por
+ * tupla, `PULADAS = 0`; com `OFFSET` numérico, as mensagens que "desceram"
+ * ficariam para sempre atrás do cursor.
+ */
+test("s2_offset_regression_realsqlite: remoção antes do cursor ⇒ PULADAS=0 (real)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "graph-ingest-sql-"));
+  const dbPath = join(dir, "kilo.db");
+  try {
+    const spec = "node:sqlite";
+    const { DatabaseSync } = (await import(spec)) as {
+      DatabaseSync: new (p: string) => {
+        exec: (s: string) => void;
+        prepare: (s: string) => { run: (...a: unknown[]) => void; all: (...a: unknown[]) => DbRow[] };
+        close: () => void;
+      };
+    };
+    const db = new DatabaseSync(dbPath);
+    db.exec(
+      "CREATE TABLE message (id TEXT, session_id TEXT, time_created INTEGER, data TEXT);",
+    );
+    db.exec(
+      "CREATE TABLE part (id TEXT, message_id TEXT, data TEXT);",
+    );
+    const insM = db.prepare(
+      "INSERT INTO message (id, session_id, time_created, data) VALUES (?,?,?,?)",
+    );
+    const insP = db.prepare("INSERT INTO part (id, message_id, data) VALUES (?,?,?)");
+    for (let i = 0; i < 100; i++) {
+      insM.run(`msg_${String(i).padStart(3, "0")}`, "ses_a", 1000 + i, JSON.stringify({ role: "user" }));
+      insP.run(`p_${i}`, `msg_${String(i).padStart(3, "0")}`, JSON.stringify({ type: "text", text: `t${i}` }));
+    }
+    // Cursor já leu até a posição 50 (ts=1049).
+    const cursor = { last_ts: 1049, last_id: "msg_049" };
+    // Compactação remove 40 linhas ANTES do cursor (posições 20..59).
+    db.exec("DELETE FROM message WHERE time_created >= 1020 AND time_created < 1060");
+
+    const backend: SqliteBackend = {
+      query: (sql, params) => db.prepare(sql).all(...params),
+      close: () => db.close(),
+    };
+    const first = readBatch(backend, "ses_a", cursor, 1000);
+    // Nenhuma mensagem PULADA: a primeira lida é a imediatamente após o cursor
+    // (ts=1060). As remoções não deslocam a identidade.
+    assert.equal(first.messages[0]!.time_created, 1060, "deve retomar em ts=1060 (PULADAS=0)");
+    assert.equal(first.messages[0]!.id, "msg_060");
+    // Todas as mensagens com ts > cursor continuam alcançáveis (nenhum buraco).
+    assert.equal(first.messages.length, 40);
+    db.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("s2_backend_provider_retries_after_failure: falha de abertura NÃO é cacheada", async () => {
+  let attempts = 0;
+  const fake: SqliteBackend = { query: () => [], close: () => {} };
+  const provider = createBackendProvider("/missing/kilo.db", {
+    open: async () => {
+      attempts++;
+      if (attempts === 1) throw new Error("ENOENT: banco ainda não existe");
+      return fake;
+    },
+  });
+  await assert.rejects(() => provider.get(), /ENOENT/);
+  // A 2ª tentativa abre de verdade (antes, a promessa rejeitada ficava cacheada
+  // para sempre — a ingestão só voltaria reiniciando o plugin).
+  assert.equal(await provider.get(), fake);
+  assert.equal(attempts, 2);
+});
+
+test("s2_backend_provider_close: fecha o handle uma vez e não relança", async () => {
+  let closed = 0;
+  const fake: SqliteBackend = { query: () => [], close: () => { closed++; } };
+  const provider = createBackendProvider("/ok", { open: async () => fake });
+  const b1 = await provider.get();
+  assert.equal(b1, fake);
+  assert.equal(await provider.get(), fake, "handle é reusado enquanto aberto");
+  provider.close();
+  assert.equal(closed, 1);
+  // Fechar duas vezes não relança nem fecha novamente.
+  provider.close();
+  assert.equal(closed, 1);
+});
+
+test("s2_backend_provider_close_never_throws: erro do close não derruba o shutdown", () => {
+  const provider = createBackendProvider("/x", { open: async () => ({ query: () => [], close: () => { throw new Error("boom"); } }) });
+  assert.doesNotThrow(() => provider.close());
+});
+
+test("s2_hook_dispose_closes_backend: o hook expõe `dispose` que fecha o provedor", async () => {
+  const { statePath, cleanup } = tmpState();
+  try {
+    let closed = 0;
+    const fake: SqliteBackend = { query: () => [], close: () => { closed++; } };
+    const { client } = stubClient(async () => ({ job_id: "j" }));
+    const hooks = ingestHook({
+      cfg: { enabled: true, batch_size: 20, max_hashes: 5000 },
+      dbPath: "ignored",
+      statePath,
+      client,
+      backend: fake,
+    });
+    assert.equal(typeof hooks.dispose, "function");
+    // O backend INJETADO é embrulhado num provedor trivial (close no-op) — o
+    // importante é que `dispose` exista e não lance. O provedor real é coberto
+    // acima.
+    hooks.dispose();
+    assert.equal(closed, 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("s2_rows_threshold_semantics: limiar conta LINHAS (sanção ADR-007 §4.4), pinado", () => {
+  // 20 linhas com só 1 texto ainda dispara (o lote sai com 1 mensagem) — este é
+  // o comportamento do antecessor e do ADR-007; o teste o pinça para que uma
+  // mudança futura de semântica seja intencional, não acidental.
+  assert.equal(shouldSend(20, 20), true);
+  assert.equal(shouldSend(19, 20), false);
 });
 
 // ---------------------------------------------------------------------------

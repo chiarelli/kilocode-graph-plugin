@@ -147,35 +147,101 @@ export async function openSqliteBackend(dbPath: string): Promise<SqliteBackend> 
   throw new Error(`nenhum backend SQLite disponível para ${dbPath}`);
 }
 
+/**
+ * Provedor do backend com **abertura lazy e retentável**. Um `kilo.db` ainda
+ * não criado no 1º evento (ou um `SQLITE_BUSY` transitório) não pode inutilizar
+ * a ingestão até o próximo restart (defeito medido na revisão adversarial da
+ * E4-S1): a falha **não** é cacheada — a próxima chamada tenta abrir de novo. O
+ * handle é fechado por `close()`, que o `dispose` do plugin drena.
+ */
+export interface BackendProvider {
+  get(): Promise<SqliteBackend>;
+  close(): void;
+}
+
+/** Provedor real (abre `dbPath` sob demanda); `open`/`onError` injetáveis. */
+export function createBackendProvider(
+  dbPath: string,
+  opts: {
+    open?: (p: string) => Promise<SqliteBackend>;
+    onError?: (err: unknown) => void;
+  } = {},
+): BackendProvider {
+  const open = opts.open ?? openSqliteBackend;
+  let current: SqliteBackend | null = null;
+  let inflight: Promise<SqliteBackend> | null = null;
+  return {
+    get: async () => {
+      if (current) return current;
+      if (!inflight) {
+        inflight = open(dbPath)
+          .then((b) => {
+            current = b;
+            return b;
+          })
+          .catch((err) => {
+            // Não cacheia a falha: a próxima chamada tenta de novo.
+            inflight = null;
+            opts.onError?.(err);
+            throw err;
+          });
+      }
+      return inflight;
+    },
+    close: () => {
+      const b = current;
+      current = null;
+      inflight = null;
+      if (b) {
+        try {
+          b.close();
+        } catch {
+          // Fechar nunca pode derrubar o shutdown (NFR-03).
+        }
+      }
+    },
+  };
+}
+
 /** `true` quando o rolê é user/assistant (o gatilho não filtra, o leitor sim). */
 function isIngestRole(role: unknown): role is "user" | "assistant" {
   return role === "user" || role === "assistant";
 }
 
-/** Texto dos `part` de tipo `text` de uma mensagem (injetável p/ teste). */
+/**
+ * Falha ao ler o banco (backend ocupado/WAL, arquivo travado). É **transitória**
+ * por natureza: a leitura aborta e o cursor **não** avança, para o próximo
+ * gatilho reler as mesmas mensagens. Distinta de "mensagem sem texto" (que
+ * avança) — confundir as duas perde mensagens para sempre (defeito medido na
+ * revisão adversarial da E4-S1).
+ */
+export class IngestReadError extends Error {
+  constructor(message: string, cause?: unknown) {
+    super(message, { cause });
+    this.name = "IngestReadError";
+  }
+}
+
+/**
+ * Texto dos `part` de tipo `text` de uma mensagem. Lança quando a consulta dos
+ * `part` falha (banco ocupado/WAL): o chamador NÃO pode tratar isso como "sem
+ * texto" — senão o cursor avança e a mensagem é perdida para sempre (defeito
+ * medido na revisão adversarial da E4-S1).
+ */
 function reconstructContent(
   backend: SqliteBackend,
   msgId: string,
-  parsed: { role?: unknown; mode?: unknown; summary?: { diffs?: unknown } },
+  parsed: { role?: unknown; mode?: unknown; summary?: unknown },
 ): string {
+  // Compactação: o antecessor devolve o marcador literal e **não** consulta os
+  // `part` (vazios). `summary` é um booleano no banco real — não há resumo a
+  // extrair. Mantido idêntico ao antecessor para não divergir do corpus dele.
   if (parsed.role === "assistant" && parsed.mode === "compaction") {
-    // TODO(tracer-bullet): placeholder idêntico para toda compactação (40 linhas
-    // no banco real) ⇒ várias mensagens com o MESMO conteúdo colidem no
-    // `batchHash` e o lote pode ser deduplicado indevidamente. A linha traz um
-    // `summary` real (hoje descartado) — extraí-lo (ou dar identidade a cada
-    // mensagem) é o endurecimento da E4-S2.
     return "[session compacted]";
   }
-  let rows: DbRow[];
-  try {
-    rows = backend.query("SELECT data FROM part WHERE message_id = ?", [msgId]);
-  } catch {
-    // TODO(tracer-bullet): falha transitória do `part` (SQLITE_BUSY/WAL) é
-    // tratada como "sem texto" e o cursor avança — perde a mensagem. Distinguir
-    // "sem texto" de "ilegível" e NÃO avançar (retry no próximo gatilho) é o
-    // endurecimento da E4-S2.
-    rows = [];
-  }
+  // Sem `try/catch`: erro de leitura propaga como `IngestReadError` (abaixo),
+  // distinguindo "sem texto" de "não consegui ler".
+  const rows = backend.query("SELECT data FROM part WHERE message_id = ?", [msgId]);
   const texts: string[] = [];
   for (const r of rows) {
     const raw = r.data;
@@ -191,9 +257,12 @@ function reconstructContent(
     }
   }
   if (texts.length > 0) return texts.join("\n");
-  // Fallback do antecessor: mensagem de usuário pode trazer o texto nos diffs.
-  if (parsed.role === "user" && Array.isArray(parsed.summary?.diffs)) {
-    return parsed.summary.diffs.filter((d): d is string => typeof d === "string").join("\n");
+  // Fallback do antecessor: mensagem de usuário pode trazer o texto nos diffs
+  // (`summary.diffs`); no banco real `summary` é booleano, então o guard de array
+  // segue valendo (defensivo, nunca dispara hoje).
+  const summary = parsed.summary as { diffs?: unknown } | undefined;
+  if (parsed.role === "user" && Array.isArray(summary?.diffs)) {
+    return summary.diffs.filter((d): d is string => typeof d === "string").join("\n");
   }
   return "";
 }
@@ -209,14 +278,22 @@ export function readBatch(
   sessionId: string,
   cursor: SessionCursor,
   limit: number,
+  onPoison?: (msgId: string) => void,
 ): ReadBatch {
-  const rows = backend.query(
-    "SELECT id, time_created, data FROM message " +
-      "WHERE session_id = ? " +
-      "AND (time_created > ? OR (time_created = ? AND id > ?)) " +
-      "ORDER BY time_created ASC, id ASC LIMIT ?",
-    [sessionId, cursor.last_ts, cursor.last_ts, cursor.last_id, limit],
-  );
+  let rows: DbRow[];
+  try {
+    rows = backend.query(
+      "SELECT id, time_created, data FROM message " +
+        "WHERE session_id = ? " +
+        "AND (time_created > ? OR (time_created = ? AND id > ?)) " +
+        "ORDER BY time_created ASC, id ASC LIMIT ?",
+      [sessionId, cursor.last_ts, cursor.last_ts, cursor.last_id, limit],
+    );
+  } catch (err) {
+    // Leitura do banco falhou (ocupado/WAL): aborta SEM avançar o cursor — o
+    // próximo gatilho relê o mesmo lote (nada é perdido nem enviado).
+    throw new IngestReadError(`leitura de message falhou (${sessionId})`, err);
+  }
 
   const messages: IngestMessage[] = [];
   let last: SessionCursor | null = null;
@@ -224,26 +301,48 @@ export function readBatch(
     const id = typeof row.id === "string" ? row.id : "";
     const ts = typeof row.time_created === "number" ? row.time_created : Number(row.time_created);
     if (!id || !Number.isFinite(ts)) continue;
-    last = { last_ts: ts, last_id: id };
 
     const raw = row.data;
-    if (typeof raw !== "string") continue;
-    let parsed: { role?: unknown; mode?: unknown; summary?: { diffs?: unknown } };
+    if (typeof raw !== "string") {
+      // Rolê sem payload textual: não há conteúdo a ler; avança (não trava).
+      last = { last_ts: ts, last_id: id };
+      continue;
+    }
+    let parsed: { role?: unknown; mode?: unknown; summary?: unknown };
     try {
       parsed = JSON.parse(raw) as typeof parsed;
     } catch {
-      // TODO(tracer-bullet): linha com `data` ilegível avança o cursor em
-      // silêncio (nem `debug`). Registrar e decidir skip×retry (linha veneno não
-      // pode ser invisível) é o endurecimento da E4-S2.
+      // Linha "veneno": o `data` não é JSON. Não é recuperável reprocessando
+      // (o conteúdo é irrecuperável de fato), então o cursor avança — mas é
+      // **registrado**, nunca silencioso.
+      last = { last_ts: ts, last_id: id };
+      onPoison?.(id);
       continue;
     }
-    if (!isIngestRole(parsed.role)) continue;
-    const content = reconstructContent(backend, id, parsed);
+    if (!isIngestRole(parsed.role)) {
+      last = { last_ts: ts, last_id: id };
+      continue;
+    }
+    let content: string;
+    try {
+      content = reconstructContent(backend, id, parsed);
+    } catch (err) {
+      // Os `part` não puderam ser lidos: NÃO avança o cursor (nem marca este
+      // rolê como lido) — a mensagem será relida no próximo gatilho. Lança para
+      // a rotina degradar sem enviar um lote incompleto.
+      throw new IngestReadError(`leitura de part falhou (${msgIdSafe(id)})`, err);
+    }
+    last = { last_ts: ts, last_id: id };
     if (!content) continue;
     messages.push({ id, role: parsed.role, content, time_created: ts });
   }
 
   return { messages, last, rows: rows.length };
+}
+
+/** ID para mensagem de erro (o próprio id já é string; guarda contra vazio). */
+function msgIdSafe(id: string): string {
+  return id || "?";
 }
 
 /** Leitor de arquivo injetável (mantido para testes/uso futuro). */
