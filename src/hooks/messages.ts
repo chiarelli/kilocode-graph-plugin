@@ -22,16 +22,22 @@
 
 import { AuthError, InfraError } from "../client.ts";
 import { debug, log, logFatal } from "../logger.ts";
+import { applyJointBudget, type JointBudget } from "../inject/budget.ts";
 import {
   MemoryInjector,
+  formatMemoryBlock,
+  type MemoryPrep,
   type RecallClient,
   type RecallConfig,
 } from "../inject/memory.ts";
 import {
-  searchAndFormat,
+  CodeInjector,
+  formatCodeBlock,
   type CodeConfig,
+  type CodePrep,
   type SearchClient,
 } from "../inject/code.ts";
+import type { CodeChunkHit, Fact } from "../client.ts";
 
 /** Um `Part` do turno, na forma mínima que a injeção consome. */
 export interface TransformPart {
@@ -161,45 +167,6 @@ export async function injectMemoryIntoMessages(
   appendContextPart(parts, injection.block);
 }
 
-/**
- * Corpo da injeção de CÓDIGO (E3c-S1): busca híbrida no memtier e injeta o bloco
- * como **part separado** (sentinela `graph-code`). **Nunca lança** — qualquer
- * falha vira "segue sem código" (NFR-03).
- *
- * TODO(tracer-bullet): rodar em PARALELO com o recall (`Promise.allSettled`) e o
- * dedup por turno do chunk entram na E3c-S2; aqui a busca é sequencial e sem
- * estado.
- */
-export async function injectCodeIntoMessages(
-  messages: TransformMessage[],
-  codeEnabled: boolean,
-  client: SearchClient,
-  cfg: CodeConfig,
-): Promise<void> {
-  if (!codeEnabled) return;
-
-  const lastUserIdx = lastUserMessageIndex(messages);
-  if (lastUserIdx === -1) return;
-
-  const parts = messages[lastUserIdx]?.parts;
-  if (!parts) return;
-
-  const text = extractUserText(parts);
-  if (!text.trim()) return;
-
-  let block: string | null;
-  try {
-    block = await searchAndFormat(client, cfg, text);
-  } catch (err) {
-    logCodeFailure(err);
-    return;
-  }
-  if (!block) return;
-
-  debug("messages.transform: injetando contexto de código");
-  appendContextPart(parts, block);
-}
-
 /** Classifica a falha da busca de código para o log correto (nunca propaga). */
 function logCodeFailure(err: unknown): void {
   if (isAbort(err)) {
@@ -219,33 +186,127 @@ function logCodeFailure(err: unknown): void {
   logFatal("code_search", err);
 }
 
+/** Mede o TOTAL (memória + código) para o teto conjunto (`maxChars`). */
+function renderTotal(facts: Fact[], chunks: CodeChunkHit[]): number {
+  return (formatMemoryBlock(facts)?.length ?? 0) + (formatCodeBlock(chunks)?.length ?? 0);
+}
+
+/** Dependências da orquestração do turno (injetores com estado + config). */
+export interface ContextRuntime {
+  enabled: boolean;
+  cfg: RecallConfig;
+  codeEnabled: boolean;
+  codeCfg: CodeConfig;
+  memoryInjector: MemoryInjector;
+  codeInjector: CodeInjector;
+}
+
 /**
- * Registra o hook no formato do Kilo (`{ "hook.name": fn }`). Monta o
- * `MemoryInjector` (estado de dedup por turno) uma única vez — o hook é
- * registrado no boot e reutilizado em todos os turnos.
+ * Orquestra o turno (E3c-S2): memória e código partem **em paralelo**
+ * (`Promise.allSettled` — a falha de uma não cancela a outra, decisão 2) e o
+ * orçamento do **total** (`maxChars`, código prioritário — decisão 3) é aplicado
+ * uma única vez. Memória ANTES de código no turno. **Nunca lança** (NFR-03).
  *
- * E3c (S1): o bloco de código é um **segundo part** no mesmo turno, com o
- * `inject/code.ts`. Hoje o código é injetado **depois** da memória (sequencial);
- * o paralelismo e o dedup do chunk entram na S2.
+ * A preparação (rede) e o commit (dedup + formatação) ficam separados nos
+ * injetores: só depois das duas respostas o orçamento conjunto decide o corte —
+ * sem isso, o corte de uma família não enxergaria o tamanho da outra.
+ */
+export async function injectContextIntoMessages(
+  messages: TransformMessage[],
+  rt: ContextRuntime,
+): Promise<void> {
+  // Só memória: caminho E2 (mesma produção, orçamento individual) — evita dois
+  // caminhos divergentes quando o código está desligado.
+  if (!rt.codeEnabled) {
+    return injectMemoryIntoMessages(messages, rt.enabled, rt.memoryInjector);
+  }
+
+  const lastUserIdx = lastUserMessageIndex(messages);
+  if (lastUserIdx === -1) return;
+  const parts = messages[lastUserIdx]?.parts;
+  if (!parts) return;
+  const text = extractUserText(parts);
+  if (!text.trim()) return;
+  const turnoId = messages[lastUserIdx]?.info.id ?? `idx:${lastUserIdx}`;
+
+  // Health gate (só memória): degradado/503 ⇒ não tenta o recall.
+  let wantMemory = rt.enabled;
+  if (wantMemory && !(await rt.memoryInjector.ready())) {
+    log("recall: health gate reprovado; seguindo sem memória");
+    wantMemory = false;
+  }
+
+  // Paralelo: cada chamada com seu próprio `AbortSignal` (o teto vale para CADA
+  // uma, não para a soma — é o que preserva o orçamento de 4s do hook).
+  const [memSettled, codeSettled] = await Promise.allSettled([
+    wantMemory
+      ? rt.memoryInjector.prepare(turnoId, text)
+      : Promise.resolve<MemoryPrep | null>(null),
+    rt.codeEnabled
+      ? rt.codeInjector.prepare(turnoId, text)
+      : Promise.resolve<CodePrep | null>(null),
+  ]);
+
+  let memPrep: MemoryPrep | null = null;
+  if (memSettled.status === "rejected") logRecallFailure(memSettled.reason);
+  else memPrep = memSettled.value;
+
+  let codePrep: CodePrep | null = null;
+  if (codeSettled.status === "rejected") logCodeFailure(codeSettled.reason);
+  else codePrep = codeSettled.value;
+
+  // Orçamento do TOTAL: tetos independentes + `maxChars` conjunto (código
+  // prioritário). Os injetores commitam a lista FINAL (já cortada).
+  const joint: JointBudget = {
+    maxMemories: rt.cfg.maxMemories,
+    maxCodeChunks: rt.codeCfg.maxCodeChunks,
+    maxChars: rt.cfg.maxChars,
+  };
+  const { facts, chunks } = applyJointBudget(
+    memPrep?.facts ?? [],
+    codePrep?.chunks ?? [],
+    joint,
+    renderTotal,
+  );
+
+  const memory = memPrep ? rt.memoryInjector.commit(memPrep, facts) : null;
+  const code = codePrep ? rt.codeInjector.commit(codePrep, chunks) : null;
+
+  if (memory) {
+    debug("messages.transform: injetando contexto de memória");
+    appendContextPart(parts, memory.block);
+  }
+  if (code) {
+    debug("messages.transform: injetando contexto de código");
+    appendContextPart(parts, code.block);
+  }
+}
+
+/**
+ * Registra o hook no formato do Kilo (`{ "hook.name": fn }`). Monta os dois
+ * injetores com estado de dedup por turno uma única vez — o hook é registrado no
+ * boot e reutilizado em todos os turnos.
  *
- * TODO(tracer-bullet): a S2 troca a ordem sequencial por `Promise.allSettled`
- * (memória e código em paralelo, cada um com seu `AbortSignal`) e passa a
- * injetar a memória ANTES do código no mesmo `transform`.
+ * E3c (S2): memória e código correm em paralelo; o orçamento do total é conjunto
+ * (código prioritário) e um turno injeta no máximo um bloco de cada família.
+ * Só memória (código desligado) segue pelo caminho E2 testado.
  */
 export function messagesHook(rt: InjectRuntime) {
-  const injector = new MemoryInjector(rt.client, rt.cfg);
+  const memoryInjector = new MemoryInjector(rt.client, rt.cfg);
+  const codeInjector = new CodeInjector(rt.client, rt.codeCfg);
   return {
     "experimental.chat.messages.transform": async (
       _input: Record<string, unknown>,
       output: { messages: TransformMessage[] },
     ): Promise<void> => {
-      await injectMemoryIntoMessages(output.messages, rt.enabled, injector);
-      await injectCodeIntoMessages(
-        output.messages,
-        rt.codeEnabled,
-        rt.client,
-        rt.codeCfg,
-      );
+      await injectContextIntoMessages(output.messages, {
+        enabled: rt.enabled,
+        cfg: rt.cfg,
+        codeEnabled: rt.codeEnabled,
+        codeCfg: rt.codeCfg,
+        memoryInjector,
+        codeInjector,
+      });
     },
   };
 }

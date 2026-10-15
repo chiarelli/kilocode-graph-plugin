@@ -109,6 +109,17 @@ function recallOpts(cfg: RecallConfig, signal?: AbortSignal): RecallOpts {
   return opts;
 }
 
+/**
+ * O que uma passada de recall devolve ANTES de formatar (E3c-S2): os fatos já
+ * filtrados pelo dedup do turno e cortados ao teto `maxMemories`. O teto de
+ * chars NÃO é aplicado aqui — quando as duas famílias coexistem ele é do
+ * ORÇAMENTO CONJUNTO (`applyJointBudget`), não desta etapa.
+ */
+export interface MemoryPrep {
+  facts: Fact[];
+  recallMs: number;
+}
+
 /** Timeout da chamada de recall como `AbortSignal` (ou `undefined` sem teto). */
 function timeoutSignal(cfg: RecallConfig): AbortSignal | undefined {
   return cfg.timeoutMs && cfg.timeoutMs > 0
@@ -144,7 +155,7 @@ async function runRecall(
 }
 
 /** Linha de observabilidade do turno (E7): recall_ms/facts/injected_chars. */
-function logInjection(m: InjectionResult): void {
+export function logInjection(m: InjectionResult): void {
   log(
     `inject recall_ms=${m.recallMs} facts=${m.facts} injected_chars=${m.chars}`,
   );
@@ -213,45 +224,81 @@ export class MemoryInjector {
   }
 
   /**
-   * Recall + dedup + orçamento + bloco. `null` ⇒ nada a injetar.
-   *
-   * `turnoId` identifica o turno (o `id` da `UserMessage`); `query` é o texto
-   * usado no recall. Trocar de turno limpa o dedup; o mesmo turno NUNCA
-   * reinjeta a mesma memória, por mais vezes que o `transform` rode nele.
+   * Sincroniza o turno: ao mudar o `turnoId`, limpa o dedup. Devolve `true`
+   * quando a família AINDA não injetou neste turno (pode tentar). Idempotente —
+   * chamável mais de uma vez no mesmo turno (o `transform` roda 2×).
    */
-  async inject(turnoId: string, query: string): Promise<InjectionResult | null> {
+  beginTurn(turnoId: string): boolean {
     if (turnoId !== this.turnoId) {
       this.turnoId = turnoId;
       this.seen.clear();
       this.injectedThisTurn = false;
     }
-    // Um turno injeta NO MÁXIMO um bloco. Sem isto, rodar o `transform` mais de
-    // uma vez no mesmo turno acumula blocos (o orçamento corta por chamada, não
-    // por turno) — medido: 5 fatos com `maxMemories=2` davam 3 blocos (2+2+1).
-    if (this.injectedThisTurn) return null;
+    return !this.injectedThisTurn;
+  }
+
+  /**
+   * Prepara uma injeção de memória SEM commitar (E3c-S2): sincroniza o turno,
+   * checa "um bloco por turno", faz o recall e devolve os fatos **filtrados pelo
+   * dedup** e cortados ao teto `maxMemories`. `null` ⇒ nada a preparar (turno já
+   * injetou / teto zero). **Lança** o erro do client — o orquestrador decide.
+   *
+   * O teto de chars (quando as duas famílias coexistem) é do orçamento CONJUNTO
+   * (`applyJointBudget`), não desta etapa; por isso `prepare` NÃO corta por
+   * `maxChars`. Use `inject` para o caminho só-de-memória.
+   */
+  async prepare(turnoId: string, query: string): Promise<MemoryPrep | null> {
+    if (!this.beginTurn(turnoId)) return null;
     const { result, recallMs } = await runRecall(
       this.client,
       this.cfg,
       query,
       timeoutSignal(this.cfg),
     );
-
     const fresh = result.facts.filter((f) => !this.seen.has(f.fact));
-    const facts = applyBudget(fresh, this.cfg, renderForBudget);
+    const facts = fresh.slice(0, Math.max(0, this.cfg.maxMemories));
+    return { facts, recallMs };
+  }
+
+  /**
+   * Commita o resultado de `prepare` com a lista final (`applyJointBudget` pode
+   * ter cortado mais). Marca o dedup e devolve o bloco formatado — `null` quando
+   * a lista final ficou vazia (não injeta bloco vazio). Só marca o turno como
+   * injetado quando HOUVE bloco: lista vazia não consome o "um por turno" (mesma
+   * semântica do E2 — a próxima passada do `transform` pode tentar de novo).
+   */
+  commit(prep: MemoryPrep, facts: Fact[]): InjectionResult | null {
     const block = formatMemoryBlock(facts);
-    if (!block) {
-      debug(`recall: nada novo a injetar (${result.facts.length} fatos)`);
-      return null;
-    }
+    if (!block) return null;
     for (const f of facts) this.seen.add(f.fact);
     this.injectedThisTurn = true;
     const injection: InjectionResult = {
       block,
       facts: facts.length,
       chars: block.length,
-      recallMs,
+      recallMs: prep.recallMs,
     };
     logInjection(injection);
+    return injection;
+  }
+
+  /**
+   * Recall + dedup + orçamento + bloco (caminho só-de-memória, E2). `null` ⇒ nada
+   * a injetar. Fina camada sobre `prepare`/`commit` com `applyBudget` (corte por
+   * `maxChars` individual — quando não há bloco de código ao lado).
+   *
+   * `turnoId` identifica o turno (o `id` da `UserMessage`); `query` é o texto
+   * usado no recall. Trocar de turno limpa o dedup; o mesmo turno NUNCA
+   * reinjeta a mesma memória, por mais vezes que o `transform` rode nele.
+   */
+  async inject(turnoId: string, query: string): Promise<InjectionResult | null> {
+    const prep = await this.prepare(turnoId, query);
+    if (!prep) return null;
+    const facts = applyBudget(prep.facts, this.cfg, renderForBudget);
+    const injection = this.commit(prep, facts);
+    if (!injection) {
+      debug(`recall: nada novo a injetar (${prep.facts.length} fatos)`);
+    }
     return injection;
   }
 }
