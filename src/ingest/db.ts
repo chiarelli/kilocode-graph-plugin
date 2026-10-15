@@ -159,12 +159,21 @@ function reconstructContent(
   parsed: { role?: unknown; mode?: unknown; summary?: { diffs?: unknown } },
 ): string {
   if (parsed.role === "assistant" && parsed.mode === "compaction") {
+    // TODO(tracer-bullet): placeholder idêntico para toda compactação (40 linhas
+    // no banco real) ⇒ várias mensagens com o MESMO conteúdo colidem no
+    // `batchHash` e o lote pode ser deduplicado indevidamente. A linha traz um
+    // `summary` real (hoje descartado) — extraí-lo (ou dar identidade a cada
+    // mensagem) é o endurecimento da E4-S2.
     return "[session compacted]";
   }
   let rows: DbRow[];
   try {
     rows = backend.query("SELECT data FROM part WHERE message_id = ?", [msgId]);
   } catch {
+    // TODO(tracer-bullet): falha transitória do `part` (SQLITE_BUSY/WAL) é
+    // tratada como "sem texto" e o cursor avança — perde a mensagem. Distinguir
+    // "sem texto" de "ilegível" e NÃO avançar (retry no próximo gatilho) é o
+    // endurecimento da E4-S2.
     rows = [];
   }
   const texts: string[] = [];
@@ -223,6 +232,9 @@ export function readBatch(
     try {
       parsed = JSON.parse(raw) as typeof parsed;
     } catch {
+      // TODO(tracer-bullet): linha com `data` ilegível avança o cursor em
+      // silêncio (nem `debug`). Registrar e decidir skip×retry (linha veneno não
+      // pode ser invisível) é o endurecimento da E4-S2.
       continue;
     }
     if (!isIngestRole(parsed.role)) continue;

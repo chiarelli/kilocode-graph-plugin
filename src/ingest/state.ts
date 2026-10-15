@@ -67,6 +67,9 @@ export function loadState(
       : [];
     return { sessions, sentBatchHashes: hashes };
   } catch {
+    // TODO(tracer-bullet): L-3 exige que o reset seja **logado**, nunca silencioso
+    // (o cursor volta ao início e o próximo `session.idle` reenvia). Emitir o log
+    // de reset é o endurecimento da E4-S4.
     return emptyState();
   }
 }

@@ -78,7 +78,7 @@ Convenções válidas para todas as epics:
 > **Decisão de produto resolvida** (2026-10-15): gatilho, rotina, cursor e
 > idempotência estão em **`docs/adr/007`** e **`docs/adr/008`**; a decomposição
 > em **`specs/e4-stories.md`**. O memtier **não muda**.
-- [ ] **E4-S1** — Tracer bullet: ler o `kilo.db` (user+assistant) → 1 lote real → `/v1/ingest`
+- [x] **E4-S1** — Tracer bullet: ler o `kilo.db` (user+assistant) → 1 lote real → `/v1/ingest`
 - [ ] **E4-S2** — Endurecer: cursor por `(time_created, id)` + `sentBatchHashes` (idempotência)
 - [ ] **E4-S3** — `session.idle` drena tudo + o resto (mesma rotina; trava por sessão)
 - [ ] **E4-S4** — Limitações L-1/L-2/L-3 como critério de aceite (decisão do dono)
@@ -553,3 +553,35 @@ redescobertas no meio do loop.
   E2E **10/10** com os três tokens; `tsc --noEmit` limpo. Revisão adversarial por
   subagente não rodou (infra `litellm:4000` fora do ar) — revisão inline.
   **E3b FECHADO**: os 5 checkboxes marcados e D-1..D-13 resolvidos.
+
+- **2026-10-15 — E4-S1 (tracer bullet).** Fatia vertical mínima da ingestão
+  assíncrona; a base sobre a qual S2..S5 endurecem (sem rewrite). Entrega:
+  1. `src/ingest/{db,batch,state,routine}.ts` + `src/hooks/ingest.ts` +
+     `client.ingest` + `config.ingest.*` + wiring em `src/index.ts`.
+  2. **Fonte = banco, nunca o evento** (ADR-007): o hook `message.updated` só
+     **acorda** a rotina (`void runIngest`); o conteúdo vem do `kilo.db`
+     (user+assistant, remontado de `part.text`). Cursor por identidade
+     `(time_created, id)`, **sem `OFFSET`** (ADR-008).
+  3. **Fatos medidos contra o `kilo.db` real** (`~/.local/share/kilo/kilo.db`,
+     16.724 msgs): `time_created` é **epoch ms** (confirma `referenceTime`); 40
+     linhas `compaction`; `assistant:user ≈ 18:1`; só **7.998/16.728** com `text`
+     (uma janela de 20 **linhas** traz ~2 com texto).
+  4. **E2E real** `tests/e2e/test_e2e_ingest.test.ts` (gated `E2E=1`, token
+     `E2E_INGEST_TOKEN`/`E2E_TOKEN` escopo `alfa`): `kilo.db` real → hook →
+     `/v1/ingest` **202** e o efeito do outro lado (o fato aparece no
+     `/v1/recall` real). Medido **2/2** verde (~65 s pelo worker serial).
+  5. **Unit** `tests/ingest.test.ts` (33 casos): hash determinístico, limiar,
+     localização do banco, cursor por tupla, degradação do estado, trava por
+     sessão, `client.ingest` (202/401/503). Unit **264 · 252 pass · 0 fail ·
+     12 skip**; `tsc --noEmit` limpo.
+  6. **Revisão adversarial** (agente nomeado `adversarial`, não inline) em
+     `ce5b219`: 12 achados + 2 não-achados. Triagem: o SUSPECT "unidade de
+     `time_created`" foi **medido e refutado** (é ms). Gap real **material**:
+     o limiar conta **linhas**, não mensagens com texto — o lote enviado sai bem
+     menor que o `batch_size` configurado (~2/20 medido). Os demais achados
+     (falha transitória do `part` avançar o cursor; backend cacheado sem retry
+     nem `close()`; linha veneno silenciosa; `max_hashes` não aplicado; reset do
+     L-3 sem log) ficam como **`TODO(tracer-bullet)`** para S2/S4 — a fatia 1 é
+     mínima por desenho.
+  7. `rg "TODO\(tracer-bullet\)" src/` → **6** marcadores (todos da E4, cada um
+     mapeado à story que o resolve). O épico só fecha quando zerar.

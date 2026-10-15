@@ -65,6 +65,11 @@ export function ingestHook(rt: IngestHookRuntime) {
     lock,
   };
 
+  // TODO(tracer-bullet): a promessa do backend é cacheada para sempre — uma
+  // falha transitória no 1º evento (banco ainda não criado, SQLITE_BUSY) só é
+  // recuperada reiniciando o plugin, e o handle nunca é fechado no `dispose`
+  // (fd fica aberto). Retry da abertura + `close()` no shutdown é o
+  // endurecimento da E4-S2.
   let backendPromise: Promise<SqliteBackend | null> | null = null;
   const getBackend = (): Promise<SqliteBackend | null> => {
     if (rt.backend) return Promise.resolve(rt.backend);
