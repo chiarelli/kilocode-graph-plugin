@@ -13,6 +13,7 @@ import {
   buildMcpConfig,
   isValidMcpName,
   registerMemtierMcp,
+  scheduleMcpRegistration,
   shouldRefreshMcpRegistration,
   type KiloLikeClient,
   type KiloMcpClient,
@@ -291,6 +292,46 @@ test("register_add_error_not_409: erro real do add ⇒ não conecta", async () =
 test("sdk_without_mcp: client.mcp undefined ⇒ log; não lança", async () => {
   await assert.doesNotReject(() => registerMemtierMcp({}, cfg()));
   await assert.doesNotReject(() => registerMemtierMcp(undefined, cfg()));
+});
+
+// --- D-11: scheduleMcpRegistration (caminho background) ---------------------
+
+test("schedule_returns_immediately: D-11 dispara sem bloquear o boot", () => {
+  // `add` que nunca resolve: se `schedule` esperasse, o teste penduraria.
+  let addStarted = false;
+  const client: KiloLikeClient = {
+    mcp: {
+      status: async () => ({ data: {} }),
+      add: async () => {
+        addStarted = true;
+        return new Promise(() => {}); // pendura para sempre
+      },
+      connect: async () => ({ data: {} }),
+      disconnect: async () => ({ data: {} }),
+    },
+  };
+  const start = Date.now();
+  scheduleMcpRegistration(client, cfg());
+  const elapsed = Date.now() - start;
+  assert.ok(elapsed < 50, `schedule deve retornar imediatamente (${elapsed}ms)`);
+  assert.equal(addStarted, false, "o add acontece em background, não no retorno");
+});
+
+test("schedule_background_registers: D-11 o registro completa em background", async () => {
+  const { client, calls } = fakeMcp();
+  scheduleMcpRegistration(client, cfg());
+  // Dá tempo do microtask/macrotask do registro rodar.
+  const deadline = Date.now() + 1000;
+  while (!calls.includes("connect") && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  assert.deepEqual(calls, ["status", "add", "connect"]);
+});
+
+test("schedule_never_rejects: D-11 client sem mcp ⇒ não lança", async () => {
+  assert.doesNotThrow(() => scheduleMcpRegistration({}, cfg()));
+  // E o `.catch` interno não vira rejeição não-tratada.
+  await new Promise((r) => setTimeout(r, 20));
 });
 
 // --- D-5: junção de URL -----------------------------------------------------

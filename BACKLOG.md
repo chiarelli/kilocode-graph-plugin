@@ -66,7 +66,7 @@ Convenções válidas para todas as epics:
 - [x] **E3b-S2** — Endurecer: idempotência (não duplicar se já definido), degradação não-fatal
 - [x] **E3b-S3** — Fechamento: prova de tools listáveis/chamáveis, docs, zero marcadores
 - [x] **E3b-S4** — **Corrigir os defeitos da revisão adversarial postergada** (D-1..D-10): vírgula final no JSONC derruba o override (D-3); precedência de `kilo.jsonc` sombreia o override (D-4); MCP fica morto e mudo em `disabled`/`connecting`/`disconnected`/`error` — regressão face ao antecessor (D-6); `409` de concorrência vira FATAL sem retry (D-7); `mcp.name` cru nos path params (D-8); token só-espaços vira header (D-9); `memtier: false` não bloqueia (D-10); junção ingênua de URL corrompe base com query/fragment (D-5)
-- [ ] **E3b-S5** — **Fechamento do E3b-S4**: comando E2E documentado tem de ser verde com o token certo (D-1/D-2 — `e2e-tok-a` é escopo `alfa`, não o workspace do teste); cobrir `scheduleMcpRegistration` (D-11), o caso negativo "já definido ⇒ não registra" ponta-a-ponta (D-12) e o `timeout`/`enabled` do `add` (D-13)
+- [x] **E3b-S5** — **Fechamento do E3b-S4**: comando E2E documentado tem de ser verde com o token certo (D-1/D-2 — `e2e-tok-a` é escopo `alfa`, não o workspace do teste); cobrir `scheduleMcpRegistration` (D-11), o caso negativo "já definido ⇒ não registra" ponta-a-ponta (D-12) e o `timeout`/`enabled` do `add` (D-13)
 
 ### E3c — Injeção de código
 - [x] **E3c-S1** — Tracer bullet: `code_search` → bloco de código no `messages.transform` (part separado)
@@ -468,3 +468,26 @@ redescobertas no meio do loop.
   por subagente não rodou (infra `litellm:4000` fora do ar) — revisão inline com
   sondagem de bordas (strings com `,]`, aspas escapadas, `?query`/`#fragment`,
   `ENOENT` sobre `connected`).
+
+- **2026-10-15 — E3b-S5 (fechamento do E3b-S4).** Resolve os defeitos de E2E e
+  de cobertura (D-1/D-2/D-11/D-12/D-13):
+  1. **D-1/D-2** (`tests/e2e/test_e2e_mcp.test.ts`): a suíte do MCP passa a usar
+     um token **dedicado** `E2E_MCP_TOKEN` (ou `KILOCODE_GRAPH_TOKEN`) e **ignora**
+     `E2E_TOKEN` (escopado a `alfa` — era a causa do vermelho). O fallback
+     silencioso para `.kilo/graph-key.json` foi **removido**: em `E2E=1` sem
+     token, o teste **falha** (não skippa, não lê arquivo) — fim do verde falso.
+  2. **Comando canônico verde**: o glob com os **três** tokens passa
+     (medido `E2E=1 E2E_TOKEN=e2e-tok-a E2E_CODE_TOKEN=e2e-tok-b
+     E2E_MCP_TOKEN=<bearer> node --test "tests/e2e/**/*.test.ts"` → **10/10**).
+     `docs/RUNBOOK-E2E.md` reescrito com o comando medido e a tabela dos três
+     tokens.
+  3. **D-11**: `scheduleMcpRegistration` coberto por unit (retorna imediato —
+     não bloqueia o boot; registra em background; não lança sem `client.mcp`).
+  4. **D-12**: novo E2E negativo — com `mcp.memtier` no `kilo.jsonc` do
+     workspace, o plugin bootado **não** registra (FR-602 ponta a ponta).
+  5. **D-13**: `timeout`/`enabled` do corpo do `add` agora assertados (unit
+     `register_add_body_has_timeout_enabled` + E2E do MCP).
+  `src/README.md` alinhado à API nova. Unit **228 · 219 pass · 0 fail · 9 skip**;
+  E2E **10/10** com os três tokens; `tsc --noEmit` limpo. Revisão adversarial por
+  subagente não rodou (infra `litellm:4000` fora do ar) — revisão inline.
+  **E3b FECHADO**: os 5 checkboxes marcados e D-1..D-13 resolvidos.

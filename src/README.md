@@ -72,16 +72,21 @@ collectHook(rt): { boot: Promise<void> }   // dispara no boot, fora do turno (FR
 // `collect indexer_ms=… files=… edges=… removed=… sync={…}`.
 ```
 
-### `mcp/register.ts` + `mcp/kilo-config.ts` (E3b — implementado)
+### `mcp/register.ts` + `mcp/kilo-config.ts` (E3b — implementado; endurecido no E3b-S4)
 ```ts
-function buildMcpConfig(cfg): McpRemoteConfig   // puro: url …/v1/mcp + header Bearer
-async function registerMemtierMcp(client, cfg): Promise<void>  // status → add → connect
-function scheduleMcpRegistration(client, cfg): void            // background no boot
-function getKiloMcpOverride(dir, name): entry | undefined       // idempotência (FR-602)
-function shouldRefreshMcpRegistration(existing): boolean        // failed/ENOENT ⇒ refresh
+function buildMcpConfig(cfg): McpRemoteConfig   // puro: new URL("v1/mcp", base/) + header Bearer (token trim)
+function isValidMcpName(name): boolean          // D-8: rejeita vazio, "/", "\", "..", espaço
+async function registerMemtierMcp(client, cfg): Promise<void>  // status → (disconnect) → add → connect
+function scheduleMcpRegistration(client, cfg): void            // background no boot (nunca bloqueia)
+function isMcpDefinedInKiloConfig(dir, name): boolean          // FR-602: varre TODOS os arquivos; false/null/[] bloqueiam
+function shouldRefreshMcpRegistration(existing): boolean       // D-6: refresh em QUALQUER estado != connected
+function stripJsoncComments(raw): string                       // JSONC: remove comentários (respeita strings)
+function stripTrailingCommas(raw): string                      // D-3: remove vírgula final (JSONC válido)
 // Registro IMPLÍCITO no boot (o usuário não define nada em kilo.jsonc); se já
-// definido lá, o plugin não registra por cima (idempotência) — FR-602.
+// definido lá — com qualquer valor, inclusive `false` — o plugin não registra
+// por cima (idempotência) — FR-602.
 // Degradação (FR-604): status/add/connect falhos viram log; o boot NUNCA quebra.
+// `409`/already-exists do add é não-fatal (segue para o connect — D-7).
 // Tool MCP `neighbors` NÃO existe no memtier (só recall/ingest/code_search/
 // code_sync) — navegação não é prometida (ADR-006).
 ```

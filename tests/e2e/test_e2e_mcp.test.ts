@@ -14,13 +14,16 @@
  *      `code_search` são **chamáveis** (`isError:false`).
  *
  * Pré-requisito do bearer: `/v1/mcp` é rota PROTEGIDA (401 sem token, medido).
- * O token vem de `E2E_TOKEN`/`KILOCODE_GRAPH_TOKEN` ou do `.kilo/graph-key.json`
- * real do repo (workspace `kilocode-graph-plugin`) — nunca fabricado. Sem token a
- * suíte **skippa com motivo**.
+ *
+ * Token (D-1/D-2 corrigidos): vem de `E2E_MCP_TOKEN` (dedicado) ou de
+ * `KILOCODE_GRAPH_TOKEN`. **Não** usa `E2E_TOKEN` — esse é escopado ao workspace
+ * `alfa` e, passado globalmente, derruba este teste (D-1). E **não** cai em
+ * `.kilo/graph-key.json` (fallback silencioso que produzia verde falso — D-2):
+ * em `E2E=1` a ausência do token é **falha**, não skip.
  */
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -39,25 +42,14 @@ const WS = "kilocode-graph-plugin";
 /** Programa do escopo do bearer (o `graph-key.json` real usa `graphplugin`). */
 const PROGRAM = process.env.E2E_PROGRAM ?? "graphplugin";
 
-/** Token + programa: env (preferido) ou o `.kilo/graph-key.json` real do repo. */
-function resolveKey(): { token: string; program: string } {
-  const envToken = process.env.E2E_TOKEN ?? process.env.KILOCODE_GRAPH_TOKEN;
-  if (envToken) return { token: envToken, program: PROGRAM };
-  try {
-    const parsed = JSON.parse(
-      readFileSync(join(process.cwd(), ".kilo", "graph-key.json"), "utf-8"),
-    ) as { token?: unknown; program?: unknown };
-    return {
-      token: typeof parsed.token === "string" ? parsed.token : "",
-      program: typeof parsed.program === "string" ? parsed.program : PROGRAM,
-    };
-  } catch {
-    return { token: "", program: PROGRAM };
-  }
-}
-
-const KEY = resolveKey();
-const TOKEN = KEY.token;
+/**
+ * Token do workspace REAL do MCP. **Nunca** cai em fallback silencioso (D-2):
+ * env `E2E_MCP_TOKEN` (dedicado) > `KILOCODE_GRAPH_TOKEN`. O `graph-key.json`
+ * **não** é fonte aqui — se o teste dependesse dele, `E2E=1` sem secret nenhum
+ * passaria, mascarando a falta de injeção de credencial. O `E2E_TOKEN` global
+ * (escopo `alfa`) é deliberadamente ignorado: era a causa do vermelho (D-1).
+ */
+const TOKEN = process.env.E2E_MCP_TOKEN ?? process.env.KILOCODE_GRAPH_TOKEN ?? "";
 
 /** Cliente MCP mínimo: JSON-RPC 2.0 sobre Streamable HTTP (POST). */
 async function mcpRequest(
@@ -126,8 +118,16 @@ function spyMcp(): { client: KiloLikeClient; registered: () => McpRemoteConfig |
 }
 
 test("e2e: registro implícito do MCP + 4 tools reais listáveis/chamáveis", {
-  skip: !E2E || !TOKEN,
+  // Só `E2E=1` decide o skip. Sem token, o corpo FALHA (D-2) — nunca verde por
+  // fallback silencioso.
+  skip: !E2E,
 }, async () => {
+  assert.ok(
+    TOKEN,
+    "E2E_MCP_TOKEN/KILOCODE_GRAPH_TOKEN ausente: o E2E do MCP exige o bearer " +
+      "do workspace real (não há fallback para graph-key.json)",
+  );
+
   const base = mkdtempSync(join(tmpdir(), "graph-e2e-e3b-"));
   const dir = join(base, WS);
   const kiloDir = join(dir, ".kilo");
@@ -135,7 +135,7 @@ test("e2e: registro implícito do MCP + 4 tools reais listáveis/chamáveis", {
   const tokenFile = join(kiloDir, "graph-key.json");
   writeFileSync(
     tokenFile,
-    JSON.stringify({ token: TOKEN, workspace: WS, program: KEY.program }),
+    JSON.stringify({ token: TOKEN, workspace: WS, program: PROGRAM }),
   );
 
   try {
@@ -148,7 +148,7 @@ test("e2e: registro implícito do MCP + 4 tools reais listáveis/chamáveis", {
         daemon: {
           url: MEMTIER_URL,
           token_file: tokenFile,
-          program: KEY.program,
+          program: PROGRAM,
           health_timeout_ms: 3000,
         },
         mcp: { enabled: true, name: "memtier" },
@@ -168,6 +168,9 @@ test("e2e: registro implícito do MCP + 4 tools reais listáveis/chamáveis", {
     assert.equal(config.type, "remote");
     assert.equal(config.url, `${MEMTIER_URL}/v1/mcp`);
     assert.equal(config.headers?.Authorization, `Bearer ${TOKEN}`);
+    // D-13: timeout/enabled do corpo do `add`.
+    assert.equal(config.timeout, 15000, "timeout do add = mcp.timeout_ms default");
+    assert.equal(config.enabled, true, "enabled do add = true");
 
     // Efeito do outro lado: o config que o plugin registrou conecta no memtier
     // MCP real e as 4 tools respondem.
@@ -178,7 +181,7 @@ test("e2e: registro implícito do MCP + 4 tools reais listáveis/chamáveis", {
 
     const recall = await callTool(config, "recall", {
       workspace: WS,
-      program: KEY.program,
+      program: PROGRAM,
       query: "plugin",
       limit: 3,
     });
@@ -186,11 +189,49 @@ test("e2e: registro implícito do MCP + 4 tools reais listáveis/chamáveis", {
 
     const search = await callTool(config, "code_search", {
       workspace: WS,
-      program: KEY.program,
+      program: PROGRAM,
       query: "registerMemtierMcp",
       limit: 3,
     });
     assert.equal(search.isError, false, "code_search deve responder sem erro");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+/**
+ * D-12 — caso NEGATIVO ponta-a-ponta (ponta a ponta do boot): com
+ * `mcp.memtier` definido no `kilo.jsonc` do workspace, o plugin **não** registra
+ * (FR-602). O unit cobre o predicado; este prova pelo boot real + espião.
+ */
+test("e2e: mcp.memtier definido no kilo.jsonc ⇒ plugin NÃO registra (FR-602)", {
+  skip: !E2E,
+}, async () => {
+  const base = mkdtempSync(join(tmpdir(), "graph-e2e-e3b-neg-"));
+  const dir = join(base, WS);
+  const kiloDir = join(dir, ".kilo");
+  mkdirSync(kiloDir, { recursive: true });
+  // O usuário definiu o MCP: o plugin deve respeitar.
+  writeFileSync(
+    join(kiloDir, "kilo.jsonc"),
+    `{ "mcp": { "memtier": { "type": "remote", "url": "http://user:1/v1/mcp" } } }`,
+  );
+
+  try {
+    assert.equal(workspaceName(dir), WS);
+    const { client, registered } = spyMcp();
+    const hooks = await pluginModule.server(
+      { directory: dir, worktree: null, client },
+      { mcp: { enabled: true, name: "memtier" }, debug: true },
+    );
+    await hooks.dispose?.();
+    // Dá tempo para o registro background (se houvesse) aparecer.
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(
+      registered(),
+      undefined,
+      "com mcp.memtier definido pelo usuário, o plugin não pode registrar",
+    );
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
