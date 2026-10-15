@@ -75,8 +75,26 @@ Convenções válidas para todas as epics:
 
 ### Segunda onda (spec sob demanda)
 - [ ] **E4** — Ingestão assíncrona (fila por sessão, debounce)
+      **DECIDIDO (2026-10-15):** batch por **VALOR de config** (não por mensagem);
+      `reference_time` = **mensagem mais atual do batch**.
+      **MEDIDO:** batch=20 custa **10 s** vs **1.405 s** do batch=1 para qualidade
+      equivalente (cobertura 15/16 × 16/16, 0 espúrias, 0 duplicatas). O 20-por-job
+      é **~140× mais barato**. O memtier forma as relações corretamente
+      **independente do tamanho do batch** (prova em
+      `docs/DECISOES-segunda-onda.md`).
+      **GARGALO observado:** o worker consome **1 job por ciclo** (serial) ⇒ ~70 s
+      por episódio, ~23 min para 20. **Decisão de concorrência do MEMTIER**, não
+      deste plugin.
+      ⚠️ **Trigger em discussão (2026-10-15):** `chat.message` dispara por
+      mensagem do **USUÁRIO** — em sessão agêntica a razão user/assistant é
+      discrepante e conteúdo pode ficar **sem ingestão para sempre**. Ver
+      `docs/TRIGGER-INGESTAO.md`.
 - [ ] **E5** — Degradação (memtier/indexer fora do ar ⇒ turno segue)
-- [ ] **E6** — Multi-CLI (adaptador OpenCode; Claude Code)
+- [!] **E6** — Multi-CLI — **BLOQUEADA: só Kilocode é suficiente hoje**
+      (decisão do dono, 2026-10-15). OpenCode e Claude Code **não estão
+      instaladas** nesta máquina (SPIKE-FINDINGS: "não dá para validar sem
+      instalar") e o Claude Code usa **outro mecanismo** (`UserPromptSubmit` →
+      `additionalContext`). Não é "pendente de spec" — é **sem consumidor hoje**.
 - [ ] **E7** — Observabilidade (log de recall/coleta, flag de debug)
 
 ---
