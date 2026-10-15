@@ -5,6 +5,7 @@
 > Espelho da convenção do [`../graphiti-daemon/BACKLOG.md`](../graphiti-daemon/BACKLOG.md).
 
 **Ordem de implementação (primeira onda):** E1 → E2 → E3a → E3b → E3c.
+**Ordem de implementação (segunda onda):** E4 → E5 → E6 → E7.
 **Primeira onda especificada agora:** E1, E2, E3a, E3b (este backlog + `specs/`).
 **Segunda onda:** E4, E5, E6, E7 (spec sob demanda).
 
