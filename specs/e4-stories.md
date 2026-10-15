@@ -159,36 +159,52 @@ degrada (não lança).
 implementação** — não só documentadas. Decisão do dono (2026-10-15): *"incluir as
 limitações L-1/L-2/L-3 como critérios de aceite."*
 
-### L-1 — Confirmação otimista
+### L-1 — Confirmação otimista ⟶ **DECIDIDO: registrar a incerteza auditável**
 
-O `202` diz que o **envio** foi aceito, não que o worker processou. Hoje o hash é
-gravado no envio ⇒ um `add_episode` que falhe por motivo transitório vira
-**perda silenciosa e definitiva**.
+O `202` diz que o **envio** foi aceito, não que o worker processou.
 
-**Critério de aceite:** a implementação precisa **explicitar** o comportamento
-escolhido, com uma das duas saídas — e a escolha é do dono na spec da story:
-- **(a) registrar a incerteza**: marcar o lote como "enviado, não confirmado" e
-  expor isso no log/estado (o operador consegue auditar); **ou**
-- **(b) reenvio conservador**: só gravar o hash após N ciclos sem erro, ou
-  manter uma janela de reenvio — sabendo que o grafo **duplica arestas** (medido),
-  então reenviar tem custo real.
-  **Não** é aceitável deixar implícito.
+**Decisão do dono (2026-10-15), verbatim:** *"registra a incerteza auditável:
+enviou o lote para o endpoint async e ele confirmou que aceitou (não que
+processou), aceitar como batch processado e assumir que batch pode ser perdido."*
 
-### L-2 — `sentBatchHashes` cresce sem expiração
+| | |
+|---|---|
+| o lote é tratado como | **processado** (o cursor avança) |
+| a incerteza é | **registrada** (estado/log: "enviado e aceito, **não confirmado**") |
+| o que se aceita | o lote **pode ser perdido** — sem reenvio |
+| o que **não** se faz | reenvio conservador (duplicaria arestas — medido) |
+
+**Critério de aceite:**
+- O estado/log do lote enviado registra explicitamente que a confirmação é de
+  **aceite**, não de processamento (auditável).
+- **Nenhum** mecanismo de reenvio ou de espera por confirmação é criado.
+- Teste: um lote cujo `add_episode` falhe no worker **não** é reenviado, e o log
+  permite ao operador identificar que aquele lote foi perdido.
+
+### L-2 — `sentBatchHashes` cresce sem expiração ⟶ **teto por workspace**
 
 Medido no antecessor: **181 + 109 hashes** em dois workspaces, sem TTL.
 
-**Critério de aceite:** política explícita de limite (TTL, teto por workspace, ou
-hash rolante), **com teste** provando que o arquivo não cresce indefinidamente.
-O antecessor não tem política — não repetir.
+**Decisão do implementador** (o porquê vai no commit): teto por workspace com
+**evicção FIFO** ao ultrapassar; limite **configurável** (`ingest.max_hashes` ou
+equivalente), default generoso. **Por que teto e não TTL:** o hash só serve
+enquanto houver chance de a mesma mensagem ser relida (janela do L-3); um teto por
+contagem é determinístico e testável, enquanto TTL depende de relógio.
 
-### L-3 — O fallback depende do disco
+**Critério de aceite:** teste provando que o número de hashes **não cresce
+indefinidamente** (ultrapassar o teto evicta os mais antigos); o arquivo de estado
+fica limitado.
 
-Se o arquivo de estado for apagado, o próximo `session.idle` **reenvia**.
+### L-3 — O fallback depende do disco ⟶ **degradação explícita**
 
-**Critério de aceite:** o comportamento na ausência/corrupção do estado está
-**definido e testado** (degradação explícita, nunca silenciosa). Aceita-se o
-reenvio como custo — o que não se aceita é não saber o que acontece.
+Se o arquivo de estado for apagado/corromper, o cursor volta ao início e o próximo
+`session.idle` **reenvia** (o grafo duplica arestas — custo medido e aceito).
+
+**Decisão do implementador:** o reset é **logado**, nunca silencioso.
+
+**Critério de aceite:** teste com estado ausente e com JSON corrompido ⇒ a rotina
+**degrada sem lançar**, **registra** o reset, e o comportamento está definido
+(não é surpresa). O reenvio é consequência documentada, não defeito.
 
 ---
 

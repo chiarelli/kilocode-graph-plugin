@@ -108,17 +108,34 @@ cursor (medido: `PULADAS = 0`).
 - **Positivo:** reprocessar é seguro: o cursor por tupla não pula, e o hash barra
   o reenvio.
 - **Positivo:** restart do plugin sobrevive (estado em disco, atômico).
-- **Negativo (L-1):** a confirmação é **otimista** — o `202` diz que o **envio** foi
-  aceito, não que o worker processou. Como o hash é gravado no envio, um
-  `add_episode` que falhe por motivo transitório vira **perda silenciosa e
-  definitiva**. Sem caminho hoje (o `job_id` do servidor não volta ao chamador).
-  **Critério de aceite da spec** (decisão do dono), não resolvido aqui.
-- **Negativo (L-2):** `sentBatchHashes` cresce **sem expiração** (medido: 181 + 109
-  hashes em dois workspaces do antecessor). Precisa de política (TTL/limite).
-  **Critério de aceite da spec.**
-- **Negativo (L-3):** a prova vive no disco; se o arquivo for apagado, o próximo
-  `session.idle` reenvia o já enviado. Custo aceito de manter a garantia no cliente.
-  **Critério de aceite da spec.**
+- **Negativo (L-1) — DECIDIDO PELO DONO (2026-10-15):** *"registra a incerteza
+  auditável: enviou o lote para o endpoint async e ele confirmou que aceitou (não
+  que processou); aceitar como batch processado e assumir que o batch pode ser
+  perdido."*
+
+  | | |
+  |---|---|
+  | **o que se adota** | o `202` = **aceito**, e o lote é tratado como **processado** (o cursor avança) |
+  | **o que se registra** | a **incerteza é auditável** — o log/estado grava "enviado e aceito, **não confirmado**" |
+  | **o que se aceita** | o lote **pode ser perdido** (falha transitória do worker ⇒ perda definitiva, sem reenvio) |
+  | **o que NÃO se faz** | reenvio conservador (duplicaria arestas — medido) e não se inventa confirmação que não existe |
+
+  Vantagem colateral: a política é **barata e determinística** — nada de janela de
+  retry, nada de estado extra. O custo (perda possível) é explícito, não
+  silencioso.
+- **Negativo (L-2) — decisão do implementador, com o porquê:** `sentBatchHashes`
+  cresce **sem expiração** (medido: 181 + 109 hashes em dois workspaces do
+  antecessor). Adota-se **teto por workspace** (evicção FIFO ao ultrapassar), com o
+  limite **configurável** e default generoso. Por que teto e não TTL: o hash só
+  serve enquanto houver chance de a mesma mensagem ser relida (a janela do L-3);
+  um teto por contagem é **determinístico e testável** ("o arquivo não cresce
+  indefinidamente"), enquanto TTL depende de relógio e é mais difícil de provar.
+- **Negativo (L-3) — decisão do implementador:** a prova vive no disco. Se o
+  arquivo for apagado/corromper, o cursor volta ao início e o próximo
+  `session.idle` **reenvia** (o grafo duplica arestas — custo medido e aceito).
+  O que se exige: **degradação explícita** — o reset é **logado**, nunca silencioso,
+  e o comportamento tem teste. É o preço de manter a garantia no cliente
+  (coerente com a decisão do dono).
 - **Requisito derivado:** a rotina precisa de **trava por sessão** — dois eventos
   (ou `session.idle` repetido) podem chamá-la em concorrência, e o cursor não pode
   avançar duas vezes para o mesmo lote.
