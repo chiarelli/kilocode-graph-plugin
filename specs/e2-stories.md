@@ -225,7 +225,7 @@ o bloco aparece no turno.
 **Comandos:**
 ```bash
 bun run typecheck && node --test "tests/**/*.test.ts"
-E2E=1 node --test "tests/e2e/**/*.test.ts"
+E2E=1 node --test "tests/e2e/**/*.test.ts"   # ver docs/RUNBOOK-E2E.md (token por suíte)
 ```
 
 ---

@@ -326,7 +326,7 @@ após full é mais barato (`skipped` alto).
 cd /home/hermes/Projetos/kilocode-graph-plugin
 bun run typecheck && node --test "tests/**/*.test.ts"
 cd ../rust-ast-indexer/rust_indexer && cargo build --release --features parsing
-cd /home/hermes/Projetos/kilocode-graph-plugin && E2E=1 node --test "tests/e2e/**/*.test.ts"
+cd /home/hermes/Projetos/kilocode-graph-plugin && E2E=1 node --test "tests/e2e/**/*.test.ts"   # ver docs/RUNBOOK-E2E.md (token por suíte)
 ```
 
 ---

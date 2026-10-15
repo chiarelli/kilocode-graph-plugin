@@ -65,6 +65,8 @@ Convenções válidas para todas as epics:
 - [x] **E3b-S1** — Tracer bullet: registrar o MCP remoto no boot (`status`→`add`→`connect`)
 - [x] **E3b-S2** — Endurecer: idempotência (não duplicar se já definido), degradação não-fatal
 - [x] **E3b-S3** — Fechamento: prova de tools listáveis/chamáveis, docs, zero marcadores
+- [ ] **E3b-S4** — **Corrigir os defeitos da revisão adversarial postergada** (D-1..D-10): vírgula final no JSONC derruba o override (D-3); precedência de `kilo.jsonc` sombreia o override (D-4); MCP fica morto e mudo em `disabled`/`connecting`/`disconnected`/`error` — regressão face ao antecessor (D-6); `409` de concorrência vira FATAL sem retry (D-7); `mcp.name` cru nos path params (D-8); token só-espaços vira header (D-9); `memtier: false` não bloqueia (D-10); junção ingênua de URL corrompe base com query/fragment (D-5)
+- [ ] **E3b-S5** — **Fechamento do E3b-S4**: comando E2E documentado tem de ser verde com o token certo (D-1/D-2 — `e2e-tok-a` é escopo `alfa`, não o workspace do teste); cobrir `scheduleMcpRegistration` (D-11), o caso negativo "já definido ⇒ não registra" ponta-a-ponta (D-12) e o `timeout`/`enabled` do `add` (D-13)
 
 ### E3c — Injeção de código
 - [x] **E3c-S1** — Tracer bullet: `code_search` → bloco de código no `messages.transform` (part separado)
@@ -312,8 +314,9 @@ redescobertas no meio do loop.
   2. Prova real da cadeia (stack viva, sem mock de infra):
      `tests/e2e/test_e2e_collector.test.ts` (indexer→sync→search→neighbors;
      OUT/IN call navegam) e `tests/e2e/test_e2e_lifecycle.test.ts`
-     (cresce/encolhe/deleta/idempotência). Ambos gated `E2E=1`; 6 E2E verdes com
-     `E2E_TOKEN=e2e-tok-a E2E_CODE_TOKEN=e2e-tok-b`.
+     (cresce/encolhe/deleta/idempotência). Ambos gated `E2E=1`. **Cada suíte consome um token de escopo diferente** —
+     o comando correto por arquivo está em `docs/RUNBOOK-E2E.md` (⚠️ passar os dois
+     tokens no glob **reprova**; medido 8 pass / 1 fail em 2026-10-15).
   3. **Defeitos medidos e corrigidos** no endurecimento real:
      - import_edge é nível de arquivo ⇒ origem `{file}:FullFile` precisa existir
        (ADR-012 D3); sem o `FullFile` sintético o lote inteiro tomava 422. O
@@ -396,3 +399,41 @@ redescobertas no meio do loop.
      `inject.timeout_ms`, `inject.max_chars` e `daemon.*`.
   8. `rg "TODO\(tracer-bullet\)" src/` → **zero**. Unit 195 verdes; E2E gated
      (9 casos skip sem `E2E=1`). `tsc --noEmit` limpo.
+
+- **2026-10-15 — E3c VALIDADA (prova medida do supervisor):** `046600b`, árvore
+  limpa. `bun run typecheck` limpo; unit **204 testes · 195 pass · 0 fail · 9 skip**;
+  `rg "TODO\(tracer-bullet\)" src/` → **zero**; E2E **9/9 pass · 0 fail** com o
+  token por suíte (`docs/RUNBOOK-E2E.md`) — incluindo o caso do E3c
+  (`inject_code`, workspace `beta`). Arquivos: 14 · +1559/−51
+  (`src/inject/code.ts` 255L, `tests/code.test.ts` + `tests/code_s2.test.ts`).
+  **Correção de rota do supervisor:** o primeiro E2E rodado pelo supervisor deu
+  `fail 1` por **erro de token dele** (`E2E_TOKEN=e2e-tok-a`, escopo `alfa`, na
+  suíte do MCP) — não era defeito do épico. Medido: cada suíte consome um token
+  distinto; o comando com os dois tokens no glob **reprova**.
+
+- **2026-10-15 — REVISÃO ADVERSARIAL POSTERGADA DO E3b → o épico REABRE.**
+  Review completo em `docs/reviews/REVIEW-E3b-adversarial.md` (16 KB, 2026-10-15).
+  Método: 3 perfis adversariais em paralelo (BLIND-HUNTER, EDGE-CASE-HUNTER,
+  VERIFICATION-GAP) em worktree destacado no `724250d`; **toda** alegação
+  re-executada pela sessão-mãe antes de entrar em DEFEITOS.
+  **10 defeitos CONFIRMADOS (D-1..D-10) + 3 de cobertura (D-11..D-13)**, 5 riscos,
+  4 não-provados. O veredito do review: *"o 'verde' declarado no fechamento não se
+  sustenta: o épico precisa reabrir"*.
+  Os que atingem contrato:
+  - **D-3** — vírgula final é JSONC válido; `stripJsoncComments` não trata, o
+    `JSON.parse` lança e o `catch` devolve `null` ⇒ override do usuário ignorado e
+    o plugin registra por cima (**FR-602 violado**).
+  - **D-4** — precedência de `kilo.jsonc`: se só um dos arquivos tem `mcp`, o
+    override é sombreado (**FR-602 violado**).
+  - **D-6** — `status` ∈ {`disabled`,`connecting`,`disconnected`,`error`} ⇒ plugin
+    **não faz nada**: MCP morto, zero tools, nenhum erro (regressão face ao
+    antecessor, que desconectava em qualquer não-conectado).
+  - **D-7** — `409` de concorrência (dois boots) vira FATAL, sem retry/reparo.
+  - **D-1/D-2** — o comando E2E prescrito pela epic é vermelho, e a suíte do MCP
+    ignora `E2E_CODE_TOKEN` caindo em fallback silencioso para o `graph-key.json`
+    (é o que produzia um "verde" falso). **Corrigido o runbook**:
+    `docs/RUNBOOK-E2E.md` (por arquivo, medido 9/9).
+  - **D-5** junção ingênua de URL; **D-8** `mcp.name` cru nos path params;
+    **D-9** token só-espaços vira header; **D-10** `memtier: false` não bloqueia.
+  Escopo aberto: **`E3b-S4`** (corrigir D-1..D-10) e **`E3b-S5`** (fechamento:
+  comando E2E verde com o token certo + cobrir D-11/D-12/D-13).
