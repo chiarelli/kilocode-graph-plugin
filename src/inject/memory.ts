@@ -170,15 +170,31 @@ export async function recallAndFormat(
 
 /**
  * Injetor com estado de **dedup por turno** (FR-104): a mesma memória não é
- * reinjetada no mesmo turno. O turno é identificado pelo texto do usuário; ao
- * mudar o turno, o conjunto de fatos já injetados é limpo. Fatos já vistos no
- * turno são filtrados antes do orçamento — se nada sobra, devolve `null` (não
+ * reinjetada no mesmo turno.
+ *
+ * O **turno** aqui é o que o nome diz: uma mensagem do usuário e as respostas do
+ * modelo até a próxima mensagem do usuário. A identidade é o `turnoId` — o `id`
+ * da `UserMessage` do Kilo (estável e único por turno). O **texto** do usuário
+ * NÃO serve: duas mensagens diferentes com o mesmo texto colapsariam no mesmo
+ * turno e a segunda não receberia memória; e um turno que roda o `transform`
+ * mais de uma vez não pode ser tratado como turno novo.
+ *
+ * Ao mudar o `turnoId`, o conjunto de fatos já injetados é limpo. Fatos já vistos
+ * no turno são filtrados antes do orçamento — se nada sobra, devolve `null` (não
  * injeta bloco vazio).
+ *
+ * > Nota de vocabulário: no antecessor (openviking) `turno` designava o **batch
+ * > de ingestão** (`turnQueue`, `ingestBatchSize` → `POST …/messages/batch`) —
+ * > nome herdado, semanticamente impróprio. Aqui o termo volta ao sentido
+ * > literal (um passo da conversa); o lote de ingestão é `batch` (E4).
  */
 export class MemoryInjector {
   private readonly client: RecallClient;
   private readonly cfg: RecallConfig;
-  private turnKey: string | null = null;
+  /** `turnoId` corrente; `null` = nenhum turno visto ainda nesta sessão. */
+  private turnoId: string | null = null;
+  /** O turno corrente já injetou um bloco? Um turno injeta **no máximo um**. */
+  private injectedThisTurn = false;
   private readonly seen = new Set<string>();
 
   constructor(client: RecallClient, cfg: RecallConfig) {
@@ -196,12 +212,23 @@ export class MemoryInjector {
     }
   }
 
-  /** Recall + dedup + orçamento + bloco. `null` ⇒ nada a injetar. */
-  async inject(query: string): Promise<InjectionResult | null> {
-    if (query !== this.turnKey) {
-      this.turnKey = query;
+  /**
+   * Recall + dedup + orçamento + bloco. `null` ⇒ nada a injetar.
+   *
+   * `turnoId` identifica o turno (o `id` da `UserMessage`); `query` é o texto
+   * usado no recall. Trocar de turno limpa o dedup; o mesmo turno NUNCA
+   * reinjeta a mesma memória, por mais vezes que o `transform` rode nele.
+   */
+  async inject(turnoId: string, query: string): Promise<InjectionResult | null> {
+    if (turnoId !== this.turnoId) {
+      this.turnoId = turnoId;
       this.seen.clear();
+      this.injectedThisTurn = false;
     }
+    // Um turno injeta NO MÁXIMO um bloco. Sem isto, rodar o `transform` mais de
+    // uma vez no mesmo turno acumula blocos (o orçamento corta por chamada, não
+    // por turno) — medido: 5 fatos com `maxMemories=2` davam 3 blocos (2+2+1).
+    if (this.injectedThisTurn) return null;
     const { result, recallMs } = await runRecall(
       this.client,
       this.cfg,
@@ -217,6 +244,7 @@ export class MemoryInjector {
       return null;
     }
     for (const f of facts) this.seen.add(f.fact);
+    this.injectedThisTurn = true;
     const injection: InjectionResult = {
       block,
       facts: facts.length,

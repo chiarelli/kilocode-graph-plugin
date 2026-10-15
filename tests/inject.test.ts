@@ -181,8 +181,8 @@ function rt(facts: Fact[], overrides: RuntimeOpts = {}) {
   };
 }
 
-function userTurn(text: string): TransformMessage[] {
-  return [{ info: { role: "user" }, parts: [{ type: "text", text }] }];
+function userTurn(text: string, id = "turno-1"): TransformMessage[] {
+  return [{ info: { role: "user", id }, parts: [{ type: "text", text }] }];
 }
 
 test("transform_injects: messages com 1 user ⇒ part novo no último user", async () => {
@@ -303,9 +303,9 @@ test("dedup_same_turn: transform 2× mesmo turno ⇒ injeta 1×", async () => {
 
 test("dedup_new_turn_clears: turno novo ⇒ injeta de novo", async () => {
   const { enabled, injector } = rt([fact("fato fixo")]);
-  const first = userTurn("pergunta um");
+  const first = userTurn("pergunta um", "turno-1");
   await injectMemoryIntoMessages(first, enabled, injector);
-  const second = userTurn("pergunta dois");
+  const second = userTurn("pergunta dois", "turno-2"); // turno DIFERENTE
   await injectMemoryIntoMessages(second, enabled, injector);
   assert.equal(second[0]?.parts.length, 2, "turno novo reinjeta");
 });
@@ -348,7 +348,7 @@ test("observability_log: inject loga recall_ms/facts/injected_chars", async () =
   const { injector } = rt([fact("f0"), fact("f1")], { maxMemories: 5 });
   const logPath = "/tmp/kilocode-graph-plugin.log";
   const before = readFileSync(logPath, "utf-8").length;
-  const injection = await injector.inject("q");
+  const injection = await injector.inject("turno-1", "q");
   assert.ok(injection);
   assert.equal(injection.facts, 2);
   assert.equal(injection.chars, injection.block.length);
@@ -455,4 +455,57 @@ test("D-4: timeout NÃO-positivo = sem teto (não aborta no primeiro tick)", asy
     fetch: fetchStub,
   });
   assert.equal((await comTeto.health()).ok, true);
+});
+
+// --- dedup por TURNO de verdade (D-1 da revisão adversarial do E2) ----------
+// "Turno" = uma mensagem do usuário e as respostas do modelo até a próxima
+// mensagem do usuário (sentido literal; a spec E2 §4 e o ARCH §4 usam assim).
+// A identidade é o `id` da UserMessage — NÃO o texto, que era a causa do D-1:
+// turnos distintos com o mesmo texto colapsavam num só, e o mesmo turno rodando
+// o `transform` mais de uma vez era tratado como turno novo (acumulava blocos).
+//
+// Vocabulário: no antecessor (openviking) `turno` designava o BATCH de ingestão
+// (`turnQueue`/`ingestBatchSize` → `POST …/messages/batch`). Aqui os dois são
+// coisas distintas — `turno` é o passo da conversa; o lote de ingestão é
+// `batch` (E4, `ingest/debounce.ts`).
+
+test("D-1: mesmo turno, transform 2x ⇒ NÃO reinjeta o mesmo fato (FR-104)", async () => {
+  // Cenario do D-1: 5 fatos, maxMemories=2. O orcamento corta a lista mas o
+  // dedup so' marcava os que sobraram, entao a 2a passada do MESMO turno
+  // reinjetava f0/f1 de novo (2+2+1 blocos). Agora o turno e' a chave.
+  const { injector } = rt([fact("f0"), fact("f1"), fact("f2"), fact("f3"), fact("f4")], {
+    maxMemories: 2,
+  });
+  const m1 = userTurn("explique o billing");
+  await injectMemoryIntoMessages(m1, true, injector);
+  assert.equal(m1[0]?.parts.length, 2, "1o passada injeta 1 bloco");
+
+  const m2 = userTurn("explique o billing"); // MESMO turno (mesmo id)
+  await injectMemoryIntoMessages(m2, true, injector);
+  assert.equal(m2[0]?.parts.length, 1, "2a passada não injeta nada novo");
+});
+
+test("D-1: turno NOVO com o MESMO texto ⇒ injeta (não colapsa no turno anterior)", async () => {
+  // O defeito antigo (chave = texto): a 2a mensagem identica caia no turno
+  // anterior e o usuario ficava sem memoria sem motivo.
+  const { injector } = rt([fact("f0"), fact("f1")], { maxMemories: 5 });
+  const t1 = userTurn("repita isso", "turno-A");
+  await injectMemoryIntoMessages(t1, true, injector);
+  assert.equal(t1[0]?.parts.length, 2);
+
+  const t2 = userTurn("repita isso", "turno-B"); // texto igual, turno diferente
+  await injectMemoryIntoMessages(t2, true, injector);
+  assert.equal(t2[0]?.parts.length, 2, "turno novo injeta mesmo com texto repetido");
+});
+
+test("D-1: sem `id` no info ⇒ fallback pelo indice (não injeta 2x no mesmo turno)", async () => {
+  // Host degradado (sem `id`): o fallback tem de manter o dedup do MESMO turno.
+  const { injector } = rt([fact("f0")], { maxMemories: 5 });
+  const semId: TransformMessage[] = [
+    { info: { role: "user" }, parts: [{ type: "text", text: "q" }] },
+  ];
+  await injectMemoryIntoMessages(semId, true, injector);
+  assert.equal(semId[0]?.parts.length, 2);
+  await injectMemoryIntoMessages(semId, true, injector);
+  assert.equal(semId[0]?.parts.length, 2, "mesmo turno ⇒ dedup mantido");
 });

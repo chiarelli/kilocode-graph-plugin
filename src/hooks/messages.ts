@@ -37,7 +37,7 @@ export interface TransformPart {
 
 /** Uma mensagem do turno (`{ info, parts }`), como o transform do Kilo entrega. */
 export interface TransformMessage {
-  info: { role?: string };
+  info: { role?: string; id?: string };
   parts: TransformPart[];
 }
 
@@ -125,6 +125,12 @@ export async function injectMemoryIntoMessages(
   const text = extractUserText(parts);
   if (!text.trim()) return;
 
+  // Identidade do turno: o `id` da UserMessage (estável, único por turno). O
+  // TEXTO não serve — duas mensagens diferentes com o mesmo texto colapsariam
+  // no mesmo turno e a segunda ficaria sem memória. Fallback pelo índice da
+  // última mensagem quando o host não fornecer `id` (transform degradado).
+  const turnoId = messages[lastUserIdx]?.info.id ?? `idx:${lastUserIdx}`;
+
   // Health gate (opcional): degradado/503 ⇒ segue sem memória, sem recall.
   if (!(await injector.ready())) {
     log("recall: health gate reprovado; seguindo sem memória");
@@ -133,7 +139,7 @@ export async function injectMemoryIntoMessages(
 
   let injection: { block: string } | null;
   try {
-    injection = await injector.inject(text);
+    injection = await injector.inject(turnoId, text);
   } catch (err) {
     logRecallFailure(err);
     return;
