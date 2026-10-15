@@ -220,12 +220,37 @@ navegação `neighbors` (bloqueada até o memtier expor tool MCP).
 Não bloqueiam a E1; **bloqueiam a E3a**. Ficam registradas para não serem
 redescobertas no meio do loop.
 
-1. **"Todos os arquivos removidos" não é representável.** `CodeSyncBody.files`
-   tem `min_length=1` (`graphiti-daemon/src/memtier/main.py:710`), então o
-   coletor não consegue zerar o grafo de um repo esvaziado. O caso coberto pela
+1. **[DECIDIDO 2026-10-15 — saída (a): aceitar e documentar]** ~~Decidir: aceitar a
+   limitação e documentar, ou pedir campo aditivo ao memtier~~
+   **"Todos os arquivos removidos" não é representável, e aceita-se a limitação.**
+   `CodeSyncBody.files` tem `min_length=1` (`graphiti-daemon/src/memtier/main.py:710`),
+   então o coletor não consegue zerar o grafo de um repo esvaziado. O caso coberto pela
    E3a-S3 é a remoção **individual** (`chunks: []` por arquivo — o campo `chunks`
-   não tem mínimo). Decidir: aceitar a limitação e documentar, ou pedir campo
-   aditivo ao memtier.
+   **não** tem mínimo: `main.py:656`).
+
+   **Prova medida (2026-10-15, contra o memtier vivo):**
+   - `files: []` → **HTTP 422**, `{"type":"too_short","loc":["body","files"],
+     "msg":"List should have at least 1 item after validation, not 0"}`.
+   - Removido **por ausência** (mando outro arquivo, sem o removido) → **202** com
+     `deleted:0` — o arquivo ausente **não** é detectado. O sync é incremental
+     ("estes mudaram"), nunca "o repo é este".
+   - Removido **declarado** (`chunks: []` explícito) → **202**, mecanismo válido.
+
+   **Consequência aceita:** esvaziar um repo **não** limpa o grafo; ficam chunks
+   órfãos, servidos como código atual (o delete é físico — não há `invalid_at` em
+   código). A limpeza é feita declarando `chunks: []` por caminho conhecido.
+
+   **Decisão do memtier que cobre o resto** (já registrada lá, não commitada):
+   o cliente é o **dono da detecção** — invariante "órfão declarado"
+   (`graphiti-daemon/specs/delecao-arquivo-removido-decisao.md` + adendo no
+   ADR-007). O plugin **já cumpre**: `manifest.files − atual` ⇒ `removed` ⇒
+   `chunks: []` (`src/index/collector.ts:204,233`), provado no E2E de ciclo de
+   vida (`tests/e2e/test_e2e_lifecycle.test.ts`, caso F3).
+
+   **Aberto (não é ação do plugin):** o `rust-ast-indexer` **não emite** evento de
+   remoção, e `incremental_index` **aliasa para `index_path`** (recebe lista
+   explícita — não roda `git diff`), então o indexer nunca saberá os removidos.
+   Alternativas com tradeoffs → **RFC no memtier** (`docs/rfc/`).
 2. **Arestas sem teto de paginação.** A E3a-S4 fatia em lotes de ≤100 arquivos
    (`MAX_FILES_PER_REQUEST`, `code.py:112`), mas
    `MAX_EDGES_PER_REQUEST = 5_000` (`code.py:99`). 100 arquivos produzem

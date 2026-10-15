@@ -133,6 +133,14 @@ Escrita só existe via `/v1/code/sync` (abaixo) — a busca é read-only.
 Regras do contrato (memtier ARCH §2):
 - **Arquivo removido = `chunks: []`** — o servidor **não** auto-deleta arquivo
   ausente do payload (spike 010, A1). O coletor mantém um **manifest**.
+  - **Limitação aceita (2026-10-15):** "todos os arquivos removidos" **não é
+    representável** — `files` tem `min_length=1` (`main.py:710`), então um repo
+    inteiramente esvaziado não pode ser declarado (`files: []` → **422**).
+    Esvaziar um repo **não** limpa o grafo; a limpeza é declarando `chunks: []`
+    por caminho conhecido.
+  - **Só o modo FULL detecta removidos.** No incremental `removed = []` por
+    desenho, e `decideTrigger` só volta a FULL no 1º uso (manifest vazio/sem
+    `last_git_head`) — ver `RFC-001` em `graphiti-daemon/docs/rfc/`.
 - ≤1 `FullFile`/`Contextual` por arquivo; `Symbol` exige `symbol_id`,
   `FullFile`/`Contextual` o proíbem.
 - **Aresta cujo alvo não existe como `CodeChunk` → 422** (ADR-012 D3). Resolver

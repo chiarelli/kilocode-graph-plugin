@@ -155,6 +155,9 @@ function shouldFlush(sessionId: string, cfg: IngestCfg): boolean
 5. **Nenhum valor hardcoded** — config via `.kilo/graph-plugin.json`/env (PRD FR-303).
 6. **Defaults desligados** para indexação e injeção (preferência do dono).
 7. **Arquivo removido exige `chunks: []`** — o memtier não auto-deleta (FR-504).
+   - Só o **FULL** detecta removidos (`removed=[]` no incremental); o FULL só
+     ocorre no 1º uso do workspace. "Repo esvaziado" não é representável
+     (`files` `min_length=1`). Limitação **aceita** — ver `RFC-001`.
 8. **Aresta com alvo ausente é descartada** — senão 422 no lote inteiro.
 
 ## Reuso do plugin OpenViking
