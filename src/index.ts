@@ -15,7 +15,10 @@ import { isAbsolute, join } from "node:path";
 import { MemtierClient } from "./client.ts";
 import { loadConfig, type PluginOptions } from "./config.ts";
 import { collectHook } from "./hooks/collect.ts";
+import { ingestHook } from "./hooks/ingest.ts";
 import { messagesHook } from "./hooks/messages.ts";
+import { findKiloDb } from "./ingest/db.ts";
+import { INGEST_STATE_REL_PATH } from "./ingest/state.ts";
 import { debug, formatBootLine, log, logFatal, setDebug } from "./logger.ts";
 import { scheduleMcpRegistration, type KiloLikeClient } from "./mcp/register.ts";
 import type { PluginCtx } from "./types.ts";
@@ -47,6 +50,7 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
     recall_timeout_ms: config.inject.timeout_ms,
     search_timeout_ms: config.inject.timeout_ms,
     sync_timeout_ms: config.code_index.sync_timeout_ms,
+    ingest_timeout_ms: config.ingest.timeout_ms,
   });
 
   log(
@@ -121,6 +125,19 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
         maxTokens: config.inject.max_tokens,
         timeoutMs: config.inject.timeout_ms,
       },
+      client,
+    }),
+    // E4: ingestão assíncrona — `message.updated` (S1) e `session.idle` (S3)
+    // acordam a MESMA rotina; o conteúdo vem do `kilo.db` (ADR-007). O evento
+    // nunca é `await` (não bloqueia o turno, FR-203). Desligado por default.
+    ...ingestHook({
+      cfg: {
+        enabled: config.ingest.enabled,
+        batch_size: config.ingest.batch_size,
+        max_hashes: config.ingest.max_hashes,
+      },
+      dbPath: config.ingest.db_path || findKiloDb(dir),
+      statePath: join(dir, INGEST_STATE_REL_PATH),
       client,
     }),
     // `dispose` drena o health do boot (curto, com `AbortSignal.timeout`). A

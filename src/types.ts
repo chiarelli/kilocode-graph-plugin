@@ -120,6 +120,18 @@ export interface Config {
     /** Timeout por request de sync (ms). Default 120000 (embedding é lento). */
     sync_timeout_ms: number;
   };
+  ingest: {
+    /** Liga a ingestão assíncrona (default `false`). */
+    enabled: boolean;
+    /** Tamanho do lote lido do banco (decisão do dono; default 20). */
+    batch_size: number;
+    /** Teto de hashes de lote por workspace (L-2; default 5000). */
+    max_hashes: number;
+    /** Timeout do `/v1/ingest` (ms; default 15000). */
+    timeout_ms: number;
+    /** Override do caminho do `kilo.db` (vazio ⇒ localiza pelo workspace). */
+    db_path: string;
+  };
   mcp: {
     enabled: boolean;
     name: string;

@@ -43,6 +43,19 @@ export const DEFAULTS = {
     indexer_bin: "",
     sync_timeout_ms: 120000,
   },
+  ingest: {
+    // Defaults desligados (preferência do dono, coerente com index/inject).
+    enabled: false,
+    // Tamanho do lote (valor de config — decisão do dono). Medido: 20 é o
+    // ponto de custo ótimo (~140× mais barato que batch=1, qualidade ~igual).
+    batch_size: 20,
+    // Teto de hashes por workspace (L-2): FIFO ao ultrapassar (aplicado S4).
+    max_hashes: 5000,
+    // Timeout do `/v1/ingest` (responde 202 imediato; folga p/ fila).
+    timeout_ms: 15000,
+    // Override do caminho do `kilo.db` (vazio ⇒ localiza a partir do workspace).
+    db_path: "",
+  },
   mcp: {
     enabled: true,
     name: "memtier",
@@ -263,6 +276,45 @@ export function loadConfig(options?: PluginOptions): Config {
           String(DEFAULTS.code_index.sync_timeout_ms),
         ),
         DEFAULTS.code_index.sync_timeout_ms,
+      ),
+    },
+    ingest: {
+      enabled: resolveBool(
+        resolve(
+          "ingest.enabled",
+          "KILOCODE_GRAPH_INGEST_ENABLED",
+          String(DEFAULTS.ingest.enabled),
+        ),
+        DEFAULTS.ingest.enabled,
+      ),
+      batch_size: resolveInt(
+        resolve(
+          "ingest.batch_size",
+          "KILOCODE_GRAPH_INGEST_BATCH_SIZE",
+          String(DEFAULTS.ingest.batch_size),
+        ),
+        DEFAULTS.ingest.batch_size,
+      ),
+      max_hashes: resolveInt(
+        resolve(
+          "ingest.max_hashes",
+          "KILOCODE_GRAPH_INGEST_MAX_HASHES",
+          String(DEFAULTS.ingest.max_hashes),
+        ),
+        DEFAULTS.ingest.max_hashes,
+      ),
+      timeout_ms: resolveInt(
+        resolve(
+          "ingest.timeout_ms",
+          "KILOCODE_GRAPH_INGEST_TIMEOUT_MS",
+          String(DEFAULTS.ingest.timeout_ms),
+        ),
+        DEFAULTS.ingest.timeout_ms,
+      ),
+      db_path: resolve(
+        "ingest.db_path",
+        "KILOCODE_GRAPH_INGEST_DB_PATH",
+        DEFAULTS.ingest.db_path,
       ),
     },
     mcp: {

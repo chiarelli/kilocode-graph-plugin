@@ -45,6 +45,8 @@ export interface MemtierClientOptions {
   search_timeout_ms?: number;
   /** Timeout do sync de código (ms) — default 120000 (embedding é lento). */
   sync_timeout_ms?: number;
+  /** Timeout do `/v1/ingest` (ms) — default 15000 (responde 202 imediato). */
+  ingest_timeout_ms?: number;
   /** `fetch` injetável (default `globalThis.fetch`). */
   fetch?: FetchLike;
   /** Leitor de arquivo injetável (default `readFileSync` utf-8). */
@@ -56,6 +58,7 @@ const DEFAULT_HEALTH_TIMEOUT_MS = 2000;
 const DEFAULT_RECALL_TIMEOUT_MS = 4000;
 const DEFAULT_SEARCH_TIMEOUT_MS = 4000;
 const DEFAULT_SYNC_TIMEOUT_MS = 120000;
+const DEFAULT_INGEST_TIMEOUT_MS = 15000;
 
 /** Limites do `POST /v1/code/sync` (memtier `code.py`, NFR-09). */
 const MAX_FILES_PER_REQUEST = 100;
@@ -228,6 +231,25 @@ interface RecallResponse {
   truncated?: boolean;
 }
 
+/**
+ * Corpo de `POST /v1/ingest` (E4). `body` é o texto do episódio (1..64KB no
+ * memtier); `reference_time` é a data da **mensagem mais atual do lote**
+ * (ISO-8601), nunca a do envio.
+ */
+interface IngestBody {
+  workspace: string;
+  program: string;
+  body: string;
+  reference_time?: string;
+}
+
+/** Resposta de `POST /v1/ingest` (202 imediato — o worker processa à parte). */
+export interface IngestResult {
+  job_id?: string;
+  workspace?: string;
+  status?: string;
+}
+
 export class MemtierClient {
   private readonly url: string;
   private readonly workspace: string;
@@ -239,6 +261,7 @@ export class MemtierClient {
   private readonly recallTimeoutMs: number;
   private readonly searchTimeoutMs: number;
   private readonly syncTimeoutMs: number;
+  private readonly ingestTimeoutMs: number;
   private readonly fetchImpl: FetchLike;
   private readonly readFileImpl: ReadFileLike;
   /** Cache do token de arquivo: `undefined` = ainda não lido (lazy). */
@@ -255,6 +278,7 @@ export class MemtierClient {
     this.recallTimeoutMs = options.recall_timeout_ms ?? DEFAULT_RECALL_TIMEOUT_MS;
     this.searchTimeoutMs = options.search_timeout_ms ?? DEFAULT_SEARCH_TIMEOUT_MS;
     this.syncTimeoutMs = options.sync_timeout_ms ?? DEFAULT_SYNC_TIMEOUT_MS;
+    this.ingestTimeoutMs = options.ingest_timeout_ms ?? DEFAULT_INGEST_TIMEOUT_MS;
     this.fetchImpl = options.fetch ?? (globalThis.fetch as FetchLike);
     this.readFileImpl =
       options.readFile ?? ((p) => readFileSync(p, "utf-8") as string);
@@ -441,6 +465,33 @@ export class MemtierClient {
     }
     if (typeof res.truncated === "boolean") result.truncated = res.truncated;
     return result;
+  }
+
+  /**
+   * `POST /v1/ingest` (E4-S1). Enfileira um episódio de memória (202 imediato;
+   * o worker roda o `add_episode` à parte, NFR-03). `referenceTime` é a data da
+   * mensagem mais atual do lote (ISO-8601). Lança erro tipado no HTTP não-2xx —
+   * quem chama (a rotina) degrada e NÃO avança o cursor.
+   */
+  async ingest(
+    body: string,
+    referenceTime?: string,
+    signal?: AbortSignal,
+  ): Promise<IngestResult> {
+    const identity = this.resolveIdentity();
+    const reqBody: IngestBody = {
+      workspace: identity.workspace,
+      program: identity.program,
+      body,
+    };
+    if (referenceTime) reqBody.reference_time = referenceTime;
+    return this.sendJson<IngestResult>(
+      "POST",
+      "/v1/ingest",
+      reqBody,
+      this.ingestTimeoutMs,
+      signal,
+    );
   }
 
   /**
