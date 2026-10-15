@@ -6,10 +6,13 @@
  * bloco com procedência (`[CONTEXTO DE MEMÓRIA]`, sentinela `graph-memory` —
  * FR-105). Resposta vazia ⇒ `null` (não injeta bloco vazio).
  *
- * Endurecimento (E2-S2): `max_tokens` no request (A1), `maxChars` (corte por
- * fato inteiro, via `applyBudget`), `timeout_ms` como `AbortSignal` da chamada,
- * dedup por turno (não reinjeta a mesma memória — FR-104), health gate opcional
- * e log de `truncated`.
+ * Endurecimento (E2-S2): `max_tokens` no request (A1), `timeout_ms` como
+ * `AbortSignal` da chamada, dedup por turno (não reinjeta a mesma memória —
+ * FR-104), health gate opcional e log de `truncated`.
+ *
+ * ADR-009: o teto de volume é **por endpoint** (`memoryMaxTokens` → `max_tokens`
+ * no body de `/v1/recall`); o corte de chars do cliente morreu.
+ * `maxMemories` segue como corte de **contagem**.
  *
  * Recebe o client (injetável) e a config; não lê env/arquivo. O hook
  * (`hooks/messages.ts`) é thin e só liga isto ao transform.
@@ -27,8 +30,8 @@ export const MEMORY_HEADER = "[CONTEXTO DE MEMÓRIA]";
 
 /** Config da injeção consumida por `memory.ts` (subconjunto de `inject.*`). */
 export interface RecallConfig extends Budget {
-  /** Teto de tokens no servidor (A1). `undefined` ⇒ sem orçamento A1. */
-  maxTokens?: number;
+  /** Teto de tokens do endpoint de recall (ADR-009). `undefined` ⇒ sem teto A1. */
+  memoryMaxTokens?: number;
   /** Teto da chamada de recall (ms) — governa o `AbortSignal`. */
   timeoutMs?: number;
   /** Checa `health()` antes do recall e degrada rápido se não estiver ok. */
@@ -81,11 +84,6 @@ export function formatMemoryBlock(facts: Fact[]): string | null {
   return `\n\n<context ${MEMORY_SENTINEL}="true">\n${MEMORY_HEADER}\n${lines}\n</context>`;
 }
 
-/** Teto de chars medido sobre o bloco renderizado (para `applyBudget`). */
-function renderForBudget(facts: Fact[]): string {
-  return formatMemoryBlock(facts) ?? "";
-}
-
 /**
  * Resultado de uma injeção — bloco pronto + métricas do turno (base da
  * observabilidade do E7: `recall_ms`, `facts`, `injected_chars`).
@@ -104,16 +102,16 @@ export interface InjectionResult {
 /** Opções de `recall` derivadas da config (limit/max_tokens/signal). */
 function recallOpts(cfg: RecallConfig, signal?: AbortSignal): RecallOpts {
   const opts: RecallOpts = { limit: cfg.maxMemories };
-  if (cfg.maxTokens !== undefined) opts.maxTokens = cfg.maxTokens;
+  if (cfg.memoryMaxTokens !== undefined) opts.maxTokens = cfg.memoryMaxTokens;
   if (signal) opts.signal = signal;
   return opts;
 }
 
 /**
  * O que uma passada de recall devolve ANTES de formatar (E3c-S2): os fatos já
- * filtrados pelo dedup do turno e cortados ao teto `maxMemories`. O teto de
- * chars NÃO é aplicado aqui — quando as duas famílias coexistem ele é do
- * ORÇAMENTO CONJUNTO (`applyJointBudget`), não desta etapa.
+ * filtrados pelo dedup do turno e cortados ao teto `maxMemories`. Não há mais
+ * teto de chars no cliente (ADR-009): o volume é limitado no servidor pelo
+ * `max_tokens` por endpoint.
  */
 export interface MemoryPrep {
   facts: Fact[];
@@ -175,7 +173,7 @@ export async function recallAndFormat(
   signal?: AbortSignal,
 ): Promise<string | null> {
   const { result } = await runRecall(client, cfg, query, signal);
-  const facts = applyBudget(result.facts, cfg, renderForBudget);
+  const facts = applyBudget(result.facts, cfg);
   return formatMemoryBlock(facts);
 }
 
@@ -242,10 +240,6 @@ export class MemoryInjector {
    * checa "um bloco por turno", faz o recall e devolve os fatos **filtrados pelo
    * dedup** e cortados ao teto `maxMemories`. `null` ⇒ nada a preparar (turno já
    * injetou / teto zero). **Lança** o erro do client — o orquestrador decide.
-   *
-   * O teto de chars (quando as duas famílias coexistem) é do orçamento CONJUNTO
-   * (`applyJointBudget`), não desta etapa; por isso `prepare` NÃO corta por
-   * `maxChars`. Use `inject` para o caminho só-de-memória.
    */
   async prepare(turnoId: string, query: string): Promise<MemoryPrep | null> {
     if (!this.beginTurn(turnoId)) return null;
@@ -285,7 +279,7 @@ export class MemoryInjector {
   /**
    * Recall + dedup + orçamento + bloco (caminho só-de-memória, E2). `null` ⇒ nada
    * a injetar. Fina camada sobre `prepare`/`commit` com `applyBudget` (corte por
-   * `maxChars` individual — quando não há bloco de código ao lado).
+   * contagem — `maxMemories`; o volume é do servidor, ADR-009).
    *
    * `turnoId` identifica o turno (o `id` da `UserMessage`); `query` é o texto
    * usado no recall. Trocar de turno limpa o dedup; o mesmo turno NUNCA
@@ -294,7 +288,7 @@ export class MemoryInjector {
   async inject(turnoId: string, query: string): Promise<InjectionResult | null> {
     const prep = await this.prepare(turnoId, query);
     if (!prep) return null;
-    const facts = applyBudget(prep.facts, this.cfg, renderForBudget);
+    const facts = applyBudget(prep.facts, this.cfg);
     const injection = this.commit(prep, facts);
     if (!injection) {
       debug(`recall: nada novo a injetar (${prep.facts.length} fatos)`);

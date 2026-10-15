@@ -1,9 +1,7 @@
 /**
  * E3c-S2 — endurecimento da injeção de código: paralelismo com o recall,
- * orçamento do TOTAL (`maxChars`, código prioritário) e dedup do chunk por
- * turno. Nenhum teste abre socket (client/fetch stubados).
- *
- * Cobre a tabela de testes da E3c-S2 (spec §E3c-S2).
+ * orçamento de CONTAGEM das duas famílias (ADR-009: sem teto conjunto em chars)
+ * e dedup do chunk por turno. Nenhum teste abre socket (client/fetch stubados).
  */
 
 import assert from "node:assert/strict";
@@ -12,8 +10,6 @@ import { test } from "node:test";
 import { MemtierClient, type FetchLike } from "../src/client.ts";
 import type { CodeChunkHit, Fact } from "../src/client.ts";
 import { applyJointBudget } from "../src/inject/budget.ts";
-import { formatMemoryBlock } from "../src/inject/memory.ts";
-import { formatCodeBlock } from "../src/inject/code.ts";
 import {
   messagesHook,
   type TransformMessage,
@@ -36,11 +32,6 @@ function chunk(over: Partial<CodeChunkHit> = {}): CodeChunkHit {
   };
 }
 
-/** Mede o TOTAL exatamente como o orquestrador (bloco de memória + de código). */
-function renderTotal(facts: Fact[], chunks: CodeChunkHit[]): number {
-  return (formatMemoryBlock(facts)?.length ?? 0) + (formatCodeBlock(chunks)?.length ?? 0);
-}
-
 /** `fetch` que despacha recall vs code/search; permite atraso/erro por perna. */
 function legFetch(opts: {
   facts?: Fact[];
@@ -49,16 +40,28 @@ function legFetch(opts: {
   searchDelayMs?: number;
   recallStatus?: number;
   searchStatus?: number;
+  onRecallBody?: (body: Record<string, unknown>) => void;
+  onSearchBody?: (body: Record<string, unknown>) => void;
 }): FetchLike {
-  return async (input) => {
+  return async (input, init) => {
     const url = String(input);
     if (url.includes("/v1/recall")) {
       if (opts.recallDelayMs) await new Promise((r) => setTimeout(r, opts.recallDelayMs));
+      if (opts.onRecallBody) {
+        opts.onRecallBody(
+          JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>,
+        );
+      }
       const status = opts.recallStatus ?? 200;
       return new Response(JSON.stringify({ facts: opts.facts ?? [] }), { status });
     }
     if (url.includes("/v1/code/search")) {
       if (opts.searchDelayMs) await new Promise((r) => setTimeout(r, opts.searchDelayMs));
+      if (opts.onSearchBody) {
+        opts.onSearchBody(
+          JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>,
+        );
+      }
       const status = opts.searchStatus ?? 200;
       return new Response(JSON.stringify({ chunks: opts.chunks ?? [] }), { status });
     }
@@ -83,77 +86,59 @@ function hook(client: MemtierClient, over: {
   codeEnabled?: boolean;
   maxMemories?: number;
   maxCodeChunks?: number;
-  maxChars?: number;
+  memoryMaxTokens?: number;
+  codeMaxTokens?: number;
 } = {}) {
   return messagesHook({
     enabled: over.enabled ?? true,
     cfg: {
       maxMemories: over.maxMemories ?? 5,
-      ...(over.maxChars !== undefined ? { maxChars: over.maxChars } : {}),
+      ...(over.memoryMaxTokens !== undefined ? { memoryMaxTokens: over.memoryMaxTokens } : {}),
     },
     codeEnabled: over.codeEnabled ?? true,
-    codeCfg: { maxCodeChunks: over.maxCodeChunks ?? 3 },
+    codeCfg: {
+      maxCodeChunks: over.maxCodeChunks ?? 3,
+      ...(over.codeMaxTokens !== undefined ? { codeMaxTokens: over.codeMaxTokens } : {}),
+    },
     client,
   });
 }
 
-// --- orçamento do TOTAL (applyJointBudget, puro) ----------------------------
+// --- orçamento de CONTAGEM das duas famílias (ADR-009) ----------------------
 
-test("budget_total_chars: total > maxChars ⇒ corta fatos de memória ANTES de chunks", () => {
-  const facts = Array.from({ length: 5 }, (_v, i) => fact(`fato ${i} `.repeat(6)));
-  const chunks = [chunk({ path: "src/a.rs", code: "x".repeat(120) })];
-  // Teto justo acima do bloco de código: sobra pouco para a memória, que cede
-  // ANTES do chunk (código prioritário).
-  const chunkLen = formatCodeBlock(chunks)?.length ?? 0;
-  const cfg = { maxMemories: 5, maxCodeChunks: 3, maxChars: chunkLen + 60 };
-  const { facts: keptFacts, chunks: keptChunks } = applyJointBudget(
-    facts,
-    chunks,
-    cfg,
-    renderTotal,
-  );
-  assert.ok(keptFacts.length < 5, "a memória deve ceder primeiro");
-  assert.equal(keptChunks.length, 1, "o chunk de código sobrevive");
-  assert.ok(renderTotal(keptFacts, keptChunks) <= cfg.maxChars);
+test("joint_budget_counts_only: cortes independentes por contagem; nenhum corte por char", () => {
+  const facts = Array.from({ length: 8 }, (_v, i) => fact(`fato longo numero ${i} `.repeat(6)));
+  const chunks = [
+    chunk({ path: "src/a.rs", code: "x".repeat(900) }),
+    chunk({ path: "src/b.rs", code: "y".repeat(900) }),
+    chunk({ path: "src/c.rs", code: "z".repeat(900) }),
+    chunk({ path: "src/d.rs", code: "w".repeat(900) }),
+  ];
+  const { facts: f, chunks: c } = applyJointBudget(facts, chunks, {
+    maxMemories: 3,
+    maxCodeChunks: 2,
+  });
+  // Slices independentes: memória corta em 3, código corta em 2.
+  assert.equal(f.length, 3);
+  assert.equal(c.length, 2);
+  // Nenhum item foi descartado por tamanho (nada de corte por char): o chunk de
+  // 900 chars sobrevive porque o teto é de CONTAGEM, não de volume.
+  assert.equal(c[0]?.path, "src/a.rs");
+  assert.equal(c[1]?.path, "src/b.rs");
 });
 
-test("budget_code_priority: ainda acima após cortar toda a memória ⇒ só então corta chunks", () => {
-  // Este chunk sozinho estoura o teto; a memória já foi toda removida.
-  const chunkGrande = chunk({ code: "y".repeat(500) });
-  const cfg = { maxMemories: 5, maxCodeChunks: 3, maxChars: 400 };
-  const { facts, chunks } = applyJointBudget(
-    [fact("m1")],
-    [chunkGrande, chunk({ path: "src/b.rs", code: "z".repeat(200) })],
-    cfg,
-    renderTotal,
-  );
-  assert.equal(facts.length, 0, "memória cedeu inteira antes de qualquer chunk");
-  assert.ok(chunks.length < 2, "só depois o código cede (do fim)");
-});
-
-test("chunk_never_half: 1 chunk maior que o teto restante ⇒ descartado inteiro", () => {
-  const grande = chunk({ code: "w".repeat(900) });
-  const { facts, chunks } = applyJointBudget(
-    [fact("m")],
-    [grande],
-    { maxMemories: 5, maxCodeChunks: 3, maxChars: 100 },
-    renderTotal,
-  );
-  assert.equal(facts.length, 0);
-  assert.equal(chunks.length, 0, "chunk descartado inteiro, nunca pela metade");
-});
-
-test("budget_no_cap: maxChars undefined ⇒ corta só por maxMemories/maxCodeChunks", () => {
-  const facts = [fact("a"), fact("b"), fact("c"), fact("d")];
-  const chunks = [chunk(), chunk({ path: "b" }), chunk({ path: "c" }), chunk({ path: "d" })];
-  const { facts: f, chunks: c } = applyJointBudget(
-    facts,
-    chunks,
-    { maxMemories: 2, maxCodeChunks: 1 },
-    renderTotal,
-  );
-  assert.equal(f.length, 2);
-  assert.equal(c.length, 1);
+test("joint_budget_zero_family: teto de contagem <=0 ⇒ família vazia (não injeta tudo)", () => {
+  const facts = [fact("a"), fact("b")];
+  const chunks = [chunk(), chunk({ path: "b" })];
+  const { facts: f, chunks: c } = applyJointBudget(facts, chunks, {
+    maxMemories: 0,
+    maxCodeChunks: 3,
+  });
+  assert.equal(f.length, 0, "maxMemories<=0 ⇒ sem memória");
+  assert.equal(c.length, 2, "o código segue com o seu próprio teto");
+  const r2 = applyJointBudget(facts, chunks, { maxMemories: 5, maxCodeChunks: 0 });
+  assert.equal(r2.facts.length, 2);
+  assert.equal(r2.chunks.length, 0, "maxCodeChunks<=0 ⇒ sem código");
 });
 
 // --- paralelismo ------------------------------------------------------------
@@ -249,26 +234,76 @@ test("dedup_new_turn_code: turno novo ⇒ injeta de novo", async () => {
   assert.equal(t2[0]?.parts.length, 2, "turno diferente injeta de novo");
 });
 
-// --- orçamento conjunto na fiação real do hook ------------------------------
+// --- tetos por endpoint (ADR-009): cada body com o SEU max_tokens ------------
 
-test("hook_joint_budget: maxChars corta a memória antes de tocar no código", async () => {
-  const facts = Array.from({ length: 5 }, (_v, i) => fact(`fato ${i} `.repeat(8)));
-  const codeChunks = [chunk({ code: "k".repeat(200) })];
-  const codeLen = formatCodeBlock(codeChunks)?.length ?? 0;
-  const client = rtClient(legFetch({ facts, chunks: codeChunks }));
+test("code_body_uses_code_tokens: config de código ⇒ body de code com max_tokens", async () => {
+  let recallBody: Record<string, unknown> = {};
+  let searchBody: Record<string, unknown> = {};
+  const client = rtClient(
+    legFetch({
+      facts: [fact("a")],
+      chunks: [chunk()],
+      onRecallBody: (b) => {
+        recallBody = b;
+      },
+      onSearchBody: (b) => {
+        searchBody = b;
+      },
+    }),
+  );
   const messages = userTurn("q");
-  await hook(client, { maxMemories: 5, maxCodeChunks: 3, maxChars: codeLen + 60 })[
+  await hook(client, { memoryMaxTokens: 1500, codeMaxTokens: 4000 })[
     "experimental.chat.messages.transform"
   ]({}, { messages });
-  // O bloco de código sai; o de memória foi podado (ou sumiu).
+  // Cada endpoint carrega o SEU teto no próprio body (dois valores distintos).
+  assert.equal(recallBody.max_tokens, 1500, "recall usa o teto de memória");
+  assert.equal(searchBody.max_tokens, 4000, "code/search usa o teto de código");
+});
+
+test("endpoints_independent: os dois tetos NÃO se misturam entre os bodies", async () => {
+  let recallBody: Record<string, unknown> = {};
+  let searchBody: Record<string, unknown> = {};
+  const client = rtClient(
+    legFetch({
+      facts: [fact("a")],
+      chunks: [chunk()],
+      onRecallBody: (b) => {
+        recallBody = b;
+      },
+      onSearchBody: (b) => {
+        searchBody = b;
+      },
+    }),
+  );
+  const messages = userTurn("q");
+  await hook(client, { memoryMaxTokens: 1500, codeMaxTokens: 4000 })[
+    "experimental.chat.messages.transform"
+  ]({}, { messages });
+  // Discriminação: o teto de memória NUNCA chega ao body de código e vice-versa.
+  assert.notEqual(recallBody.max_tokens, searchBody.max_tokens);
+  assert.notEqual(recallBody.max_tokens, 4000, "código não vaza para o recall");
+  assert.notEqual(searchBody.max_tokens, 1500, "memória não vaza para o code");
+});
+
+// --- orçamento de contagem na fiação real do hook ---------------------------
+
+test("hook_joint_budget: tetos de contagem independentes por família (ADR-009)", async () => {
+  const facts = Array.from({ length: 8 }, (_v, i) => fact(`fato ${i} `.repeat(8)));
+  const codeChunks = [
+    chunk({ path: "src/a.rs", code: "k".repeat(200) }),
+    chunk({ path: "src/b.rs", code: "k".repeat(200) }),
+    chunk({ path: "src/c.rs", code: "k".repeat(200) }),
+    chunk({ path: "src/d.rs", code: "k".repeat(200) }),
+  ];
+  const client = rtClient(legFetch({ facts, chunks: codeChunks }));
+  const messages = userTurn("q");
+  await hook(client, { maxMemories: 3, maxCodeChunks: 2 })[
+    "experimental.chat.messages.transform"
+  ]({}, { messages });
   const parts = messages[0]?.parts ?? [];
-  const codePart = parts.find((p) => String(p.text).includes("graph-code"));
-  assert.ok(codePart, "o código sobrevive ao corte");
-  const memoryPart = parts.find((p) => String(p.text).includes("graph-memory"));
-  if (memoryPart) {
-    const totalLen = parts
-      .slice(1)
-      .reduce((n, p) => n + String(p.text).length, 0);
-    assert.ok(totalLen <= codeLen + 60, "o total respeita o teto conjunto");
-  }
+  const codePart = String(parts.find((p) => String(p.text).includes("graph-code"))?.text ?? "");
+  const memoryPart = String(parts.find((p) => String(p.text).includes("graph-memory"))?.text ?? "");
+  // Cada família obedece só ao SEU teto de contagem.
+  assert.equal(memoryPart.match(/^- /gm)?.length, 3, "3 fatos de memória");
+  assert.equal(codePart.match(/\[CÓDIGO RELEVANTE/g)?.length, 2, "2 chunks de código");
 });

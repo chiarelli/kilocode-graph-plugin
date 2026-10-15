@@ -98,15 +98,15 @@ function stripTrailingCommas(raw): string                      // D-3: remove v�
 // code_sync) — navegação não é prometida (ADR-006).
 ```
 
-### `inject/budget.ts` (E2 + joint budget da E3c — implementado)
+### `inject/budget.ts` (E2 + joint budget da E3c — implementado; ADR-009)
 ```ts
-function applyBudget(facts: Fact[], cfg: Budget, render?: (f: Fact[]) => string): Fact[]
-// corta por fato INTEIRO: maxMemories (nº) e maxChars (teto do bloco renderizado).
-// `render` é injetado por memory.ts só para medir (evita ciclo de import).
-function applyJointBudget(facts, chunks, cfg, renderTotal): { facts; chunks }
-// E3c: maxChars = teto do TOTAL (memória+código). Corta fatos INTEIROS de
-// memória primeiro (do fim); só então chunks INTEIROS de código (do fim) —
-// código prioritário; chunk nunca pela metade.
+function applyBudget(facts: Fact[], cfg: Budget): Fact[]
+// corta por fato INTEIRO: maxMemories (nº). O teto de VOLUME é do servidor
+// (`max_tokens` por endpoint, ADR-009) — não há mais teto de chars no cliente.
+function applyJointBudget(facts, chunks, cfg): { facts; chunks }
+// E3c: aplica os tetos de CONTAGEM independentes por família (maxMemories /
+// maxCodeChunks). O teto conjunto em chars morreu (ADR-009); corte por item
+// inteiro, nunca pela metade.
 ```
 
 ### `inject/memory.ts` (E2 + prepare/commit da E3c — implementado)
@@ -141,8 +141,9 @@ function messagesHook(rt: InjectRuntime): { "experimental.chat.messages.transfor
 // thin: liga o transform do Kilo aos dois injetores; nunca lança (NFR-03).
 async function injectContextIntoMessages(messages, rt): Promise<void>
 // E3c: memória e código em PARALELO (Promise.allSettled, cada um com seu
-// AbortSignal); orçamento do TOTAL (`applyJointBudget`, código prioritário);
-// memória ANTES do código; um bloco de cada família por turno. Código desligado
+// AbortSignal); orçamento de CONTAGEM por família (`applyJointBudget`:
+// maxMemories/maxCodeChunks — ADR-009, sem teto conjunto em chars); memória
+// ANTES do código; um bloco de cada família por turno. Código desligado
 // ⇒ delega ao caminho E2.
 ```
 
@@ -266,8 +267,8 @@ default. Em `options`, o placeholder `{env:VAR}` resolve a env var citada
 | `daemon.health_timeout_ms` | `KILOCODE_GRAPH_HEALTH_TIMEOUT_MS` | `2000` |
 | `inject.enabled` | `KILOCODE_GRAPH_INJECT_ENABLED` | `false` |
 | `inject.max_memories` | `KILOCODE_GRAPH_INJECT_MAX_MEMORIES` | `5` |
-| `inject.max_chars` | `KILOCODE_GRAPH_INJECT_MAX_CHARS` | `3000` |
-| `inject.max_tokens` | `KILOCODE_GRAPH_INJECT_MAX_TOKENS` | `2000` |
+| `inject.memory_max_tokens` | `KILOCODE_GRAPH_INJECT_MEMORY_MAX_TOKENS` | `2000` |
+| `inject.code_max_tokens` | `KILOCODE_GRAPH_INJECT_CODE_MAX_TOKENS` | `2000` |
 | `inject.timeout_ms` | `KILOCODE_GRAPH_INJECT_TIMEOUT_MS` | `4000` |
 | `inject.code_enabled` | `KILOCODE_GRAPH_INJECT_CODE_ENABLED` | `false` |
 | `inject.max_code_chunks` | `KILOCODE_GRAPH_INJECT_MAX_CODE_CHUNKS` | `3` |

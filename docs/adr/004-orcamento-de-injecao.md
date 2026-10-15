@@ -1,6 +1,8 @@
 # ADR-004 — Orçamento de injeção com defaults conservadores
 
-**Status:** aceito
+**Status:** superado por [ADR-009](009-limites-por-endpoint-e-piso-de-confianca.md)
+(o modelo `max_chars` conjunto + `max_tokens` compartilhado é substituído por
+limites **por endpoint em tokens** e um piso de confiança da memória)
 **Data:** 2026-10-06
 **Origem:** PRD FR-106, E7
 

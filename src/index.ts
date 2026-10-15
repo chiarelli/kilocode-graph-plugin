@@ -190,8 +190,7 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
       enabled: config.inject.enabled,
       cfg: {
         maxMemories: config.inject.max_memories,
-        maxChars: config.inject.max_chars,
-        maxTokens: config.inject.max_tokens,
+        memoryMaxTokens: config.inject.memory_max_tokens,
         timeoutMs: config.inject.timeout_ms,
         // Health gate é opcional (spec §E2-S2): desligado para não dobrar o
         // round-trip no caminho crítico — um 503 do próprio recall já degrada.
@@ -200,7 +199,7 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
       codeEnabled: config.inject.code_enabled,
       codeCfg: {
         maxCodeChunks: config.inject.max_code_chunks,
-        maxTokens: config.inject.max_tokens,
+        codeMaxTokens: config.inject.code_max_tokens,
         timeoutMs: config.inject.timeout_ms,
       },
       client,

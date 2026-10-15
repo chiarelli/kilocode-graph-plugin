@@ -20,7 +20,6 @@ import {
 import { applyBudget } from "../src/inject/budget.ts";
 import type { Fact } from "../src/client.ts";
 import { injectMemoryIntoMessages, type TransformMessage } from "../src/hooks/messages.ts";
-
 /** Stub de `fetch` que captura o request e devolve `{ facts }` (ou o status dado). */
 function recallFetch(
   facts: Fact[],
@@ -57,6 +56,20 @@ test("recall_body_shape: body tem workspace/program/query/limit/max_tokens", asy
   assert.equal(body.query, "onde fica o billing");
   assert.equal(body.limit, 5);
   assert.equal(body.max_tokens, 2000);
+});
+
+test("recall_body_uses_memory_tokens: config de memória ⇒ body de recall com max_tokens", async () => {
+  let body: Record<string, unknown> = {};
+  const client = new MemtierClient({
+    url: "http://memtier:8400",
+    workspace: "ws",
+    fetch: recallFetch([fact("a")], (b) => {
+      body = b;
+    }),
+  });
+  // Teto de memória 1500 (o de código seria 4000): o recall usa o SEU.
+  await recallAndFormat(client, { maxMemories: 5, memoryMaxTokens: 1500 }, "q");
+  assert.equal(body.max_tokens, 1500);
 });
 
 test("recall_omits_optional_fields: sem opts ⇒ só identidade+query", async () => {
@@ -154,8 +167,7 @@ test("recall_and_format: orçamento aplicado antes de formatar", async () => {
 interface RuntimeOpts {
   enabled?: boolean;
   maxMemories?: number;
-  maxChars?: number;
-  maxTokens?: number;
+  memoryMaxTokens?: number;
   timeoutMs?: number;
   healthGate?: boolean;
   status?: number;
@@ -170,8 +182,9 @@ function rt(facts: Fact[], overrides: RuntimeOpts = {}) {
   });
   const cfg = {
     maxMemories: overrides.maxMemories ?? 5,
-    ...(overrides.maxChars !== undefined ? { maxChars: overrides.maxChars } : {}),
-    ...(overrides.maxTokens !== undefined ? { maxTokens: overrides.maxTokens } : {}),
+    ...(overrides.memoryMaxTokens !== undefined
+      ? { memoryMaxTokens: overrides.memoryMaxTokens }
+      : {}),
     ...(overrides.timeoutMs !== undefined ? { timeoutMs: overrides.timeoutMs } : {}),
     ...(overrides.healthGate !== undefined ? { healthGate: overrides.healthGate } : {}),
   };
@@ -234,28 +247,30 @@ test("transform_recall_fails: recall lança ⇒ hook não lança; sem part", asy
 });
 
 // --- E2-S2: orçamento, max_tokens, dedup, degradação ------------------------
+// ADR-009: o orçamento do cliente é só CONTAGEM (`maxMemories`); o teto de
+// volume é por endpoint no servidor (`max_tokens` no body de cada rota).
 
-/** Render do bloco para medir o teto de chars (mesmo formato do memory.ts). */
-const renderBlock = (facts: Fact[]): string => formatMemoryBlock(facts) ?? "";
-
-test("budget_maxchars_whole_facts: 5 fatos longos, max 100 chars ⇒ fatos inteiros", () => {
-  const facts = Array.from({ length: 5 }, (_v, i) =>
-    fact(`fato suficientemente longo numero ${i} para estourar o teto`),
-  );
-  const kept = applyBudget(facts, { maxMemories: 5, maxChars: 100 }, renderBlock);
-  assert.ok(kept.length < 5, "deve cortar fatos inteiros");
-  assert.ok(renderBlock(kept).length <= 100, "bloco cabe no teto");
-  // Nenhum fato veio pela metade.
+test("budget_counts_only: 8 fatos, maxMemories=5 ⇒ 5 fatos (contagem)", () => {
+  const facts = Array.from({ length: 8 }, (_v, i) => fact(`f${i}`));
+  const kept = applyBudget(facts, { maxMemories: 5 });
+  assert.equal(kept.length, 5);
   for (const k of kept) assert.ok(facts.some((f) => f.fact === k.fact));
 });
 
-test("budget_maxchars_drops_all_when_single_fact_too_long", () => {
-  const facts = [fact("x".repeat(500))];
-  const kept = applyBudget(facts, { maxMemories: 5, maxChars: 20 }, renderBlock);
-  assert.equal(kept.length, 0);
+test("budget_whole_items: um fato grande nunca é fatiado pela metade", () => {
+  const grande = fact("x".repeat(500));
+  const kept = applyBudget([grande, fact("curto")], { maxMemories: 5 });
+  assert.equal(kept.length, 2);
+  assert.equal(kept[0]?.fact.length, 500, "o fato entra INTEIRO, não truncado");
 });
 
-test("budget_sends_max_tokens: config ⇒ request tem max_tokens", async () => {
+test("budget_maxmemories_nonpositive: teto <=0 ⇒ lista vazia (nunca injeta tudo)", () => {
+  const facts = [fact("a"), fact("b")];
+  assert.equal(applyBudget(facts, { maxMemories: 0 }).length, 0);
+  assert.equal(applyBudget(facts, { maxMemories: -1 }).length, 0);
+});
+
+test("budget_sends_max_tokens: config de memória ⇒ request tem max_tokens", async () => {
   let body: Record<string, unknown> = {};
   const client = new MemtierClient({
     url: "http://memtier:8400",
@@ -264,7 +279,7 @@ test("budget_sends_max_tokens: config ⇒ request tem max_tokens", async () => {
       body = b;
     }),
   });
-  await recallAndFormat(client, { maxMemories: 5, maxTokens: 2000 }, "q");
+  await recallAndFormat(client, { maxMemories: 5, memoryMaxTokens: 2000 }, "q");
   assert.equal(body.max_tokens, 2000);
 });
 
@@ -284,7 +299,7 @@ test("budget_respects_truncated: truncated ⇒ log + bloco usa o que veio", asyn
   });
   const logPath = "/tmp/kilocode-graph-plugin.log";
   const before = readFileSync(logPath, "utf-8").length;
-  const block = await recallAndFormat(client, { maxMemories: 5, maxTokens: 2000 }, "q");
+  const block = await recallAndFormat(client, { maxMemories: 5, memoryMaxTokens: 2000 }, "q");
   assert.ok(block);
   assert.match(block, /só o primeiro/);
   const appended = readFileSync(logPath, "utf-8").slice(before);
@@ -382,23 +397,20 @@ test("timeout_no_inject: recall pendura ⇒ aborta; sem injeção; turno segue",
 });
 
 // --- regressão da revisão adversarial do E2 (defeitos D-2, D-3, D-4) ---------
-// Cada teste abaixo REPROVA no código anterior à correção (verificado: D-2
-// devolvia lista vazia, D-3 fechava a sentinela, D-4 abortava de imediato).
+// Duas destas (D-2, D-4) seguem reprovando no código anterior à correção. A
+// D-2 era sobre `maxChars` — chave REMOVIDA pelo ADR-009; a lição que ela
+// pinava (teto não-positivo não pode virar modo degenerado) migrou para
+// `budget_maxmemories_nonpositive`, abaixo neste arquivo.
 
-test("D-2: maxChars NÃO-positivo = sem teto (não pode zerar a injeção)", () => {
+test("D-2 (migrado): teto de contagem não-positivo ⇒ lista vazia (nunca injeta tudo)", () => {
   const facts = [fact("a"), fact("b")];
-  // Render de tamanho fixo e conhecido: torna o corte determinístico,
-  // independente do texto que o helper `fact()` produz.
-  const render = () => "x".repeat(100);
-  // O defeito: `length > -1` é sempre verdadeiro ⇒ drenava até vazio.
-  assert.equal(applyBudget(facts, { maxMemories: 5, maxChars: -1 }, render).length, 2);
-  assert.equal(applyBudget(facts, { maxMemories: 5, maxChars: -100 }, render).length, 2);
-  // `0` tem o mesmo contrato que `undefined` (sem teto).
-  assert.equal(applyBudget(facts, { maxMemories: 5, maxChars: 0 }, render).length, 2);
-  assert.equal(applyBudget(facts, { maxMemories: 5 }, render).length, 2);
+  // O único teto de cliente agora é `maxMemories` (ADR-009). `<=0` degrada para
+  // "sem memória" — nunca para "injeta tudo" (o oposto do defeito do E2).
+  assert.equal(applyBudget(facts, { maxMemories: 0 }).length, 0);
+  assert.equal(applyBudget(facts, { maxMemories: -1 }).length, 0);
   // Teto positivo continua cortando — não pode ter afrouxado o caminho normal.
-  assert.equal(applyBudget(facts, { maxMemories: 5, maxChars: 1000 }, render).length, 2);
-  assert.equal(applyBudget(facts, { maxMemories: 5, maxChars: 50 }, render).length, 0);
+  assert.equal(applyBudget(facts, { maxMemories: 5 }).length, 2);
+  assert.equal(applyBudget([fact("a"), fact("b"), fact("c")], { maxMemories: 2 }).length, 2);
 });
 
 test("D-3: fato com quebra de linha/tag não escapa da sentinela", () => {

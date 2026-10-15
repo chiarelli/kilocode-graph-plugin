@@ -118,8 +118,18 @@ export interface Config {
   inject: {
     enabled: boolean;
     max_memories: number;
-    max_chars: number;
-    max_tokens: number;
+    /**
+     * ADR-009 — teto de tokens do bloco de MEMÓRIA (unidade `chars/4`, a do
+     * memtier). Vai no body de `POST /v1/recall` como `max_tokens`. Substitui o
+     * teto de chars do cliente e o `max_tokens` compartilhado do ADR-004.
+     */
+    memory_max_tokens: number;
+    /**
+     * ADR-009 — teto de tokens do bloco de CÓDIGO. Vai no body de
+     * `POST /v1/code/search` como `max_tokens`. Independente do de memória: cada
+     * endpoint carrega o SEU teto.
+     */
+    code_max_tokens: number;
     timeout_ms: number;
     /** E3c — liga a injeção do bloco de código (default `false`). */
     code_enabled: boolean;

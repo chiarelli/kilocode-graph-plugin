@@ -25,19 +25,16 @@ import { debug, log, logFatal } from "../logger.ts";
 import { applyJointBudget, type JointBudget } from "../inject/budget.ts";
 import {
   MemoryInjector,
-  formatMemoryBlock,
   type MemoryPrep,
   type RecallClient,
   type RecallConfig,
 } from "../inject/memory.ts";
 import {
   CodeInjector,
-  formatCodeBlock,
   type CodeConfig,
   type CodePrep,
   type SearchClient,
 } from "../inject/code.ts";
-import type { CodeChunkHit, Fact } from "../client.ts";
 
 /** Um `Part` do turno, na forma mínima que a injeção consome. */
 export interface TransformPart {
@@ -186,11 +183,6 @@ function logCodeFailure(err: unknown): void {
   logFatal("code_search", err);
 }
 
-/** Mede o TOTAL (memória + código) para o teto conjunto (`maxChars`). */
-function renderTotal(facts: Fact[], chunks: CodeChunkHit[]): number {
-  return (formatMemoryBlock(facts)?.length ?? 0) + (formatCodeBlock(chunks)?.length ?? 0);
-}
-
 /** Dependências da orquestração do turno (injetores com estado + config). */
 export interface ContextRuntime {
   enabled: boolean;
@@ -204,12 +196,12 @@ export interface ContextRuntime {
 /**
  * Orquestra o turno (E3c-S2): memória e código partem **em paralelo**
  * (`Promise.allSettled` — a falha de uma não cancela a outra, decisão 2) e o
- * orçamento do **total** (`maxChars`, código prioritário — decisão 3) é aplicado
- * uma única vez. Memória ANTES de código no turno. **Nunca lança** (NFR-03).
+ * orçamento de **contagem** (`applyJointBudget`: `maxMemories`/`maxCodeChunks`) é
+ * aplicado uma única vez. Memória ANTES de código no turno. **Nunca lança**
+ * (NFR-03).
  *
- * A preparação (rede) e o commit (dedup + formatação) ficam separados nos
- * injetores: só depois das duas respostas o orçamento conjunto decide o corte —
- * sem isso, o corte de uma família não enxergaria o tamanho da outra.
+ * O teto de **volume** é por endpoint, no servidor (`max_tokens` no body de cada
+ * rota — ADR-009); o hook não recompõe um teto conjunto em chars.
  */
 export async function injectContextIntoMessages(
   messages: TransformMessage[],
@@ -255,18 +247,16 @@ export async function injectContextIntoMessages(
   if (codeSettled.status === "rejected") logCodeFailure(codeSettled.reason);
   else codePrep = codeSettled.value;
 
-  // Orçamento do TOTAL: tetos independentes + `maxChars` conjunto (código
-  // prioritário). Os injetores commitam a lista FINAL (já cortada).
+  // Orçamento de contagem: tetos independentes por família (ADR-009 — sem teto
+  // de chars conjunto). Os injetores commitam a lista FINAL (já cortada).
   const joint: JointBudget = {
     maxMemories: rt.cfg.maxMemories,
     maxCodeChunks: rt.codeCfg.maxCodeChunks,
-    maxChars: rt.cfg.maxChars,
   };
   const { facts, chunks } = applyJointBudget(
     memPrep?.facts ?? [],
     codePrep?.chunks ?? [],
     joint,
-    renderTotal,
   );
 
   const memory = memPrep ? rt.memoryInjector.commit(memPrep, facts) : null;
@@ -287,9 +277,10 @@ export async function injectContextIntoMessages(
  * injetores com estado de dedup por turno uma única vez — o hook é registrado no
  * boot e reutilizado em todos os turnos.
  *
- * E3c (S2): memória e código correm em paralelo; o orçamento do total é conjunto
- * (código prioritário) e um turno injeta no máximo um bloco de cada família.
- * Só memória (código desligado) segue pelo caminho E2 testado.
+ * E3c (S2): memória e código correm em paralelo; o orçamento é de **contagem**,
+ * por família (ADR-009 — sem teto conjunto em chars) e um turno injeta no máximo
+ * um bloco de cada família. Só memória (código desligado) segue pelo caminho E2
+ * testado.
  */
 export function messagesHook(rt: InjectRuntime) {
   const memoryInjector = new MemoryInjector(rt.client, rt.cfg);

@@ -31,8 +31,8 @@ export const CODE_HEADER = "CÓDIGO RELEVANTE";
 export interface CodeConfig {
   /** Nº máximo de chunks injetados (o mesmo valor vai no `limit` da busca). */
   maxCodeChunks: number;
-  /** Teto de tokens no servidor (A1). `undefined` ⇒ sem orçamento A1. */
-  maxTokens?: number;
+  /** Teto de tokens do endpoint de busca (ADR-009). `undefined` ⇒ sem teto A1. */
+  codeMaxTokens?: number;
   /** Teto da chamada de busca (ms) — governa o `AbortSignal`. */
   timeoutMs?: number;
 }
@@ -79,7 +79,7 @@ function timeoutSignal(cfg: CodeConfig): AbortSignal | undefined {
 /** Opções de `searchCode` derivadas da config (limit/max_tokens/signal). */
 function searchOpts(cfg: CodeConfig, signal?: AbortSignal): SearchCodeOpts {
   const opts: SearchCodeOpts = { limit: cfg.maxCodeChunks };
-  if (cfg.maxTokens !== undefined) opts.maxTokens = cfg.maxTokens;
+  if (cfg.codeMaxTokens !== undefined) opts.maxTokens = cfg.codeMaxTokens;
   if (signal) opts.signal = signal;
   return opts;
 }
@@ -114,8 +114,9 @@ function dedupeByIdentity(chunks: CodeChunkHit[]): CodeChunkHit[] {
 
 /**
  * O que uma passada de busca devolve ANTES de formatar (E3c-S2): os chunks
- * filtrados pelo dedup do turno e cortados ao teto `maxCodeChunks`. O teto de
- * chars é do ORÇAMENTO CONJUNTO (`applyJointBudget`), não desta etapa.
+ * filtrados pelo dedup do turno e cortados ao teto `maxCodeChunks`. Não há mais
+ * teto de chars no cliente (ADR-009): o volume é limitado no servidor pelo
+ * `max_tokens` por endpoint.
  */
 export interface CodePrep {
   chunks: CodeChunkHit[];
@@ -148,9 +149,8 @@ async function runSearch(
  * pronto ou `null` quando não há o que injetar (0 chunks). **Lança** o erro do
  * client — quem chama (o hook) degrada.
  *
- * O teto de chars NÃO é aplicado aqui: quando as duas famílias coexistem, ele é
- * do orçamento conjunto (`applyJointBudget`, decisão 3). Este caminho é o
- * só-de-código.
+ * Não há teto de chars no cliente (ADR-009): o volume é limitado no servidor
+ * pelo `max_tokens` do endpoint. Este é o caminho só-de-código.
  */
 export async function searchAndFormat(
   client: SearchClient,

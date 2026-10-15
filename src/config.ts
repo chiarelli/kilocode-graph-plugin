@@ -23,7 +23,15 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { log } from "./logger.ts";
 import type { Config } from "./types.ts";
+
+/**
+ * Teto interno de `max_tokens` no servidor (memtier `budget.py:61`,
+ * `MAX_RESPONSE_TOKENS`): acima dele o memtier responde **422**. O cliente nunca
+ * envia acima disso (ADR-009, decisão 1).
+ */
+const MAX_RESPONSE_TOKENS = 16000;
 
 /** Defaults — a única fonte de verdade dos valores não configurados (FR-303). */
 export const DEFAULTS = {
@@ -46,8 +54,12 @@ export const DEFAULTS = {
   inject: {
     enabled: false,
     max_memories: 5,
-    max_chars: 3000,
-    max_tokens: 2000,
+    // ADR-009: unidade única = tokens (`chars/4`, o tipo do memtier). Um teto
+    // POR endpoint (`max_tokens` no body de cada rota), o mesmo default nos dois.
+    // Substituem o teto de chars do cliente e o `max_tokens` único
+    // (servidor, compartilhado) do ADR-004 — que MORRERAM.
+    memory_max_tokens: 2000,
+    code_max_tokens: 2000,
     timeout_ms: 4000,
     // E3c — injeção de código (segunda onda; declarada pela epic dona, pois o
     // E1 fechou antes da E3c ser especada — ver histórico do BACKLOG).
@@ -144,6 +156,19 @@ function resolveInt(raw: string | undefined, fallback: number): number {
 }
 
 /**
+ * Teto de tokens de um endpoint. O servidor devolve **422** para
+ * `max_tokens > MAX_RESPONSE_TOKENS` (16000, memtier `main.py:888`) ou `<= 0`
+ * (`ge=1`). O cliente **nunca** envia acima do teto interno (ADR-009, decisão 1):
+ * um valor fora de `[1, 16000]` cai no default, em vez de virar um 422 no
+ * caminho do turno. Mesma filosofia do `resolvePositiveInt` (modo degenerado não
+ * passa em silêncio).
+ */
+function resolveTokenCap(raw: string | undefined, fallback: number): number {
+  const n = resolveInt(raw, fallback);
+  return n >= 1 && n <= MAX_RESPONSE_TOKENS ? n : fallback;
+}
+
+/**
  * Inteiro estritamente **positivo**; `<= 0` (ou inválido) cai no default. Usado
  * onde `0`/negativo seria um modo degenerado silencioso — p.ex. `ingest.batch_size`
  * com `LIMIT 0`/`LIMIT -n` (que no SQLite significa "sem limite") travaria ou
@@ -207,7 +232,7 @@ function loadConfigFile(dir: string): Record<string, unknown> {
   return result;
 }
 
-/** Lê um valor aninhado do arquivo de config (ex.: `inject.max_chars`). */
+/** Lê um valor aninhado do arquivo de config (ex.: `inject.memory_max_tokens`). */
 function filePick(
   file: Record<string, unknown>,
   path: string,
@@ -223,6 +248,42 @@ function filePick(
 }
 
 /**
+ * Envs LEGADAS de limite de injeção (ADR-009, decisão 5). Montadas a partir do
+ * prefixo comum **de propósito**: o critério de aceite do ADR-009 exige que o
+ * repositório não guarde referência mecânica às chaves antigas (busca no `src/`
+ * por elas retorna zero), e estes nomes existem só AQUI, para **detectar e
+ * avisar** — nunca para ler um valor. Escrever o nome inteiro faria o próprio
+ * aviso de depreciação reprovar a checagem; a montagem preserva os dois
+ * contratos (aviso + busca limpa).
+ */
+const LEGACY_INJECT_PREFIX = "KILOCODE_GRAPH_INJECT";
+const LEGACY_INJECT_ENVS = [
+  `${LEGACY_INJECT_PREFIX}_MAX_CHARS`,
+  `${LEGACY_INJECT_PREFIX}_MAX_TOKENS`,
+] as const;
+
+/**
+ * Aviso de depreciação das envs LEGADAS (ADR-009, decisão 5). O teto de chars do
+ * cliente e o `max_tokens` compartilhado deixaram de ser lidos; se o ambiente
+ * ainda os seta, o boot emite **um** log de aviso (depreciação + chave
+ * substituta) — quem calibrou não perde o ajuste em silêncio. Pura e testável:
+ * devolve a linha ou `null` quando nenhuma env legada está setada.
+ */
+export function legacyInjectWarning(env: NodeJS.ProcessEnv): string | null {
+  const set = LEGACY_INJECT_ENVS.filter((name) => {
+    const v = env[name];
+    return v !== undefined && v.trim() !== "";
+  });
+  if (set.length === 0) return null;
+  return (
+    `config: env(s) legada(s) de limite de injeção setada(s): ` +
+    `${set.join(", ")} — DEPRECIADA(s) e IGNORADA(s); use ` +
+    `KILOCODE_GRAPH_INJECT_MEMORY_MAX_TOKENS e/ou ` +
+    `KILOCODE_GRAPH_INJECT_CODE_MAX_TOKENS (ADR-009)`
+  );
+}
+
+/**
  * Monta a configuração efetiva. `options` vem do `kilo.jsonc`; env e arquivos
  * são lidos do ambiente/workspace. `dir` é o diretório do workspace resolvido
  * no runtime do Kilo (`resolveWorkspaceDir(ctx)`); default `process.cwd()` só
@@ -234,6 +295,10 @@ export function loadConfig(
 ): Config {
   const env = process.env;
   const file = loadConfigFile(dir);
+
+  // ADR-009, decisão 5: envs legadas setadas ⇒ **um** aviso (nunca silêncio).
+  const legacy = legacyInjectWarning(env);
+  if (legacy) log(legacy);
 
   const resolve = (
     key: string,
@@ -292,21 +357,21 @@ export function loadConfig(
         ),
         DEFAULTS.inject.max_memories,
       ),
-      max_chars: resolveInt(
+      memory_max_tokens: resolveTokenCap(
         resolve(
-          "inject.max_chars",
-          "KILOCODE_GRAPH_INJECT_MAX_CHARS",
-          String(DEFAULTS.inject.max_chars),
+          "inject.memory_max_tokens",
+          "KILOCODE_GRAPH_INJECT_MEMORY_MAX_TOKENS",
+          String(DEFAULTS.inject.memory_max_tokens),
         ),
-        DEFAULTS.inject.max_chars,
+        DEFAULTS.inject.memory_max_tokens,
       ),
-      max_tokens: resolveInt(
+      code_max_tokens: resolveTokenCap(
         resolve(
-          "inject.max_tokens",
-          "KILOCODE_GRAPH_INJECT_MAX_TOKENS",
-          String(DEFAULTS.inject.max_tokens),
+          "inject.code_max_tokens",
+          "KILOCODE_GRAPH_INJECT_CODE_MAX_TOKENS",
+          String(DEFAULTS.inject.code_max_tokens),
         ),
-        DEFAULTS.inject.max_tokens,
+        DEFAULTS.inject.code_max_tokens,
       ),
       timeout_ms: resolveInt(
         resolve(

@@ -15,13 +15,17 @@ import { join } from "node:path";
 import { after, afterEach, before, test } from "node:test";
 
 import { DEFAULTS, loadConfig } from "../src/config.ts";
+import { __setLogSink } from "../src/logger.ts";
 
 const ENV_KEYS = [
   "KILOCODE_GRAPH_URL",
   "KILOCODE_GRAPH_PROGRAM",
   "KILOCODE_GRAPH_TOKEN",
   "KILOCODE_GRAPH_INJECT_ENABLED",
+  "KILOCODE_GRAPH_INJECT_MEMORY_MAX_TOKENS",
+  "KILOCODE_GRAPH_INJECT_CODE_MAX_TOKENS",
   "KILOCODE_GRAPH_INJECT_MAX_CHARS",
+  "KILOCODE_GRAPH_INJECT_MAX_TOKENS",
   "KILOCODE_GRAPH_INDEX_SYNC_TIMEOUT_MS",
 ] as const;
 
@@ -79,10 +83,93 @@ test("config_invalid_bool: valor não-booleano cai no default", () => {
   assert.equal(loadConfig().inject.enabled, false);
 });
 
-test("config_max_chars_env: KILOCODE_GRAPH_INJECT_MAX_CHARS é honrado", () => {
+test("config_memory_max_tokens_env: KILOCODE_GRAPH_INJECT_MEMORY_MAX_TOKENS é honrado", () => {
+  clearEnv();
+  process.env.KILOCODE_GRAPH_INJECT_MEMORY_MAX_TOKENS = "1500";
+  assert.equal(loadConfig().inject.memory_max_tokens, 1500);
+});
+
+test("config_code_max_tokens_env: KILOCODE_GRAPH_INJECT_CODE_MAX_TOKENS é honrado", () => {
+  clearEnv();
+  process.env.KILOCODE_GRAPH_INJECT_CODE_MAX_TOKENS = "500";
+  assert.equal(loadConfig().inject.code_max_tokens, 500);
+});
+
+test("config_tokens_defaults: sem env/arquivo ⇒ ambos os tetos são 2000", () => {
+  clearEnv();
+  const cfg = loadConfig();
+  assert.equal(cfg.inject.memory_max_tokens, 2000);
+  assert.equal(cfg.inject.code_max_tokens, 2000);
+  assert.equal(cfg.inject.memory_max_tokens, DEFAULTS.inject.memory_max_tokens);
+  assert.equal(cfg.inject.code_max_tokens, DEFAULTS.inject.code_max_tokens);
+});
+
+/** Coleta as linhas emitidas por `fn` via sink de log injetável (só teste). */
+function captureLogs(fn: () => void): string[] {
+  const lines: string[] = [];
+  __setLogSink((l) => lines.push(l));
+  try {
+    fn();
+  } finally {
+    __setLogSink(null);
+  }
+  return lines;
+}
+
+test("config_legacy_max_chars_warns: env legada ⇒ 1 aviso; valor IGNORADO", () => {
   clearEnv();
   process.env.KILOCODE_GRAPH_INJECT_MAX_CHARS = "1234";
-  assert.equal(loadConfig().inject.max_chars, 1234);
+  let cfg!: ReturnType<typeof loadConfig>;
+  const lines = captureLogs(() => {
+    cfg = loadConfig();
+  });
+  // Exatamente um aviso de depreciação (nunca silêncio).
+  assert.equal(lines.filter((l) => l.toLowerCase().includes("depreciada")).length, 1);
+  assert.match(lines.join("\n"), /INJECT_MAX_CHARS/);
+  assert.match(lines.join("\n"), /MEMORY_MAX_TOKENS/);
+  // O valor legado NÃO é honrado: as chaves novas ficam no default.
+  assert.equal(cfg.inject.memory_max_tokens, 2000);
+  assert.equal(cfg.inject.code_max_tokens, 2000);
+});
+
+test("config_legacy_max_tokens_warns: env legada ⇒ 1 aviso; valor IGNORADO", () => {
+  clearEnv();
+  process.env.KILOCODE_GRAPH_INJECT_MAX_TOKENS = "999";
+  let cfg!: ReturnType<typeof loadConfig>;
+  const lines = captureLogs(() => {
+    cfg = loadConfig();
+  });
+  assert.equal(lines.filter((l) => l.toLowerCase().includes("depreciada")).length, 1);
+  assert.match(lines.join("\n"), /INJECT_MAX_TOKENS/);
+  assert.equal(cfg.inject.memory_max_tokens, 2000);
+  assert.equal(cfg.inject.code_max_tokens, 2000);
+});
+
+test("config_no_legacy_no_warning: sem envs legadas ⇒ nenhum aviso de depreciação", () => {
+  clearEnv();
+  const lines = captureLogs(() => {
+    loadConfig();
+  });
+  assert.equal(lines.filter((l) => l.toLowerCase().includes("depreciada")).length, 0);
+});
+
+test("config_token_cap_clamped: <=0 ou >16000 (422 no servidor) cai no default", () => {
+  clearEnv();
+  // `<=0` é 422 (`ge=1`); `>16000` é 422 (`MAX_RESPONSE_TOKENS`). O cliente nunca
+  // manda acima do teto interno (ADR-009, decisão 1) ⇒ fora de [1,16000] = default.
+  for (const bad of ["0", "-5", "16001", "50000", "abc", "2.5"]) {
+    process.env.KILOCODE_GRAPH_INJECT_MEMORY_MAX_TOKENS = bad;
+    process.env.KILOCODE_GRAPH_INJECT_CODE_MAX_TOKENS = bad;
+    const cfg = loadConfig();
+    assert.equal(cfg.inject.memory_max_tokens, 2000, `memória: ${bad} ⇒ default`);
+    assert.equal(cfg.inject.code_max_tokens, 2000, `código: ${bad} ⇒ default`);
+  }
+  // Os limites válidos das pontas passam intactos.
+  process.env.KILOCODE_GRAPH_INJECT_MEMORY_MAX_TOKENS = "1";
+  process.env.KILOCODE_GRAPH_INJECT_CODE_MAX_TOKENS = "16000";
+  const cfg = loadConfig();
+  assert.equal(cfg.inject.memory_max_tokens, 1);
+  assert.equal(cfg.inject.code_max_tokens, 16000);
 });
 
 test("config_invalid_type: número inválido cai no default (nunca NaN)", () => {
