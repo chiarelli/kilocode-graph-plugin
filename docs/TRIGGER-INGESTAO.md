@@ -8,9 +8,15 @@
 > agêntica a razão user/assistant é discrepante e mensagens úteis ficariam **sem
 > processamento para sempre**.
 
-**Decisão do dono (2026-10-15):** usar **`message.updated` como trigger default**
-e **`session.idle` como fallback** — *"para usar `session.idle` como fallback tem
-que se provar a idempotência"*.
+**Decisão do dono (2026-10-15):**
+
+1. **`message.updated` NÃO é o gatilho de "ingira esta mensagem".** É o gatilho
+   que responde *"o próximo batch já está pronto para envio?"* — isto é, ele
+   **alimenta o acumulador** e o batch fecha por **valor de config** (a decisão do
+   E4). A pergunta não é por mensagem; é pelo **estado do lote**.
+2. **`session.idle` como fallback** — e *"para implementar `session.idle` é
+   obrigatório guardar `sentBatchHashes` como prova para o mecanismo de
+   idempotência"* (o guard local, não o marcador do servidor).
 
 ---
 
@@ -55,9 +61,17 @@ message.updated  role='assistant'  id=msg_...   (mesma msg, 3ª vez)
 
 **Entrega os dois roles** — resolve o C-1. ⚠️ **Mas o MESMO id aparece 2–3×**
 (5 eventos para 2 mensagens). **`message.updated` não é um evento de borda: é
-notificação de atualização, disparada múltiplas vezes por mensagem.** Quem usar
-como trigger **precisa deduplicar por `id`** — sem isso, o trigger já nasce
-duplicando.
+notificação de atualização, disparada múltiplas vezes por mensagem.**
+
+**Como usar (papel correto, corrigido pelo dono):** `message.updated` **não**
+significa "ingira esta mensagem". Ele é o **sinal de que o acumulador mudou** — a
+pergunta que ele responde é *"o próximo batch já está pronto para envio?"*. Então:
+
+- a repetição 2–3× do mesmo `id` **não é duplicação de ingestão**: é a mesma
+  mensagem reanunciando o mesmo estado do lote;
+- o **acumulador precisa deduplicar por `id`** (é o que torna a repetição
+  inócua), e o **batch fecha por valor** (limiar de config), não por evento;
+- quem decide enviar é o **estado do lote**, não a mensagem individual.
 
 ### 2.3 `experimental.chat.messages.transform` — viu **só** `['user']`
 
@@ -117,7 +131,9 @@ IngestBody:    { workspace, program, body, reference_time, name, saga }
 - Logo: reenviar o mesmo batch = job novo, uuid novo, **sem marcador** → a lib
   re-extrai (dedup de entidade parcial: 9→9; arestas sem dedup: 9→11).
 
-**Como o antecessor resolve:** hash **local**, não no servidor —
+**Como o antecessor resolve — e é o desenho ADOTADO** (§4.3): hash **local**, não
+no servidor. A ausência do campo no `IngestBody` deixa de ser um gap a corrigir e
+passa a ser o **contrato aceito**: o plugin é o dono da idempotência.
 
 ```js
 batchHash(payload) { /* djb2 sobre role\0content */ }
@@ -131,21 +147,69 @@ O guard vive no **estado do plugin** (`sentBatchHashes`), não no memtier.
 
 | | |
 |---|---|
-| **`message.updated` como default** | ✅ viável — entrega user+assistant. **Exige** dedup por `id` (o evento repete 2–3×) |
+| **`message.updated` como default** | ✅ viável — entrega user+assistant. É o sinal de **"o batch está pronto?"**, não de "ingira esta mensagem". Exige **acumulador com dedup por `id`** (o evento repete 2–3×) — sem isso o mesmo conteúdo entra 2–3× no lote |
 | **`session.idle` como fallback** | ⚠️ **só com guard local de hash** (como o antecessor). Sem ele, o fallback **duplica fatos** — provado |
-| **Alternativa mais forte** | o memtier aceitar uma **chave de idempotência do cliente** (`idempotency_key`/`job_id` aditivo, default `null` = comportamento legado bit a bit, técnica do ADR-012/013). Tornaria o fallback seguro **no servidor**, não por disciplina do cliente |
+| **Alternativa DESCARTADA** | mover a chave para o servidor (`idempotency_key` aditivo no `/v1/ingest`). Seria tecnicamente mais forte, mas foi **descartada pelo dono** (§4.3): a idempotência fica **no plugin**. Consequência: o `sentBatchHashes` deixa de ser "disciplina" e passa a ser **requisito funcional** |
 | **Custo do fallback hoje** | cada reenvio re-extrai com LLM (~70 s no grafo pequeno) — o custo é de compute, não só de dado |
 
-## 4. Recomendação do autor
+## 4. Desenho — decisões fixadas
 
-1. **`message.updated`** como trigger default, **com dedup por `id`** — é o único
-   hook que entrega os dois roles, e o defeito de repetição é tratado no cliente.
-2. **`session.idle`** como fallback **com `sentBatchHashes` local** (padrão
-   provado do antecessor) — sem o guard, **não** ligar.
-3. **Abrir a opção aditiva no memtier** (`idempotency_key` no `/v1/ingest`) como
-   o caminho correto de longo prazo: move a garantia do cliente para o servidor,
-   sem quebrar o corpo legado (default `null`). É a mesma técnica do ADR-012
-   (`edges`) e do ADR-013 (contadores) — aditivo, não-destrutivo.
+### 4.1 `message.updated` é **sinal de lote**, não de mensagem
+
+```
+message.updated  →  acumulador (dedup por id)
+                 →  "o próximo batch está pronto?"  (limiar de VALOR, E4)
+                 →  nesse ponto, e só nesse, POST /v1/ingest
+```
+
+O evento **não** significa "ingira esta mensagem". Ele anuncia que o estado do
+lote mudou. Quem decide enviar é o **limiar**, não o evento — e é isso que
+preserva a decisão do E4 (batch por valor de config).
+
+### 4.2 `session.idle` exige `sentBatchHashes` — **é obrigatório, não opcional**
+
+Decisão do dono: *"para implementar `session.idle` é obrigatório guardar
+`sentBatchHashes` como prova para o mecanismo de idempotência"*.
+
+Concorda com a medição (§3): sem o guard, o fallback **duplica fatos**
+(`relações 9 → 11`, fato do Bruno `[2x]`). O mecanismo:
+
+```
+hash = batchHash(itens do lote)          // djb2 sobre `role\0content` (padrão do antecessor)
+if (sentBatchHashes[hash]) → NÃO envia   // prova de que ESTE lote já foi
+else                       → envia e grava o hash
+```
+
+Por que o guard tem de ser **local**: o marcador do servidor
+(`ingest:done:{job_id}`) é **por job**, e o `job_id` é gerado no servidor
+(`queue.py:178`) — o `IngestBody` **não aceita** `job_id`/`idempotency_key`.
+O cliente não tem como reusar a identidade do servidor. Logo, **a prova de
+idempotência é do cliente**, e o `sentBatchHashes` é essa prova.
+
+**Persistência — medido no antecessor** (a pergunta "grava em disco?" está fechada):
+
+| | |
+|---|---|
+| arquivo | `<workspace>/.kilo/openviking-ingest.json` (`WORKSPACE_STATE_FILES.ingest`) |
+| conteúdo | `{ sessions, status, sentBatchHashes }` |
+| escrita | **atômica** — `writeFileSync(tmp)` + `renameSync(tmp, p)` (`:1134-1145`) |
+| carga | `loadState()` no boot; JSON corrompido ⇒ estado vazio (degrada, não lança) |
+
+⚠️ **Crescimento:** um hash por lote enviado, **sem expiração** — o arquivo cresce
+indefinidamente. O antecessor **não** tem política de TTL/limite. Para o
+graph-plugin isso precisa ser decidido (é dívida latente, não bloqueio).
+
+### 4.3 Onde vive a idempotência — **DECIDIDO: no plugin**
+
+Decisão do dono (2026-10-15): *"Vamos deixar a responsabilidade da idempotência do
+lado do plugin, não do memtier."*
+
+| | |
+|---|---|
+| **decidido** | a garantia é do **plugin** (`sentBatchHashes` por workspace, persistido) |
+| **descartado** | `idempotency_key` aditivo no `/v1/ingest` (chegou a ser proposto nesta investigação) |
+| **consequência** | o memtier **não muda**; nenhum contrato novo; o RFC-001 e este doc ficam como estão |
+| **por que faz sentido** | a decisão acompanha o desenho já existente (`specs/delecao-arquivo-removido-decisao.md`: *"o CLIENTE é responsável por declarar"*) — a mesma invariante de **órfão declarado** aplicada à ingestão: quem conhece o que já mandou é o cliente |
 
 ## 5. Não medido (não afirmar)
 
@@ -154,6 +218,8 @@ O guard vive no **estado do plugin** (`sentBatchHashes`), não no memtier.
 - **Frequência real** de `session.idle` (se dispara por turno ou só com a sessão
   realmente ociosa) — 1 ocorrência nesta execução.
 - Se o `message.updated` repetido traz **conteúdo** diferente a cada vez (se
-  sim, o dedup por `id` precisa considerar o último estado, não o primeiro).
+  sim, o acumulador precisa guardar o **último estado** por `id`, não o primeiro).
+- Política de expiração do `sentBatchHashes` — o antecessor **não tem** (cresce
+  sem limite). Não medi o tamanho que atinge na prática.
 - Taxa de travamento da fila em sessões reais — o defeito é **de desenho**; não
   instrumentei o antecessor em produção.
