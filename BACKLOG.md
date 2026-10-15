@@ -81,7 +81,7 @@ Convenções válidas para todas as epics:
 - [x] **E4-S1** — Tracer bullet: ler o `kilo.db` (user+assistant) → 1 lote real → `/v1/ingest`
 - [x] **E4-S2** — Endurecer: cursor por `(time_created, id)` + `sentBatchHashes` (idempotência)
 - [x] **E4-S3** — `session.idle` drena tudo + o resto (mesma rotina; trava por sessão)
-- [ ] **E4-S4** — Limitações L-1/L-2/L-3 como critério de aceite (decisão do dono)
+- [x] **E4-S4** — Limitações L-1/L-2/L-3 como critério de aceite (decisão do dono)
 - [ ] **E4-S5** — Fechamento: E2E real, docs coerentes, zero marcadores
 
       **DECIDIDO (2026-10-15):** batch por **VALOR de config** (não por mensagem);
@@ -641,3 +641,25 @@ redescobertas no meio do loop.
      **único** no marcador (sem contradição) e o teto de espera do worker subiu.
   6. Unit **283 · 269 pass · 0 fail · 14 skip**; `tsc --noEmit` limpo.
      `rg "TODO\(tracer-bullet\)" src/` → **1** (o reset do L-3, que é da S4).
+
+- **2026-10-15 — E4-S4 (limitações L-1/L-2/L-3 como critério de aceite).**
+  Endereçadas na implementação (não só documentadas), sobre a mesma base.
+  1. **L-1 — incerteza auditável.** O estado passa a guardar `sentBatches`:
+     `{ hash, job_id, reference_time, accepted_at, confirmed:false }`. O `202`
+     confirma o **aceite**, não o processamento; `confirmed:false` **é** o
+     registro da incerteza; o log do envio traz `accepted_not_confirmed=true`.
+     **Nenhum** mecanismo de reenvio ou de espera por confirmação foi criado
+     (decisão do dono). Teste: um lote cujo worker "morre" **não** é reenviado,
+     e a auditoria permite identificá-lo.
+  2. **L-2 — teto por workspace.** `markBatchSent`/`markBatchAccepted` aplicam
+     teto **FIFO** (`DEFAULT_MAX_HASHES = 5000`, configurável por
+     `ingest.max_hashes`; `<=0` = ilimitado). Teste prova que o número de hashes
+     **não cresce indefinidamente** (ultrapassar evicta os mais antigos). Por que
+     teto e não TTL: determinístico e testável (decisão do ADR-008).
+  3. **L-3 — degradação explícita.** `loadState` ganha `onReset`; a rotina
+     **registra** o reset (arquivo ausente **ou** JSON corrompido), com dedup por
+     (caminho, classe) para não repetir a linha a cada gatilho. Teste cobre os
+     dois casos (degradam sem lançar, registram o reset) e o comportamento
+     definido (estado perdido ⇒ reenvio, consequência documentada — não defeito).
+  4. Unit **290 · 276 pass · 0 fail · 14 skip**; `tsc --noEmit` limpo.
+     `rg "TODO\(tracer-bullet\)" src/` → **zero**.

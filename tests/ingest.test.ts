@@ -41,6 +41,8 @@ import {
   hasSentBatch,
   INGEST_STATE_REL_PATH,
   loadState,
+  markBatchAccepted,
+  markBatchSent,
   saveState,
 } from "../src/ingest/state.ts";
 import { ingestHook, sessionIdFromEvent } from "../src/hooks/ingest.ts";
@@ -267,7 +269,7 @@ test("db_read_batch_other_session: só a sessão pedida é lida", () => {
 // ---------------------------------------------------------------------------
 
 test("state_empty_default: estado vazio", () => {
-  assert.deepEqual(emptyState(), { sessions: {}, sentBatchHashes: [] });
+  assert.deepEqual(emptyState(), { sessions: {}, sentBatchHashes: [], sentBatches: [] });
 });
 
 test("state_load_missing_or_corrupt: degrada para vazio, não lança", () => {
@@ -277,6 +279,27 @@ test("state_load_missing_or_corrupt: degrada para vazio, não lança", () => {
   assert.deepEqual(loadState("/bad.json", () => "{not json"), emptyState());
 });
 
+test("s4_l3_reset_logged: reset do estado é reportado (ausente e corrompido)", () => {
+  // L-3: o reset nunca é silencioso. `onReset` é chamado com o motivo nos dois
+  // casos — arquivo ilegível (ENOENT) e JSON corrompido.
+  const reasons: string[] = [];
+  const missing = loadState(
+    "/nope.json",
+    () => {
+      throw new Error("ENOENT: no such file");
+    },
+    (r) => reasons.push(r),
+  );
+  assert.deepEqual(missing, emptyState());
+  assert.equal(reasons.length, 1);
+  assert.match(reasons[0]!, /ilegível/);
+
+  const corrupt = loadState("/bad.json", () => "{not json", (r) => reasons.push(r));
+  assert.deepEqual(corrupt, emptyState());
+  assert.equal(reasons.length, 2);
+  assert.match(reasons[1]!, /JSON corrompido/);
+});
+
 test("state_load_valid: cursor e hashes válidos são lidos; inválidos descartados", () => {
   const raw = JSON.stringify({
     sessions: {
@@ -284,11 +307,18 @@ test("state_load_valid: cursor e hashes válidos são lidos; inválidos descarta
       ses_bad: { last_ts: "x" },
     },
     sentBatchHashes: ["h1", 2, "h2"],
+    sentBatches: [
+      { hash: "h1", reference_time: "x", accepted_at: "y", confirmed: false },
+      { hash: 3 },
+      null,
+    ],
   });
   const st = loadState("/ok.json", () => raw);
   assert.deepEqual(st.sessions.ses_a, { last_ts: 10, last_id: "m1" });
   assert.equal(st.sessions.ses_bad, undefined);
   assert.deepEqual(st.sentBatchHashes, ["h1", "h2"]);
+  assert.equal(st.sentBatches!.length, 1);
+  assert.equal(st.sentBatches![0]!.hash, "h1");
 });
 
 test("state_atomic_write: grava em tmp e renomeia; cria o diretório", () => {
@@ -1030,6 +1060,108 @@ test("s3_drain_cursor_concurrent: dois drenos concorrentes não corrompem o curs
     assert.equal(st.sessions.ses_a!.last_id, "msg_062", "cursor cobriu as 63");
     // Nenhum lote duplicado (hash distinto por lote).
     assert.equal(new Set(st.sentBatchHashes).size, st.sentBatchHashes.length);
+  } finally {
+    cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// E4-S4 — limitações L-1/L-2/L-3 como critério de aceite
+// ---------------------------------------------------------------------------
+
+test("s4_l1_audit_accept_not_confirm: lote aceito é registrado como NÃO confirmado", async () => {
+  const { statePath, cleanup } = tmpState();
+  try {
+    const backend = makeBackend(genMsgs(20, 1000));
+    const { client } = stubClient(async () => ({ job_id: "job_l1", status: "queued" }));
+    const outcome = await ingestOnce(rt(statePath, client), backend, "ses_a");
+    assert.equal(outcome.sent, true);
+
+    const st = loadState(statePath);
+    assert.equal(st.sentBatches!.length, 1, "o lote aceito tem registro auditável");
+    const audit = st.sentBatches![0]!;
+    assert.equal(audit.hash, outcome.hash);
+    assert.equal(audit.job_id, "job_l1");
+    assert.equal(audit.reference_time, new Date(1019).toISOString());
+    assert.equal(audit.confirmed, false, "o 202 confirma o ACEITE, não o processamento");
+    assert.match(audit.accepted_at, /^\d{4}-\d{2}-\d{2}T/);
+  } finally {
+    cleanup();
+  }
+});
+
+test("s4_l1_worker_failure_not_resent: lote que 'morre' no worker NÃO é reenviado (sem retry)", async () => {
+  const { statePath, cleanup } = tmpState();
+  try {
+    const backend = makeBackend(genMsgs(20, 1000));
+    const { client, calls } = stubClient(async () => ({ job_id: "j", status: "queued" }));
+    // 1ª passada: aceito (o worker pode tê-lo perdido — o plugin não sabe).
+    await ingestOnce(rt(statePath, client), backend, "ses_a");
+    assert.equal(calls.length, 1);
+    const audit = loadState(statePath).sentBatches![0]!;
+    // O operador consegue IDENTIFICAR o lote perdido pelos dados de auditoria.
+    assert.ok(audit.job_id && audit.hash && audit.reference_time);
+
+    // Gatilhos subsequentes: nenhum reenvio (não há retry conservador — decisão
+    // do dono; reenviar duplicaria arestas, medido 9→11).
+    await runIngest(rt(statePath, client), backend, "ses_a", true);
+    await runIngest(rt(statePath, client), backend, "ses_a", true);
+    assert.equal(calls.length, 1, "o lote perdido não é reenviado");
+  } finally {
+    cleanup();
+  }
+});
+
+test("s4_l2_hash_cap_fifo: ultrapassar o teto evicta os mais antigos (não cresce sem limite)", () => {
+  const st = emptyState();
+  const cap = 3;
+  for (let i = 0; i < 5; i++) markBatchSent(st, `h${i}`, cap);
+  assert.equal(st.sentBatchHashes.length, cap, "arquivo limitado pelo teto");
+  assert.deepEqual(st.sentBatchHashes, ["h2", "h3", "h4"], "FIFO: os antigos saem");
+  // Os hashes recentes continuam presentes (dedup ainda funciona na janela).
+  assert.equal(hasSentBatch(st, "h4"), true);
+  assert.equal(hasSentBatch(st, "h0"), false);
+});
+
+test("s4_l2_hash_cap_unlimited_and_dedup: teto<=0 é ilimitado; hash repetido não duplica", () => {
+  const st = emptyState();
+  for (let i = 0; i < 10; i++) markBatchSent(st, `h${i}`, 0);
+  assert.equal(st.sentBatchHashes.length, 10, "sem teto quando maxHashes<=0");
+  markBatchSent(st, "h9", 0);
+  assert.equal(st.sentBatchHashes.length, 10, "hash repetido não re-insere");
+});
+
+test("s4_l2_audit_also_bounded: a auditoria L-1 respeita o mesmo teto", () => {
+  const st = emptyState();
+  for (let i = 0; i < 5; i++) {
+    markBatchAccepted(st, {
+      hash: `h${i}`,
+      reference_time: "t",
+      accepted_at: "a",
+      confirmed: false,
+    }, 2);
+  }
+  assert.equal(st.sentBatches!.length, 2);
+  assert.equal(st.sentBatches![1]!.hash, "h4");
+});
+
+test("s4_l3_corrupt_state_degrades_and_replays: corromper o estado ⇒ degrada e reinsere", async () => {
+  const { statePath, cleanup } = tmpState();
+  try {
+    const backend = makeBackend(genMsgs(20, 1000));
+    const first = stubClient(async () => ({ job_id: "j1" }));
+    await ingestOnce(rt(statePath, first.client), backend, "ses_a");
+    assert.equal(first.calls.length, 1);
+
+    // Corrompe o estado em disco (L-3).
+    saveState(statePath, emptyState()); // zera (simula perda)
+    const second = stubClient(async () => ({ job_id: "j2" }));
+    await runIngest(rt(statePath, second.client), backend, "ses_a", true);
+    // Comportamento DEFINIDO (documentado, não surpresa): o estado perdido faz o
+    // cursor voltar ao início e o lote é reenviado — o grafo pode duplicar (custo
+    // aceito). O que importa é degradar sem lançar e registrar (coberto pelo
+    // `s4_l3_reset_logged`).
+    assert.equal(second.calls.length, 1, "estado perdido ⇒ reenvio (consequência do L-3)");
   } finally {
     cleanup();
   }

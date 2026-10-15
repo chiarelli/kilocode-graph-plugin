@@ -25,6 +25,7 @@ import { IngestReadError, readBatch, type SqliteBackend } from "./db.ts";
 import {
   hasSentBatch,
   loadState,
+  markBatchAccepted,
   markBatchSent,
   saveState,
   setCursor,
@@ -41,6 +42,18 @@ export interface IngestConfig {
 
 /** O que a rotina precisa do client (permite stub estreito em teste). */
 export type IngestClient = Pick<MemtierClient, "ingest">;
+
+/**
+ * Estado já resetado que foi logado (L-3) — evita repetir a linha a cada
+ * gatilho num workspace cujo estado ainda não existe. Chave: caminho + classe
+ * do reset (ausente/corrompido).
+ */
+const resetLogged = new Set<string>();
+
+/** Extrai a classe do reset do motivo (para a chave de dedup do log). */
+function resetClass(reason: string): string {
+  return reason.startsWith("JSON corrompido") ? "corrupt" : "missing";
+}
 
 /** Dependências da rotina (injetáveis para teste, sem banco/rede reais). */
 export interface IngestRuntime {
@@ -108,7 +121,16 @@ export async function ingestOnce(
 ): Promise<IngestOutcome> {
   if (!rt.cfg.enabled) return { sent: false, rows: 0 };
 
-  const state = loadState(rt.statePath);
+  // L-3: o reset do estado é **registrado**, nunca silencioso — o cursor volta
+  // ao início e o próximo `session.idle` reenvia (custo aceito). Registrado uma
+  // vez por estado/motivo (senão todo `message.updated` de um workspace novo
+  // repetiria a linha).
+  const state = loadState(rt.statePath, undefined, (reason) => {
+    const key = `${rt.statePath}\0${resetClass(reason)}`;
+    if (resetLogged.has(key)) return;
+    resetLogged.add(key);
+    log(`ingest: estado resetado (${reason}); cursor reinicia session=${sessionId}`);
+  });
   const prev = state.sessions[sessionId] ?? { last_ts: 0, last_id: "" };
   const { messages, last, rows } = readBatch(
     backend,
@@ -159,16 +181,30 @@ export async function ingestOnce(
   }
 
   const res = await rt.client.ingest(batch.body, batch.referenceTime);
-  // Só após o 202: hash (idempotência) e cursor avançam juntos, no mesmo write.
-  // L-1: o 202 confirma o ACEITE, não o processamento.
-  markBatchSent(state, batch.hash);
+  // Só após o 202: hash (idempotência, com teto FIFO — L-2), auditoria (L-1) e
+  // cursor avançam juntos, no mesmo write atômico. O 202 confirma o **ACEITE**,
+  // não o processamento: `confirmed:false` é a incerteza auditável. Não se cria
+  // reenvio nem espera por confirmação (decisão do dono) — o lote pode ser
+  // perdido, e a auditoria permite ao operador identificá-lo.
+  markBatchSent(state, batch.hash, rt.cfg.max_hashes);
+  markBatchAccepted(
+    state,
+    {
+      hash: batch.hash,
+      job_id: res.job_id,
+      reference_time: batch.referenceTime,
+      accepted_at: new Date().toISOString(),
+      confirmed: false,
+    },
+    rt.cfg.max_hashes,
+  );
   if (last) setCursor(state, sessionId, last);
   saveState(rt.statePath, state);
 
   log(
     `ingest sent session=${sessionId} rows=${rows} msgs=${messages.length} ` +
       `hash=${batch.hash} job_id=${res.job_id ?? "?"} status=${res.status ?? "?"} ` +
-      `reference_time=${batch.referenceTime}`,
+      `reference_time=${batch.referenceTime} accepted_not_confirmed=true`,
   );
   return { sent: true, rows, hash: batch.hash, jobId: res.job_id, msgs: messages.length };
 }
