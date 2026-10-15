@@ -37,6 +37,13 @@ export interface RunIndexerOptions {
   /** Extrai imports/calls (arestas). Default `true`. */
   extractImports?: boolean;
   extractCalls?: boolean;
+  /**
+   * Fonte de arquivos via git (`git ls-files --exclude-standard`), honrando o
+   * ignore-stack completo. Default `false` (varre tudo). Quando `true` e o git
+   * estiver ausente ou o diretório não for um repositório, o indexer responde
+   * `GIT_UNAVAILABLE` e aborta o job (sem degradar para um scan completo).
+   */
+  loadIgnores?: boolean;
   /** Range do incremental (S4). */
   gitRange?: { from: string; to: string };
   /** Timeout do job (ms); estouro ⇒ encerra e devolve o que veio. */
@@ -71,6 +78,7 @@ export function buildCommand(
   payload.options = {
     extract_imports: opts.extractImports ?? true,
     extract_calls: opts.extractCalls ?? true,
+    load_ignores: opts.loadIgnores ?? false,
   };
   const jobId = `graph-${mode}-${Date.now()}`;
   const line = JSON.stringify({

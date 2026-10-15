@@ -70,6 +70,10 @@ export const DEFAULTS = {
     enabled: false,
     indexer_bin: "",
     sync_timeout_ms: 120000,
+    // Fonte de arquivos via git (`git ls-files --exclude-standard`), honrando o
+    // ignore-stack completo. Default `false` (varre tudo). `true` exige git +
+    // repositório: ausente ⇒ o indexer falha com `GIT_UNAVAILABLE` (sem fallback).
+    load_ignores: false,
   },
   ingest: {
     // Defaults desligados (preferência do dono, coerente com index/inject).
@@ -419,6 +423,14 @@ export function loadConfig(
           String(DEFAULTS.code_index.sync_timeout_ms),
         ),
         DEFAULTS.code_index.sync_timeout_ms,
+      ),
+      load_ignores: resolveBool(
+        resolve(
+          "code_index.load_ignores",
+          "KILOCODE_GRAPH_INDEX_LOAD_IGNORES",
+          String(DEFAULTS.code_index.load_ignores),
+        ),
+        DEFAULTS.code_index.load_ignores,
       ),
     },
     ingest: {

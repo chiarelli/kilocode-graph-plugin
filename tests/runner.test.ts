@@ -53,6 +53,25 @@ test("build_command_incremental: use_git + git_range", () => {
   assert.equal(cmd.payload.git_range.from, "abc");
 });
 
+test("build_command_load_ignores: default false, presente em options", () => {
+  const cmd = JSON.parse(
+    buildCommand("full", "/repo", { bin: "x", repoRoot: "/repo", mode: "full" }).line,
+  ) as { payload: { options: Record<string, unknown> } };
+  assert.equal(cmd.payload.options.load_ignores, false);
+});
+
+test("build_command_load_ignores: true propaga em options", () => {
+  const cmd = JSON.parse(
+    buildCommand("full", "/repo", {
+      bin: "x",
+      repoRoot: "/repo",
+      mode: "full",
+      loadIgnores: true,
+    }).line,
+  ) as { payload: { options: Record<string, unknown> } };
+  assert.equal(cmd.payload.options.load_ignores, true);
+});
+
 test("parse_line_junk: linha não-JSON ⇒ null (ignorada)", () => {
   assert.equal(parseLine("not json {"), null);
   assert.equal(parseLine(""), null);

@@ -32,6 +32,11 @@ import type { SyncResult } from "../types.ts";
 export interface CollectConfig {
   enabled: boolean;
   indexer_bin: string;
+  /**
+   * Fonte de arquivos via git (`load_ignores`). Ausente/`false` ⇒ varre tudo.
+   * Quando `true`, o indexer exige git + repositório (senão `GIT_UNAVAILABLE`).
+   */
+  load_ignores?: boolean;
 }
 
 /** Dependências do hook (injetáveis para teste, sem spawn real). */
@@ -153,6 +158,7 @@ export async function collectCode(rt: CollectRuntime): Promise<SyncResult | null
       repoRoot: rt.repoRoot,
       mode,
       gitRange: trigger.gitRange,
+      loadIgnores: rt.cfg.load_ignores ?? false,
     });
   } catch (err) {
     logFatal("collect indexer", err);

@@ -229,6 +229,31 @@ test("collect_incremental_no_removed: incremental não marca inalterados como re
   assert.equal(keep, undefined, "inalterado não deve ser enviado como removido");
 });
 
+test("collect_load_ignores: repassa load_ignores do cfg ao runner", async () => {
+  let seen: { loadIgnores?: boolean } | undefined;
+  const rt = runtime({
+    cfg: { enabled: true, indexer_bin: "/fake/indexer", load_ignores: true },
+    run: async (opts) => {
+      seen = opts;
+      return { events: [chunkEvent("src/a.rs", "a1")], skipped: false };
+    },
+  });
+  await collectCode(rt);
+  assert.equal(seen?.loadIgnores, true);
+});
+
+test("collect_load_ignores_off: default false quando cfg não define", async () => {
+  let seen: { loadIgnores?: boolean } | undefined;
+  const rt = runtime({
+    run: async (opts) => {
+      seen = opts;
+      return { events: [chunkEvent("src/a.rs", "a1")], skipped: false };
+    },
+  });
+  await collectCode(rt);
+  assert.equal(seen?.loadIgnores, false);
+});
+
 test("collect_incremental_merges_manifest: estado pós-incremental preserva inalterados", async () => {
   const saved: string[][] = [];
   const rt = runtime({
