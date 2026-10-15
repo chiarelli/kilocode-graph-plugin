@@ -1,147 +1,159 @@
 # TRIGGER DE INGESTÃO — verificação do `[VERIFICAR]` (2026-10-15)
 
-> **Status:** investigação concluída. Achado **material**: o problema relatado é
-> **real** e tem dois agravantes. Nada foi implementado — este documento é
-> evidência + opções para decisão.
+> **Status:** investigação **concluída**, com dois experimentos executados contra a
+> stack viva. Achado **material**: o problema relatado é real, e há um **defeito de
+> idempotência** que bloqueia o fallback proposto. Nada foi implementado.
 >
-> **Pergunta do dono:** o plugin OpenViking faz ingestão por batch com trigger em
-> mensagem do usuário, e o graph-plugin "usa o mesmo mecanismo de trigger"
-> `[VERIFICAR]`. O problema: em sessão agêntica a razão user/assistant é
-> discrepante; vários steps de LLM podem gerar mensagens sem nenhuma mensagem de
-> usuário até o fim da sessão, e **várias mensagens úteis ficariam sem serem
-> processadas para sempre**.
+> **Pergunta do dono:** o trigger do antecessor é mensagem do usuário; em sessão
+> agêntica a razão user/assistant é discrepante e mensagens úteis ficariam **sem
+> processamento para sempre**.
+
+**Decisão do dono (2026-10-15):** usar **`message.updated` como trigger default**
+e **`session.idle` como fallback** — *"para usar `session.idle` como fallback tem
+que se provar a idempotência"*.
 
 ---
 
 ## 1. `[VERIFICAR]` — resposta
 
-**Confirmado: o disparo é por mensagem do usuário.** Mas há **três** fatos, não um:
+**Confirmado: o disparo é por mensagem do usuário.** Três fatos:
 
 | # | fato | evidência |
 |---|---|---|
-| 1 | O antecessor (OpenViking) alimenta a fila **só** com (a) o texto do usuário, no hook `chat.message`, e (b) um caso especial: a tool `viking_remember` | `openviking-memory.js:2041` (`syncTurn("user", …)`) e `:2080` (`syncTurn("assistant", "[memory:…]")` dentro de `tool.execute.after`, **só** quando a tool é `viking_remember`) |
-| 2 | O **graph-plugin ainda não implementa ingestão** — o trigger está apenas **especificado** | `src/hooks/` tem só `collect.ts` + `messages.ts`; `src/index.ts` não registra `chat.message`. O desenho está em `ARCHITECTURE.md:287,295` (FR-201/FR-204) |
-| 3 | O hook `chat.message` é chamado **a cada mensagem recebida** (doc do SDK: *"Called when a new message is received"*), mas o antecessor só aproveita `out.parts` (texto do usuário) — o **assistente nunca entra por esse caminho** | `@kilocode/plugin/dist/index.d.ts:189`; `openviking-memory.js:2036-2043` |
+| 1 | O antecessor alimenta a fila **só** com (a) o texto do usuário em `chat.message` e (b) um caso especial: a tool `viking_remember` (que não existe no memtier) | `openviking-memory.js:2041` e `:2080` |
+| 2 | O **graph-plugin ainda não implementa ingestão** — o trigger está apenas especificado (FR-201/FR-204). `src/hooks/` tem só `collect.ts` + `messages.ts` | `src/index.ts` não registra `chat.message` |
+| 3 | O dreno do antecessor só re-agenda se **sobrar** item após o batch (`processQueue`), e item novo só chega por `syncTurn` — isto é, por `chat.message` | `:642-670` |
 
-**A premissa do dono está certa** — e é pior do que ele descreveu: não é que o
-assistente "às vezes" não seja capturado; é que **o único caminho de captura do
-assistente é a tool `viking_remember`**, que no memtier **não existe** (as tools
-MCP são `recall`/`ingest`/`code_search`/`code_sync`).
+**C-2 (fila presa) é real:** sessão agêntica que termina sem novo prompt do
+usuário deixa o residual na fila **para sempre**. Não há flush por `session.idle`
+(o antecessor só usa `compacting`).
 
-## 2. As duas consequências (nomeadas)
+## 2. Instrumentação — o que os hooks REALMENTE entregam
 
-### C-1 — Assimetria por desenho
+Sonda registrada no runtime real (`kilo run` com um plugin de log, 85 eventos
+capturados em `/tmp/trigger_probe/probe.jsonl`). Config restaurado depois.
 
-Em sessão agêntica, a razão user/assistant é discrepante: **1 mensagem do usuário
-→ N mensagens do assistente** (steps de LLM, chamadas de tool, raciocínio). Se só
-o texto do usuário alimenta a fila:
-
-- o volume ingerido é uma **fração pequena** da sessão;
-- o **lado do assistente** (decisões, código escrito, resultados) fica **fora** —
-  e é justamente onde vive a maior parte do valor de memória num fluxo de trabalho.
-
-### C-2 — Fila que nunca drena (o caso que o dono descreveu)
-
-O antecessor drena com `while (turnQueue.length > 0 && batch.length < batchSize)`
-(`:642`) — ou seja, **só drena quando a fila tem itens**. O gatilho de chegada é
-`syncTurn` (`:2041`), que é **chamado apenas no hook `chat.message`**.
-
-Cadeia do defeito:
+### 2.1 `chat.message` — **só o USUÁRIO**
 
 ```
-sessão agêntica: N steps do LLM
-  → nenhuma mensagem nova do USUÁRIO
-  → nenhum disparo de chat.message (por mensagem do usuário)
-  → turnQueue fica com o que sobrou (< batchSize)
-  → processQueue() já rodou e NÃO re-agenda (só re-agenda se length > 0 SOBRAR
-     após o batch)
-  → o resto espera um PRÓXIMO disparo, que só vem com um prompt novo do usuário
+chat.message  →  roleGuess = "user"        parts = [text len=40]
 ```
 
-Se a sessão **termina** sem novo prompt: o residual fica na fila **para sempre**.
-Não há flush por `session.idle` — o antecessor só tem `session.compacting`
-(`:2086`), que roda na **compactação**, não no fim/de pausa da sessão.
+Disparou **1 vez** na sessão, com role `user`. **Não** entrega o assistente.
+Isso **confirma o C-1** empiricamente: quem dependesse só de `chat.message`
+nunca capturaria o lado assisante.
 
-## 3. O que o SDK oferece (as saídas existem)
+### 2.2 `message.updated` — **user E assistant** ✅
 
-Verificado nos tipos reais (`@kilocode/sdk/dist/gen/types.gen.d.ts`):
+```
+message.updated  role='user'       id=msg_13fc3a547001woVy9WU3CAwELY
+message.updated  role='assistant'  id=msg_13fc3a5cf001xVadDOaZhxu4ro
+message.updated  role='user'       id=msg_...   (mesma msg, 2ª vez)
+message.updated  role='assistant'  id=msg_...   (mesma msg, 2ª vez)
+message.updated  role='assistant'  id=msg_...   (mesma msg, 3ª vez)
+```
 
-| hook/evento | payload | serve para |
+**Entrega os dois roles** — resolve o C-1. ⚠️ **Mas o MESMO id aparece 2–3×**
+(5 eventos para 2 mensagens). **`message.updated` não é um evento de borda: é
+notificação de atualização, disparada múltiplas vezes por mensagem.** Quem usar
+como trigger **precisa deduplicar por `id`** — sem isso, o trigger já nasce
+duplicando.
+
+### 2.3 `experimental.chat.messages.transform` — viu **só** `['user']`
+
+```
+messages.transform  roles = ['user']   parts = [{type:'text', len:40}]
+```
+
+⚠️ **Contradiz a premissa de que o transform vê a conversa inteira.** Nesta
+execução ele recebeu apenas a mensagem do usuário. **Não** serve como fonte de
+captura do assistente. (Ressalva: execução única e curta — vale reconfirmar numa
+sessão longa antes de descartar o hook.)
+
+### 2.4 Eventos disponíveis (81 no total)
+
+| evento | ocorrências | serve como trigger? |
 |---|---|---|
-| `chat.message` | `{ sessionID, agent?, model?, … }` + `out.parts` | captura atômica — **é o atual** |
-| `experimental.chat.messages.transform` | `output.messages[]` (**com roles**) | já roda no graph-plugin (injeção) — **vê a conversa inteira** |
-| `tool.execute.after` | `{ tool, sessionID, callID, args }` + `output.{title,output,metadata}` | captura por uso de ferramenta (é o que o OV usa p/ `remember`) |
-| **`session.idle`** | `{ sessionID }` | **gatilho de flush no fim da atividade** — o OV **não usa** |
-| `message.updated` | `{ info: Message }` | evento por mensagem (user **e** assistant) |
-| `experimental.session.compacting` | `output.context/prompt` | drenar antes de perder contexto (o OV usa) |
-| `event` (hook genérico) | `{ event: Event }` | acesso a **todos** os eventos acima |
+| `message.part.delta` | 11 | streaming de partes (muito frequente) |
+| `message.part.updated` | 7 | atualização de parte |
+| **`message.updated`** | **5** | **sim — com dedup por `id`** |
+| `session.status` | 4 | mudança de status |
+| `session.updated` | 3 | |
+| **`session.idle`** | **1** | **sim — fallback, 1× por ociosidade** |
+| `session.drained` | 1 | também existe (payload: `sessionID`, `token`) |
+| `plugin.added` | 44 | ruído de boot |
 
-**O ponto-chave:** o hook `event` é genérico e recebe `session.idle` e
-`message.updated`. As duas lacunas (assimetria e fila presa) têm remédio **sem
-mudar o contrato do memtier**.
+## 3. Idempotência — **PROVADA: o grafo NÃO converge sozinho**
 
-## 4. Opções
+Teste: o **mesmo** lote de 6 mensagens ingerido **2×** no mesmo workspace
+(`rfcbatcha--idem-dup`), medido no grafo.
 
-### (a) Batch com **dois** gatilhos: contagem **OU** `session.idle`
+| métrica | rodada 1 | rodada 2 | veredito |
+|---|---|---|---|
+| entidades | 9 | **9** | ✅ convergiu |
+| relações `RELATES_TO` | 9 | **11** | ❌ **+2 (duplicou)** |
+| episódios | 1 | **2** | sempre cresce (registro novo) |
+| fatos | 9 (8 únicos) | **11 (10 únicos)** | ❌ duplicação de fato |
 
-Manter o batch por valor (decisão do dono) e adicionar um **flush** em
-`session.idle`: ao ficar ociosa, enfileira o residual, mesmo abaixo do limiar.
+**Fato duplicado confirmado, literal:**
+
+```
+[2x] "O deploy do Meridiano roda em Kubernetes na AWS, decisão do Bruno"
+```
+
+### 3.1 A causa-raiz (por que o cliente **não consegue** ser idempotente hoje)
+
+O marcador do servidor **não é endereçável pelo cliente**:
+
+```
+queue.py:178   job_id = uuid.uuid4().hex      # GERADO NO SERVIDOR
+queue.py:390   done_key(job_id)  →  "ingest:done:{job_id}"
+IngestBody:    { workspace, program, body, reference_time, name, saga }
+               # ^ NAO tem campo job_id/idempotency_key
+```
+
+- O `job_id` nasce **no servidor**; o corpo do `/v1/ingest` **não o aceita**.
+- O marcador `ingest:done:{job_id}` é **por job**, não por **conteúdo**.
+- Logo: reenviar o mesmo batch = job novo, uuid novo, **sem marcador** → a lib
+  re-extrai (dedup de entidade parcial: 9→9; arestas sem dedup: 9→11).
+
+**Como o antecessor resolve:** hash **local**, não no servidor —
+
+```js
+batchHash(payload) { /* djb2 sobre role\0content */ }
+...
+if (!this.state.sentBatchHashes[hash]) { ...enviar...; this.state.sentBatchHashes[hash] = true; }
+```
+
+O guard vive no **estado do plugin** (`sentBatchHashes`), não no memtier.
+
+### 3.2 Consequência para a decisão do dono
 
 | | |
 |---|---|
-| **Custo** | baixo — só no plugin; o contrato do memtier não muda (`/v1/ingest` já aceita qualquer tamanho de body) |
-| **A favor** | mata a **C-2** (fila presa) com uma linha de conceito; preserva o batch de 20 no fluxo normal |
-| **Contra** | o residual vira um job pequeno (1–19 msgs) — mas a medição mostra que **batch menor não degrada a qualidade** (15/16 × 16/16), só custa mais caro |
-| **Risco** | `session.idle` dispara com frequência; precisa de guarda para não virar 1 job por ociosidade curta |
+| **`message.updated` como default** | ✅ viável — entrega user+assistant. **Exige** dedup por `id` (o evento repete 2–3×) |
+| **`session.idle` como fallback** | ⚠️ **só com guard local de hash** (como o antecessor). Sem ele, o fallback **duplica fatos** — provado |
+| **Alternativa mais forte** | o memtier aceitar uma **chave de idempotência do cliente** (`idempotency_key`/`job_id` aditivo, default `null` = comportamento legado bit a bit, técnica do ADR-012/013). Tornaria o fallback seguro **no servidor**, não por disciplina do cliente |
+| **Custo do fallback hoje** | cada reenvio re-extrai com LLM (~70 s no grafo pequeno) — o custo é de compute, não só de dado |
 
-### (b) Capturar o **assistente** no `messages.transform` (ou em `message.updated`)
+## 4. Recomendação do autor
 
-O transform já vê `messages[]` **com roles** e já está implementado (injeção).
-Dava para aproveitar a passagem para observar as mensagens do assistente.
+1. **`message.updated`** como trigger default, **com dedup por `id`** — é o único
+   hook que entrega os dois roles, e o defeito de repetição é tratado no cliente.
+2. **`session.idle`** como fallback **com `sentBatchHashes` local** (padrão
+   provado do antecessor) — sem o guard, **não** ligar.
+3. **Abrir a opção aditiva no memtier** (`idempotency_key` no `/v1/ingest`) como
+   o caminho correto de longo prazo: move a garantia do cliente para o servidor,
+   sem quebrar o corpo legado (default `null`). É a mesma técnica do ADR-012
+   (`edges`) e do ADR-013 (contadores) — aditivo, não-destrutivo.
 
-| | |
-|---|---|
-| **Custo** | baixo no plugin; **mas** o transform roda no **caminho crítico** (orçamento 4 s) — acumular ali é risco de latência |
-| **A favor** | resolve a **C-1** (assimetria); usa um hook que já existe |
-| **Contra** | mistura responsabilidades (injeção × ingestão) no mesmo hook quente; `message.updated` é mais limpo para isso |
-| **Risco** | transformar o hook de 4 s em acumulador de estado |
+## 5. Não medido (não afirmar)
 
-### (c) Ingestão por `session.idle` com a **sessão inteira** (não por mensagem)
-
-No fim da atividade, ler a sessão do `kilo.db` e ingerir o que mudou.
-
-| | |
-|---|---|
-| **Custo** | médio — leitura do DB de sessões (o antecessor já lê: `findKiloDb`, `ingest.setDbPath`) |
-| **A favor** | fonte **completa** e única (não depende de interceptar hook nenhum); captura user **e** assistant por construção |
-| **Contra** | é um caminho paralelo ao batch — ou substitui, ou duplica. Perde a semântica de "batch de 20" |
-| **Risco** | ler o DB por fora pode divergir do que o plugin acumulou |
-
-### (d) Não mudar (status quo) + documentar a perda
-
-| | |
-|---|---|
-| **A favor** | zero trabalho |
-| **Contra** | a perda é **silenciosa** — mesma classe do `chunks: []` (RFC-001) |
-
-## 5. Recomendação do autor
-
-**(a) + (b) no mesmo épico (E4):** `session.idle` para o flush (mata C-2, que é o
-defeito duro) e `message.updated` para a captura do assistente (mata C-1, que é a
-perda de valor). Ambos são **só no plugin** — nenhum dos dois exige mudar o
-memtier. O batch por valor (decisão do dono) fica **intacto**: o `session.idle` é
-flush, não substituição.
-
-## 6. Não medido (não afirmar)
-
-- **Com que frequência** a fila residual fica presa na prática — não instrumentei
-  o antecessor nem medi sessões reais. O defeito é **de desenho** (a fila só drena
-  com novo disparo), não uma taxa observada.
-- Se `chat.message` é chamado também para mensagens do assistente no runtime do
-  Kilo 7.8.3 — o doc do SDK diz "a new message is received" (ambíguo) e o
-  antecessor **descarta** o caso não-usuário. Precisa de instrumentação para
-  responder com certeza.
-- Frequência real de `session.idle` (se dispara a cada turno ou só com a sessão
-  realmente ociosa) — não medido.
-- O que o E2 atual já faz hoje com o assistant: nada (o graph-plugin **não tem**
-  hook de ingestão).
+- Se `messages.transform` recebe a conversa inteira em **sessão longa** — nesta
+  execução curta ele viu só `['user']`. Reconfirma antes de descartar o hook.
+- **Frequência real** de `session.idle` (se dispara por turno ou só com a sessão
+  realmente ociosa) — 1 ocorrência nesta execução.
+- Se o `message.updated` repetido traz **conteúdo** diferente a cada vez (se
+  sim, o dedup por `id` precisa considerar o último estado, não o primeiro).
+- Taxa de travamento da fila em sessões reais — o defeito é **de desenho**; não
+  instrumentei o antecessor em produção.
