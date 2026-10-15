@@ -10,10 +10,11 @@
 
 **Decisão do dono (2026-10-15):**
 
-1. **`message.updated` NÃO é o gatilho de "ingira esta mensagem".** É o gatilho
-   que responde *"o próximo batch já está pronto para envio?"* — isto é, ele
-   **alimenta o acumulador** e o batch fecha por **valor de config** (a decisão do
-   E4). A pergunta não é por mensagem; é pelo **estado do lote**.
+1. **`message.updated` NÃO é o gatilho de "ingira esta mensagem".** É só o
+   **sinal de que a sessão mudou**; o plugin então **lê o banco** (`kilo.db`) e
+   verifica se o limiar de batch foi atingido. O batch fecha por **valor de
+   config** (decisão do E4). Nem o evento nem o seu payload são fonte de
+   conteúdo.
 2. **`session.idle` como fallback** — e *"para implementar `session.idle` é
    obrigatório guardar `sentBatchHashes` como prova para o mecanismo de
    idempotência"* (o guard local, não o marcador do servidor).
@@ -64,25 +65,33 @@ message.updated  role='assistant'  id=msg_...   (mesma msg, 3ª vez)
 notificação de atualização, disparada múltiplas vezes por mensagem.**
 
 **Como usar (papel correto, corrigido pelo dono):** `message.updated` **não**
-significa "ingira esta mensagem". Ele é o **sinal de que o acumulador mudou** — a
-pergunta que ele responde é *"o próximo batch já está pronto para envio?"*. Então:
+significa "ingira esta mensagem". É só o **sinal de que a sessão mudou** — o
+plugin então **lê o banco** e decide se o limiar foi atingido. Então:
 
-- a repetição 2–3× do mesmo `id` **não é duplicação de ingestão**: é a mesma
-  mensagem reanunciando o mesmo estado do lote;
-- o **acumulador precisa deduplicar por `id`** (é o que torna a repetição
-  inócua), e o **batch fecha por valor** (limiar de config), não por evento;
-- quem decide enviar é o **estado do lote**, não a mensagem individual.
+- a repetição 2–3× do mesmo `id` é **inócua**: como o conteúdo vem do DB e o
+  avanço é por **offset**, repetir o sinal apenas reavalia o mesmo estado — não
+  ingere duas vezes;
+- **não há acumulador em memória** (ver §2.2-bis e §4.1);
+- quem decide enviar é o **estado do lote medido no banco**, não a mensagem
+  individual.
 
 ### 2.2-bis Onde mora o CONTEÚDO (sonda 2, com uso de ferramenta)
 
 Segunda instrumentação, numa sessão **com ferramentas** (leitura de arquivo +
-escrita), para responder a pergunta do acumulador.
+escrita), para responder a pergunta do desenho da ingestão.
 
 **Achado 1 — `message.updated` é METADADO, não conteúdo.** Traz `info` com
-`role`/`id`/`time` — mas **sem `parts`**. Quem carrega o texto é
-**`message.part.updated`**. Consequência direta: o trigger default
-(`message.updated`) **não consegue** montar o lote sozinho — ele precisa do
-`message.part.updated` para ter o conteúdo.
+`role`/`id`/`time` — mas **sem `parts`**.
+
+⚠️ **Correção do desenho (dono, 2026-10-15):** isso **não** significa que o
+conteúdo tenha de vir de outro evento (`message.part.updated`). **Nenhum dos dois
+eventos carrega dado útil para a ingestão.** Ambos são **apenas sinal de que a
+sessão mudou** — o plugin então **lê o banco** (`kilo.db`) e retira as próximas N
+mensagens. É exatamente o que o antecessor faz:
+`messagesFromDb(sessionId, offset, limit)` → `SELECT id, time_created, data FROM
+message WHERE session_id = ? ORDER BY time_created ASC, id ASC LIMIT ? OFFSET ?`
+(`openviking-memory.js:1159`), com um **offset processado por sessão**
+(`processedMessages`).
 
 **Achado 2 — o conteúdo é construído INCREMENTALMENTE (confirmado).** Mesmo `id`,
 mesmo `part`, vários anúncios com texto crescente:
@@ -102,10 +111,17 @@ caractere a caractere. Ou seja: há duas granularidades (delta × part-updated) 
 o teste exercitou a segunda. **Não medido:** se o delta também chega em sessões
 mais longas/streaming contínuo.
 
-**Consequência para o acumulador** (o que a pergunta pedia): **guardar o ÚLTIMO
-estado por `id`** — um `Map<messageID, {role, texto}>` onde cada
-`message.part.updated` de texto **substitui** o valor, nunca soma. Assim o lote
-nunca contém o texto parcial (len=0) nem uma concatenação dupla.
+**Consequência — NÃO há acumulador em memória.** A leitura do DB é a fonte de
+verdade, e o **progresso é um offset por sessão** (`processedMessages`), não um
+buffer de eventos. Consequência prática: o `len=0` acima é **irrelevante** para a
+ingestão — quando o plugin lê o DB, a mensagem já está **persistida e completa**;
+o parcial que existia no evento não é o que se lê.
+
+**O que o offset resolve (e é o coração do desenho):**
+- **Incremento sem duplicar**: `offset` avança só após o envio confirmado do lote.
+- **Restart sobrevive**: o estado fica em `.kilo/` (por sessão), não na memória.
+- **Idempotência reforçada**: se o offset não avançou, reprocessar lê **as mesmas**
+  mensagens; o `batchHash` (§4.2) barra o reenvio.
 
 ### 2.3 `experimental.chat.messages.transform` — viu **só** `['user']`
 
@@ -115,11 +131,11 @@ messages.transform  roles = ['user','assistant']              lens  = [176, 0]
 messages.transform  roles = ['user','assistant','assistant']   lens  = [176, 0, 0]
 ```
 
-⚠️ **Reconfirmado na sonda 2, e é pior do que "vê só o user":** o transform
-**enxerga** as mensagens do assistant (os roles aparecem), mas com **`len=0`** —
-o texto delas **não está lá**. Ele recebe a estrutura sem o conteúdo do
-assistant. Portanto o transform **não** serve como fonte de captura do
-assistant (o `message.part.updated` serve).
+⚠️ **Reconfirmado na sonda 2:** o transform **enxerga** as mensagens do assistant
+(os roles aparecem) mas com **`len=0`**; nesta execução o texto do user veio (176),
+o do assistant não. **Também irrelevante para a ingestão** — pela correção do dono
+(§2.2-bis), nenhum hook é fonte de conteúdo; a fonte é o **banco**. E é bom que
+seja: o transform roda **antes** de a mensagem do assistant existir de fato.
 
 ⚠️ **Contradiz a premissa de que o transform vê a conversa inteira.** Nesta
 execução ele recebeu apenas a mensagem do usuário. **Não** serve como fonte de
@@ -189,24 +205,45 @@ O guard vive no **estado do plugin** (`sentBatchHashes`), não no memtier.
 
 | | |
 |---|---|
-| **`message.updated` como default** | ✅ viável — entrega user+assistant. É o sinal de **"o batch está pronto?"**, não de "ingira esta mensagem". Exige **acumulador com dedup por `id`** (o evento repete 2–3×) — sem isso o mesmo conteúdo entra 2–3× no lote |
+| **`message.updated` como default** | ✅ viável — é o **sinal** de "a sessão mudou"; o conteúdo vem do **DB** (offset). O evento repete 2–3× por mensagem, mas isso é **inócuo**: o avanço é por offset, não por evento |
 | **`session.idle` como fallback** | ⚠️ **só com guard local de hash** (como o antecessor). Sem ele, o fallback **duplica fatos** — provado |
 | **Alternativa DESCARTADA** | mover a chave para o servidor (`idempotency_key` aditivo no `/v1/ingest`). Seria tecnicamente mais forte, mas foi **descartada pelo dono** (§4.3): a idempotência fica **no plugin**. Consequência: o `sentBatchHashes` deixa de ser "disciplina" e passa a ser **requisito funcional** |
 | **Custo do fallback hoje** | cada reenvio re-extrai com LLM (~70 s no grafo pequeno) — o custo é de compute, não só de dado |
 
 ## 4. Desenho — decisões fixadas
 
-### 4.1 `message.updated` é **sinal de lote**, não de mensagem
+### 4.1 Os eventos são **só sinal**; o conteúdo vem do banco
 
 ```
-message.updated  →  acumulador (dedup por id)
-                 →  "o próximo batch está pronto?"  (limiar de VALOR, E4)
-                 →  nesse ponto, e só nesse, POST /v1/ingest
+message.updated / session.idle   →  SINAL: "a sessão mudou"
+                                 →  plugin LÊ o kilo.db (offset processado)
+                                 →  "o próximo batch está pronto?" (limiar de VALOR)
+                                 →  POST /v1/ingest com as N mensagens lidas
 ```
 
-O evento **não** significa "ingira esta mensagem". Ele anuncia que o estado do
-lote mudou. Quem decide enviar é o **limiar**, não o evento — e é isso que
-preserva a decisão do E4 (batch por valor de config).
+**Nenhum dos dois eventos é fonte de dado.** O plugin **não** monta o lote a
+partir do payload do evento (nem `parts` do `message.updated`, nem texto do
+`message.part.updated`): ele **lê o banco de dados** — as próximas N mensagens
+não processadas, pelo **offset por sessão**. É o desenho do antecessor
+(`messagesFromDb(sessionId, offset, batchSize)`, `:1159`), e é o que
+**dispensa o acumulador em memória**.
+
+Vantagens do offset sobre buffer de eventos:
+
+| | |
+|---|---|
+| **fonte completa** | o DB é a verdade — user **e** assistant, sem depender de hook nenhum entregar texto |
+| **sem estado em memória** | o progresso é `processedMessages` por sessão (persistido em `.kilo/`) |
+| **restart sobrevive** | reinício do plugin não perde o que já foi processado |
+| **sem parcial** | ao ler o DB, a mensagem já está persistida e completa (§2.2-bis) |
+
+E quem decide enviar continua sendo o **limiar de valor** (decisão do E4) — os
+eventos não competem com isso.
+
+⚠️ **Ponto a resolver no E4:** qual coluna/ordenação define "as próximas N". O
+antecessor usa `ORDER BY time_created ASC, id ASC` com `OFFSET` — que **não** é o
+mesmo esquema do `id` de sessão do graph-plugin. Precisa decidir o cursor (offset
+numérico × `lastMessageId`) e o que acontece se mensagens chegarem fora de ordem.
 
 ### 4.2 `session.idle` exige `sentBatchHashes` — **é obrigatório, não opcional**
 
@@ -217,7 +254,7 @@ Concorda com a medição (§3): sem o guard, o fallback **duplica fatos**
 (`relações 9 → 11`, fato do Bruno `[2x]`). O mecanismo:
 
 ```
-hash = batchHash(itens do lote)          // djb2 sobre `role\0content` (padrão do antecessor)
+hash = batchHash(lote lido do DB)        // djb2 sobre `role\0content` (padrão do antecessor)
 if (sentBatchHashes[hash]) → NÃO envia   // prova de que ESTE lote já foi
 else                       → envia e grava o hash
 ```
@@ -251,8 +288,12 @@ Os dois gatilhos **não** fazem a mesma coisa:
 | **`session.idle`** (fallback) | dispara **sempre** | **todos os batches necessários, inclusive o resto** |
 
 **Exemplo do dono:** batch = 20, `session.idle` dispara com **63 mensagens** não
-ingeridas ⇒ **3 jobs de 20 + 1 job de 3** (o resto). O fallback **drena tudo**;
-não deixa resíduo.
+ingeridas ⇒ **3 lotes de 20 + 1 de 3** (o resto). O fallback **drena tudo**; não
+deixa resíduo.
+
+Note que "63 não ingeridas" é medido **no banco** (total de mensagens da sessão
+menos o offset), não num buffer de eventos — é o que torna o cálculo possível
+sem estado em memória.
 
 Regra formal do fallback: `jobs = ceil(pendentes / batch)`, com o último job
 levando o resto (`pendentes mod batch`, se ≠ 0). Se `pendentes == 0`, não dispara.
