@@ -310,6 +310,95 @@ lado do plugin, não do memtier."*
 | **consequência** | o memtier **não muda**; nenhum contrato novo; o RFC-001 e este doc ficam como estão |
 | **por que faz sentido** | a decisão acompanha o desenho já existente (`specs/delecao-arquivo-removido-decisao.md`: *"o CLIENTE é responsável por declarar"*) — a mesma invariante de **órfão declarado** aplicada à ingestão: quem conhece o que já mandou é o cliente |
 
+### 4.5 Cursor de ingestão — `OFFSET` numérico tem defeito medido
+
+**Pergunta do dono (2026-10-15):** *"Acho melhor offset numérico com order by
+time_created. Não, melhor não, tem algum erro? Pode ver. Qual o problema dessa
+opção?"*
+
+Medido no `kilo.db` real (`~/.local/share/kilo/kilo.db`, 16.411 mensagens,
+324 sessões; sessão maior com 1.366).
+
+#### O que **não** é problema (verificado)
+
+| hipótese | veredito |
+|---|---|
+| `time_created` tem empates | **0 empates** em 16.411 — não é problema hoje |
+| `id` serve de tiebreak estável | ✅ **sim** — descartado o "id não é ordenável" |
+| conjunto é estável na prática | ✅ a sessão real está em ordem (0 inversões >5 posições) |
+
+#### O problema real: `OFFSET` **numérico** sobre um conjunto que **encolhe**
+
+O `OFFSET` é uma **posição**, não uma identidade. Se qualquer linha **antes** do
+cursor for removida, tudo abaixo **desce** e passa a ficar antes do cursor — e
+nunca mais é lido.
+
+**Medido, com número:**
+
+```
+C2 — compactação remove 40 msgs (posições 30..69), cursor já em 100:
+   lidas depois = 1.226 | offset final = 1.326
+   *** PULADAS PARA SEMPRE = 40 ***
+   msg_f4b1c90f9…: pos 100 → 60  (desceu 40)   ← nunca mais lida
+   msg_f4b1cb187…: pos 101 → 61  (desceu 40)
+   …
+```
+
+E a evidência de que **isso acontece de fato** neste banco:
+
+- **40 mensagens com `compaction`** no `data` (14 na maior sessão);
+- a tabela `message` tem `ON DELETE CASCADE` na FK para `session`;
+- **47 buracos no `rowid`** — prova de que linhas **já foram removidas** (o rowid
+  não é denso).
+
+A compactação é justamente a construção que **remove/reduz** histórico no meio da
+sessão — o gatilho exato do defeito.
+
+#### O mesmo defeito na inserção fora de ordem (mais raro, mesma classe)
+
+```
+C3 — mensagem ATRASADA (time_created antigo) chega depois:
+   entra na posição 10; se o cursor já passou de 10 → PULADA PARA SEMPRE
+   e as 10 seguintes andam +1 → relidas (o batchHash barra, custo só)
+```
+
+Só **1 em 16.411** mensagens está fora de ordem hoje — raro, mas o custo quando
+ocorre é **perda silenciosa e definitiva** (a mesma classe do L-1).
+
+#### A correção: cursor por **identidade**, não por posição
+
+```
+WHERE session_id = ?
+  AND (time_created > :last_ts
+       OR (time_created = :last_ts AND id > :last_id))
+ORDER BY time_created ASC, id ASC
+LIMIT :n
+```
+
+Guarda-se o **par `(time_created, id)` do último lido**, não um número.
+
+**Medido:**
+
+```
+C4 — mesmo cenário da C2 (40 removidas antes do cursor), cursor por tupla:
+   PULADAS = 0
+```
+
+Imune à remoção: o cursor aponta para **uma mensagem**, não para uma posição;
+remover linhas antes dela não muda a cláusula `>`, então nada é pulado.
+
+#### Recomendação
+
+**Cursor por `(time_created, id)`** — custa o mesmo (o `ORDER BY` já era esse) e
+elimina a classe inteira de perda. O `OFFSET` numérico do antecessor funciona lá
+porque o estado dele é reconstruído com backfill; aqui, onde o cursor é o único
+registro de progresso, a posição **não** é segura.
+
+⚠️ **Ainda assim persiste:** mensagem atrasada com `time_created` **anterior** ao
+cursor continua pulada (C3) — o cursor por tupla não resolve isso, só o numérico
+torna pior. Mitigação (se quisermos): janela de revarredura dos últimos N, às
+custas de reenvio barrado pelo hash.
+
 ## 6. Limitações conhecidas desta escolha — **anotadas, NÃO serão resolvidas agora**
 
 Decisão do dono (2026-10-15): registrar e deixar **sem resposta**.
