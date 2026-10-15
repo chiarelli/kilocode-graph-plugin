@@ -399,6 +399,89 @@ cursor continua pulada (C3) — o cursor por tupla não resolve isso, só o num�
 torna pior. Mitigação (se quisermos): janela de revarredura dos últimos N, às
 custas de reenvio barrado pelo hash.
 
+### 4.6 O controle de estado do OpenViking — **tem gap real (verificado nos dados)**
+
+**Observação do dono:** *"Veja como é que é o controle do OpenVic; pelo menos está
+funcionando até agora, só se tem algum bug encoberto que eu não descobri ainda,
+mas pelo que eu vi até agora o OpenVic tem feito a ingestão em batch da forma
+correta, lendo do banco de dados."*
+
+**Veredito: o desenho está certo (lê do banco, cursor + hash), mas há um bug
+encoberto — e ele já produziu perda real.**
+
+#### O que está correto (confirmado)
+
+| | |
+|---|---|
+| fonte | lê do banco (`messagesFromDb`, `:1159`) — **não** dos eventos ✔ |
+| progresso | `processedMessages` (offset) + `sentBatchHashes` (prova), persistidos em `.kilo/openviking-ingest.json` ✔ |
+| escrita atômica | `writeFileSync(tmp)` + `renameSync` ✔ |
+| dedup | `batchHash` (djb2 `role\0content`) barra reenvio ✔ |
+
+#### O bug: `caughtUp=true` com resto na fila (a sessão **fica presa**)
+
+Codigo (`:1268-1277` + `:1253`):
+
+```
+if (msgs.length < batchSize) {
+  if (msgs.length === 0) { caughtUp = true; continue; }   // fim real — ok
+  if (offset > 0)       { caughtUp = true; continue; }   // <- RESTO < batch: PRESA
+}
+...
+for (const sid of chain) { if (state.sessions[sid]?.caughtUp) continue; }  // pula
+```
+
+Um lote **parcial** (< 20) com `offset > 0` marca `caughtUp = true` e o loop
+**passa a pular a sessão**. O resto só sai se algo **reabrir** o flag.
+
+#### Medido no estado REAL (2 workspaces)
+
+```
+waweb            : 181 sentBatchHashes | 14 sessões | 7 com gap
+graphiti-daemon  : 109 sentBatchHashes | 12 sessões | 4 com gap
+
+total de mensagens no gap (2 workspaces): 45
+  AINDA no banco (recuperáveis): 45
+  REMOVIDAS (compactação): 0
+```
+
+**Todas as 45 estão no banco e não foram ingeridas.** Exemplos:
+`ses_ef5b6a6d4…: 18 total, 10 processado (gap 8)`;
+`ses_efc48fc65…: 171 total, 162 processado (gap 9)`.
+
+#### Por que isso não é "só contábil"
+
+O único caminho que reabre (`ensureBackfill`, `:1358-1366`) exige:
+
+```
+delta = dbCount - processedMessages
+if (delta >= ingestBatchSize)  → caughtUp = false    // reabre
+else if (delta > 0)            → "waiting for …"     // ESPERA
+```
+
+Ou seja: o resto **< 20** fica **bloqueado até a sessão ganhar mais 20 mensagens**.
+Numa sessão que **encerrou**, esse limiar nunca é atingido ⇒ as mensagens ficam
+**sem ingestão para sempre**.
+
+⚠️ **É exatamente a classe do C-2** que o dono levantou (§1): mensagem útil que
+nunca é processada. Confirmado no estado real, não em teoria.
+
+#### A correção (para o graph-plugin)
+
+- **`session.idle` drena tudo** (regra §4.3-bis) — resolve na raiz: o resto vai
+  num job menor, sem esperar limiar.
+- **`caughtUp` não deve ser setado com pendência** — ou o flag é "nada pendente"
+  (não "sem lote cheio"), ou o rearme não pode exigir `delta >= batchSize`.
+- O `sentBatchHashes` do antecessor (181 + 109 hashes, **sem TTL**) confirma a
+  dívida L-2.
+
+#### O que **não** foi medido
+
+- Se há sessões do OpenViking **não rastreadas** no estado (só olhei as que estão
+  no JSON) — o gap pode ser maior.
+- Se algum mecanismo fora do arquivo reabre o `caughtUp` em runtime (procurei no
+  código: `ensureBackfill` é o único, e ele exige `delta >= batchSize`).
+
 ## 6. Limitações conhecidas desta escolha — **anotadas, NÃO serão resolvidas agora**
 
 Decisão do dono (2026-10-15): registrar e deixar **sem resposta**.
