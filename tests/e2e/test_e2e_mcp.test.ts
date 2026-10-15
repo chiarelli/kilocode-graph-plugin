@@ -139,7 +139,9 @@ test("e2e: registro implícito do MCP + 4 tools reais listáveis/chamáveis", {
   );
 
   try {
-    assert.equal(workspaceName(dir), WS);
+    // Derivado = `<stem>-<sha1 8>`; o bearer real é escopado ao nome EXATO, então
+    // o boot PINA a identidade via `daemon.workspace`.
+    assert.match(workspaceName(dir), new RegExp(`^${WS}-[0-9a-f]{8}$`));
 
     const { client, registered } = spyMcp();
     const hooks = await pluginModule.server(
@@ -149,6 +151,7 @@ test("e2e: registro implícito do MCP + 4 tools reais listáveis/chamáveis", {
           url: MEMTIER_URL,
           token_file: tokenFile,
           program: PROGRAM,
+          workspace: WS,
           health_timeout_ms: 3000,
         },
         mcp: { enabled: true, name: "memtier" },
@@ -218,7 +221,7 @@ test("e2e: mcp.memtier definido no kilo.jsonc ⇒ plugin NÃO registra (FR-602)"
   );
 
   try {
-    assert.equal(workspaceName(dir), WS);
+    assert.match(workspaceName(dir), new RegExp(`^${WS}-[0-9a-f]{8}$`));
     const { client, registered } = spyMcp();
     const hooks = await pluginModule.server(
       { directory: dir, worktree: null, client },

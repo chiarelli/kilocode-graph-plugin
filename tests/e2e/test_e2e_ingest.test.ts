@@ -8,7 +8,8 @@
  *   1. Um `kilo.db` temporário e REAL (`node:sqlite`) com 20 mensagens
  *      (user+assistant) numa sessão.
  *   2. O plugin **boota** de verdade (`server(ctx, options)`) com
- *      `ingest.enabled=true`, apontando `ingest.db_path` para esse banco.
+ *      `ingest.enabled=true`; o `dir` do banco vem do **runtime** pelo fake de
+ *      `client.path.get()` (o estado do workspace); não há mais env var/config.
  *   3. O hook `event` recebe um `message.updated` REAL — a rotina lê o banco e
  *      envia 1 lote. O **efeito do outro lado** não é o retorno local: é o
  *      marcador do episódio aparecendo no `/v1/recall` real (o worker processou).
@@ -48,6 +49,21 @@ const BATCH = 20;
  * vários jobs que se somam, então o teto é generoso.
  */
 const WORKER_TIMEOUT_MS = Number(process.env.E2E_INGEST_WORKER_MS ?? 480000);
+
+/**
+ * Fake do runtime do Kilo: `client.path.get` devolve o **diretório de estado**
+ * do workspace (onde vive o `kilo.db`). É a fonte real do caminho do banco — o
+ * plugin o resolve por aqui, não por env var/config.
+ */
+function runtimeClient(stateDir: string) {
+  return {
+    path: {
+      get: async (_opts: { query: { directory: string } }) => ({
+        data: { state: stateDir },
+      }),
+    },
+  };
+}
 
 /**
  * Cria um `kilo.db` real (node:sqlite) com `count` mensagens user/assistant.
@@ -150,14 +166,15 @@ test(
     const marker = `ORION_${Date.now().toString(36)}`;
     await createKiloDb(dbPath, sessionId, marker);
 
-    const wsName = workspaceName(dir);
-    assert.equal(wsName, WS, `basename do workspace deve resolver para ${WS}`);
+    // Derivado = `<stem>-<sha1 8>`; o token legado é escopado ao nome EXATO, então
+    // o boot PINA a identidade via `daemon.workspace`.
+    assert.match(workspaceName(dir), new RegExp(`^${WS}-[0-9a-f]{8}$`));
 
     const hooks = await pluginModule.server(
-      { directory: dir, worktree: null },
+      { directory: dir, worktree: null, client: runtimeClient(kiloDir) },
       {
-        daemon: { url: MEMTIER_URL, token_file: tokenFile, program: PROGRAM, health_timeout_ms: 3000 },
-        ingest: { enabled: true, batch_size: BATCH, db_path: dbPath },
+        daemon: { url: MEMTIER_URL, token_file: tokenFile, program: PROGRAM, workspace: WS, health_timeout_ms: 3000 },
+        ingest: { enabled: true, batch_size: BATCH },
         debug: true,
       },
     );
@@ -216,10 +233,10 @@ test(
     await createKiloDb(dbPath, sessionId, `ORION_${Date.now().toString(36)}`);
 
     const hooks = await pluginModule.server(
-      { directory: dir, worktree: null },
+      { directory: dir, worktree: null, client: runtimeClient(kiloDir) },
       {
-        daemon: { url: MEMTIER_URL, token_file: tokenFile, program: PROGRAM, health_timeout_ms: 3000 },
-        ingest: { enabled: true, batch_size: BATCH, db_path: dbPath },
+        daemon: { url: MEMTIER_URL, token_file: tokenFile, program: PROGRAM, workspace: WS, health_timeout_ms: 3000 },
+        ingest: { enabled: true, batch_size: BATCH },
         debug: true,
       },
     );
@@ -284,10 +301,10 @@ test(
     await createKiloDb(dbPath, sessionId, marker, 23, 22);
 
     const hooks = await pluginModule.server(
-      { directory: dir, worktree: null },
+      { directory: dir, worktree: null, client: runtimeClient(kiloDir) },
       {
-        daemon: { url: MEMTIER_URL, token_file: tokenFile, program: PROGRAM, health_timeout_ms: 3000 },
-        ingest: { enabled: true, batch_size: 20, db_path: dbPath },
+        daemon: { url: MEMTIER_URL, token_file: tokenFile, program: PROGRAM, workspace: WS, health_timeout_ms: 3000 },
+        ingest: { enabled: true, batch_size: 20 },
         debug: true,
       },
     );
@@ -364,10 +381,10 @@ test(
     await createKiloDb(dbPath, sessionId, marker);
 
     const hooks = await pluginModule.server(
-      { directory: dir, worktree: null },
+      { directory: dir, worktree: null, client: runtimeClient(kiloDir) },
       {
-        daemon: { url: MEMTIER_URL, token_file: tokenFile, program: PROGRAM, health_timeout_ms: 3000 },
-        ingest: { enabled: true, batch_size: BATCH, db_path: dbPath },
+        daemon: { url: MEMTIER_URL, token_file: tokenFile, program: PROGRAM, workspace: WS, health_timeout_ms: 3000 },
+        ingest: { enabled: true, batch_size: BATCH },
         debug: true,
       },
     );

@@ -14,12 +14,67 @@
  * avanço é uma tupla, imune à remoção de linhas antes do cursor.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 
-/** Fallback quando nenhum `.kilo/kilo.db` é achado a partir do workspace. */
-export const DEFAULT_DB_PATH = join(homedir(), ".local/share/kilo/kilo.db");
+import { debug, log, logFatal } from "../logger.ts";
+
+/** Nome do arquivo do banco de sessões do Kilo (fixo por decisão do runtime). */
+export const KILO_DB_FILENAME = "kilo.db";
+
+/**
+ * Fallback determinístico quando o runtime não responde: é o **próprio default
+ * do runtime** no Linux (`~/.local/share/kilo/kilo.db`). Nunca é um caminho
+ * inventado pelo plugin — apenas a última reserva se `GET /path` falhar.
+ */
+export const DEFAULT_DB_PATH = join(homedir(), ".local/share", "kilo", KILO_DB_FILENAME);
+
+/**
+ * Porta mínima de `client.path` do Kilo (o runtime expõe `GET /path` → diretórios
+ * de estado/config do workspace). Estrutural: um fake em teste a implementa.
+ */
+export interface RuntimePathClient {
+  path?: {
+    get(opts: { query: { directory: string } }): Promise<{
+      data?: { state?: unknown };
+      error?: unknown;
+    }>;
+  };
+}
+
+/**
+ * Resolve o caminho do `kilo.db` a partir do **runtime do Kilo** — o valor que o
+ * runtime já determinou no boot (nunca `process.cwd()`, nunca env var). O
+ * diretório de estado vem de `client.path.get().state`; o banco é
+ * `<state>/kilo.db`. **Nunca lança** (NFR-03): sem a API do client, resposta
+ * inválida ou erro ⇒ log e fallback para o default do runtime.
+ */
+export async function resolveRuntimeDbPath(
+  client: RuntimePathClient | undefined,
+  directory: string,
+): Promise<string> {
+  const pathApi = client?.path;
+  if (!pathApi) {
+    debug("ingest: client.path indisponível; usando o db default do runtime");
+    return DEFAULT_DB_PATH;
+  }
+  try {
+    const res = await pathApi.get({ query: { directory } });
+    const state = res.data?.state;
+    if (typeof state === "string" && state.trim() !== "") {
+      const dbPath = join(state, KILO_DB_FILENAME);
+      debug(`ingest: db do runtime resolvido em ${dbPath}`);
+      return dbPath;
+    }
+    log(
+      "ingest: `client.path.get` não devolveu `state`; usando o db default do runtime",
+    );
+  } catch (err) {
+    logFatal("ingest resolve db path", err);
+  }
+  return DEFAULT_DB_PATH;
+}
 
 /** Um resultado cru do SQLite (coluna → valor). */
 export type DbRow = Record<string, unknown>;
@@ -53,34 +108,6 @@ export interface ReadBatch {
   last: SessionCursor | null;
   /** Nº de LINHAS lidas (não só as com texto) — decide o limiar do gatilho. */
   rows: number;
-}
-
-/**
- * Localiza o `kilo.db` a partir do diretório do projeto (caminhos do antecessor,
- * `openviking-memory.js:370`): `.kilo/kilo.db`, `.devcontainer/kilo/local/kilo.db`,
- * até 5 níveis acima (`<parent>/.kilo/kilo.db`) e, por fim, o banco global.
- * Nunca retorna `""` — devolve o candidato de fallback (o backend decide).
- */
-export function findKiloDb(
-  projectDir: string,
-  exists: (p: string) => boolean = existsSync,
-): string {
-  const candidates = [
-    join(projectDir, ".kilo", "kilo.db"),
-    join(projectDir, ".devcontainer", "kilo", "local", "kilo.db"),
-  ];
-  for (const p of candidates) {
-    if (exists(p)) return p;
-  }
-  let dir = projectDir;
-  for (let i = 0; i < 5; i++) {
-    const parent = dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-    const p = join(dir, ".kilo", "kilo.db");
-    if (exists(p)) return p;
-  }
-  return DEFAULT_DB_PATH;
 }
 
 /** Backend falso/injetável construído sobre uma função `query` (teste). */

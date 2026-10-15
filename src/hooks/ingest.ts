@@ -27,7 +27,7 @@ import {
 /** Dependências do hook (injetáveis para teste, sem banco/rede reais). */
 export interface IngestHookRuntime {
   cfg: IngestConfig;
-  /** Caminho do `kilo.db` (resolvido por `findKiloDb` no boot). */
+  /** Caminho do `kilo.db` (resolvido do runtime do Kilo no boot). */
   dbPath: string;
   /** Caminho do estado (`.kilo/graph-ingest.json`). */
   statePath: string;

@@ -100,7 +100,19 @@ export interface Config {
     token_file: string;
     /** Bearer resolvido de `KILOCODE_GRAPH_TOKEN` (env). Nunca logado. */
     token: string;
+    /**
+     * Bearer do **gestor** resolvido de `KILOCODE_GRAPH_MANAGER_TOKEN` (env).
+     * Vazio ⇒ provisionamento do workspace desligado. Nunca logado.
+     */
+    manager_token: string;
     program: string;
+    /**
+     * Override do nome do workspace (vazio ⇒ derivado de `workspaceName(dir)` =
+     * `<stem>-<sha1 8>`). Setado ⇒ identidade explícita, usada como veio — o
+     * memtier escopa o bearer ao nome EXATO, então tokens pré-escopados (E2E,
+     * migração) precisam pinar o nome. Não recebe o sufixo de hash.
+     */
+    workspace: string;
     health_timeout_ms: number;
   };
   inject: {
@@ -129,8 +141,6 @@ export interface Config {
     max_hashes: number;
     /** Timeout do `/v1/ingest` (ms; default 15000). */
     timeout_ms: number;
-    /** Override do caminho do `kilo.db` (vazio ⇒ localiza pelo workspace). */
-    db_path: string;
   };
   mcp: {
     enabled: boolean;

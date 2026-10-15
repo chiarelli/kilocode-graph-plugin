@@ -84,8 +84,10 @@ test("e2e: plugin boota com inject.enabled e injeta bloco de memória no turno",
 }, async () => {
   const { dir, tokenFile } = makeWorkspace();
   try {
-    const wsName = workspaceName(dir);
-    assert.equal(wsName, WS, `basename do workspace deve resolver para ${WS}`);
+    // O nome DERIVADO agora carrega o hash do caminho; o token legado é escopado
+    // ao nome EXATO (`alfa`), então o boot PINA a identidade via
+    // `daemon.workspace`. O derivado tem a forma `<stem>-<sha1 8>`.
+    assert.match(workspaceName(dir), /^alfa-[0-9a-f]{8}$/);
 
     const hooks = await pluginModule.server(
       { directory: dir, worktree: null },
@@ -94,6 +96,7 @@ test("e2e: plugin boota com inject.enabled e injeta bloco de memória no turno",
           url: MEMTIER_URL,
           token_file: tokenFile,
           program: PROGRAM,
+          workspace: WS,
           health_timeout_ms: 3000,
         },
         inject: { enabled: true, max_memories: 5, max_chars: 3000, max_tokens: 2000 },

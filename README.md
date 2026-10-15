@@ -7,7 +7,10 @@ provider.
 Substitui o `kilo-openviking-plugin` por baixo: os hooks do Kilo são os mesmos,
 o provider muda.
 
-> **Status:** esqueleto de projeto. PRD e arquitetura são drafts (v0.2).
+> **Status:** E1 (fundação), E2 (memória), E3a/E3b/E3c (código) e E4 (ingestão)
+> implementados; PRD e arquitetura continuam drafts (v0.2). O boot também
+> **provisiona o workspace memtier 1:1** e resolve config/banco por workspace (ver
+> §Configuração). Segunda onda (E5–E7) é forma e contratos.
 > **Dependências:**
 > - [`memtier`](../graphiti-daemon/) (ex-`graphiti-daemon`) — **implementado**
 >   (E1–E7/E11 + A1/A2/E12). Fala-se HTTP/MCP; o plugin não conhece FalkorDB.
@@ -65,6 +68,53 @@ O plugin usa **hooks de evento** (não captura por `chat.message`):
 | `experimental.chat.messages.transform` | **injeção** no turno (memória + código) |
 | `experimental.chat.system.transform` | contexto de sistema |
 | `experimental.session.compacting` | preservar memória na compactação |
+
+## Configuração e provisionamento
+
+O plugin roda **por escopo de workspace**, mesmo instalado globalmente. O
+diretório do workspace vem do **runtime do Kilo** (`ctx.worktree` >
+`ctx.directory` > cwd); é dele que saem o config e o banco — nunca de
+`process.cwd()`.
+
+| Item | Origem | Onde fica |
+|---|---|---|
+| Endpoint do memtier | env `KILOCODE_GRAPH_URL` (default `http://127.0.0.1:8400`) | — |
+| Config do plugin | `<workspace>/.kilo/graph-plugin.json` > `~/.config/kilo/graph-plugin.json` | workspace/global |
+| Nome do workspace | derivado do dir = `<stem>-<sha1 8>`; override `KILOCODE_GRAPH_WORKSPACE` | — |
+| Bearer do workspace | arquivo `.kilo/graph-key.json` = `{ token, workspace, program }` (`0600`) | `./.kilo/` do workspace |
+| Banco de sessões | `client.path.get().state` + `/kilo.db` (runtime do Kilo) | runtime |
+| Bearer do **gestor** | env `KILOCODE_GRAPH_MANAGER_TOKEN` (opcional) | — |
+
+**Mapeamento 1:1.** Cada workspace Kilo corresponde a um workspace memtier. O
+nome do workspace memtier é **`<stem>-<sha1 8 do caminho>`** (ex.:
+`kilocode-graph-plugin-<sha1 8>`) — o sufixo de hash **sempre presente** minimiza
+colisões entre diretórios distintos (mesmo basename, saneamento ou truncamento).
+O vínculo é controlado pela chave do workspace em `./.kilo/`. Quem tem token
+pré-escopado a um nome exato (o memtier escopa o bearer ao nome **exato**) pina a
+identidade via `KILOCODE_GRAPH_WORKSPACE`.
+
+**Provisionamento automático.** Com `KILOCODE_GRAPH_MANAGER_TOKEN` no ambiente e
+a chave do workspace **ausente**, o plugin cria o workspace memtier no boot e
+salva a chave — o usuário não faz onboarding manual:
+
+```
+gestor (env) ──▶ POST /v1/mgmt/programs → /v1/mgmt/workspaces → /v1/mgmt/invites
+                 ──▶ POST /v1/auth/claim-user (show-once) ──▶ POST /v1/auth/rotate
+                 ──▶ grava <workspace>/.kilo/graph-key.json  (token rotacionado, 0600)
+```
+
+Sem o bearer do gestor, a chave do workspace é pré-requisito manual (como antes).
+A rotação é obrigatória (o bearer do claim tem `must_rotate=true`); o token
+resultante é o persistido. O fluxo nunca lança nem sobrescreve uma chave
+utilizável — falha degrada para o caminho `401` de sempre. Envs completas em
+[`src/README.md`](src/README.md#variáveis-de-ambiente).
+
+**Prova.** Unit: `tests/provision.test.ts` (5 passos, `exists` não sobrescreve,
+degradação, concorrência). E2E real contra o memtier
+(`tests/e2e/test_e2e_provision.test.ts`, gated `E2E=1` + `E2E_MANAGER_TOKEN`):
+boot → cria o workspace → grava a chave → a chave autentica em `/v1/recall`
+(prova que é o bearer rotacionado) → 2º boot não reescreve. Tabela completa de
+verificação em [`src/README.md`](src/README.md#verificação-o-que-prova-cada-afirmação).
 
 ## Coleta de código (o coletor)
 

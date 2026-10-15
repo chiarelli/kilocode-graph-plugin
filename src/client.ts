@@ -271,7 +271,8 @@ export class MemtierClient {
     this.url = options.url.replace(/\/+$/, "");
     this.workspace = options.workspace ?? "";
     this.program = options.program ?? "default";
-    this.envToken = options.token ?? "";
+    // `trim()`: token só-espaços não pode vencer o `token_file` (defeito medido).
+    this.envToken = (options.token ?? "").trim();
     this.tokenFile = options.token_file ?? "";
     this.timeoutMs = options.timeout_ms ?? DEFAULT_TIMEOUT_MS;
     this.healthTimeoutMs = options.health_timeout_ms ?? DEFAULT_HEALTH_TIMEOUT_MS;
@@ -300,14 +301,19 @@ export class MemtierClient {
 
   /**
    * Token efetivo: env > `token_file` > ausente. O arquivo é lido **uma vez**
-   * (lazy) e cacheado; ausente/corrompido ⇒ `""` (a borda decide 401). O valor
-   * nunca é logado.
+   * (lazy) e cacheado **apenas quando dá um token**; um resultado vazio NÃO é
+   * cacheado — assim uma chave que aparece depois (provisionamento externo,
+   * rotação, arquivo criado após o boot) é relida na próxima chamada, em vez de
+   * fixar `""` até reiniciar (defeito medido: o `health()` do boot forçava a
+   * primeira leitura vazia e todo recall/ingest seguia sem `Authorization`).
+   * O valor nunca é logado.
    */
   private token(): string {
     if (this.envToken) return this.envToken;
-    if (this.fileToken !== undefined) return this.fileToken;
-    this.fileToken = this.readTokenFile();
-    return this.fileToken;
+    if (this.fileToken) return this.fileToken;
+    const fresh = this.readTokenFile();
+    if (fresh) this.fileToken = fresh;
+    return fresh;
   }
 
   private readTokenFile(): string {
@@ -316,9 +322,10 @@ export class MemtierClient {
       const parsed = JSON.parse(this.readFileImpl(this.tokenFile)) as {
         token?: unknown;
       };
-      return typeof parsed.token === "string" ? parsed.token : "";
+      return typeof parsed.token === "string" ? parsed.token.trim() : "";
     } catch {
       // Ausente/corrompido não é fatal: segue sem header, a borda responde 401.
+      // (Não cacheado — o arquivo pode aparecer/consertar depois.)
       return "";
     }
   }

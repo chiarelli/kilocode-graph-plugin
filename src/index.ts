@@ -10,41 +10,97 @@
  * o `dispose`.
  */
 
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, relative } from "node:path";
 
 import { MemtierClient } from "./client.ts";
-import { loadConfig, type PluginOptions } from "./config.ts";
+import { DEFAULTS, loadConfig, type PluginOptions } from "./config.ts";
 import { collectHook } from "./hooks/collect.ts";
 import { ingestHook } from "./hooks/ingest.ts";
 import { messagesHook } from "./hooks/messages.ts";
-import { findKiloDb } from "./ingest/db.ts";
+import {
+  resolveRuntimeDbPath,
+  type RuntimePathClient,
+} from "./ingest/db.ts";
 import { INGEST_STATE_REL_PATH } from "./ingest/state.ts";
 import { debug, formatBootLine, log, logFatal, setDebug } from "./logger.ts";
 import { scheduleMcpRegistration, type KiloLikeClient } from "./mcp/register.ts";
+import { ensureWorkspaceKey } from "./provision.ts";
 import type { PluginCtx } from "./types.ts";
 import { resolveWorkspaceDir, workspaceName } from "./workspace.ts";
 
 /**
- * `token_file` é relativo ao workspace (`daemon.token_file` default
- * `.kilo/graph-key.json`). Caminho absoluto é respeitado como veio.
+ * `token_file` é resolvido **dentro** do workspace (`daemon.token_file` default
+ * `.kilo/graph-key.json`). Um caminho absoluto só é honrado se estiver contido no
+ * `dir`; qualquer caminho que escape (absoluto fora do workspace, ou `../..`) é
+ * **recusado** e cai no default do workspace. Sem esse confinamento o
+ * provisionamento escreveria (destrutivamente) onde o caminho apontasse — ex.:
+ * `/home/u/.ssh/authorized_keys` — contradizendo o escopo por workspace.
+ * `token_file` vazio também cai no default: o plugin sempre tem um arquivo de
+ * chave dentro do workspace (nunca um `""` que quebraria a escrita).
  */
-function resolveTokenFile(dir: string, tokenFile: string): string {
-  if (!tokenFile) return "";
-  return isAbsolute(tokenFile) ? tokenFile : join(dir, tokenFile);
+export function resolveTokenFile(dir: string, tokenFile: string): string {
+  const fallback = join(dir, DEFAULTS.daemon.token_file);
+  if (!tokenFile) return fallback;
+  const resolved = isAbsolute(tokenFile) ? tokenFile : join(dir, tokenFile);
+  if (!isInsideDir(dir, resolved)) {
+    log(
+      `token_file fora do workspace (${tokenFile}); usando ${DEFAULTS.daemon.token_file}`,
+    );
+    return fallback;
+  }
+  return resolved;
+}
+
+/** `true` quando `child` está contido em `parent` (ou é o próprio). */
+function isInsideDir(parent: string, child: string): boolean {
+  const rel = relative(parent, child);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
 const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
-  const config = loadConfig(options);
+  // O diretório do workspace vem do runtime do Kilo (`ctx.worktree` >
+  // `ctx.directory` > cwd) ANTES do config: o `.kilo/graph-plugin.json` do
+  // workspace é lido DESSE diretório, nunca de `process.cwd()` (plugin global).
+  const dir = resolveWorkspaceDir(ctx);
+  const config = loadConfig(options, dir);
   setDebug(config.debug);
 
-  const dir = resolveWorkspaceDir(ctx);
-  const workspace = workspaceName(dir);
+  // Identidade do workspace: `daemon.workspace` (override explícito) > derivado
+  // do diretório (`workspaceName(dir)` = `<stem>-<sha1 8>`). O override existe
+  // porque o memtier escopa o bearer ao nome EXATO — quem tem token pré-escopado
+  // precisa pinar o nome (o derivado carrega o hash do caminho).
+  const workspace = config.daemon.workspace || workspaceName(dir);
+  const keyFile = resolveTokenFile(dir, config.daemon.token_file);
+
+  // Provisionamento do workspace 1:1. Com o bearer do gestor no ambiente
+  // (`KILOCODE_GRAPH_MANAGER_TOKEN`) e a chave do workspace ausente, cria o
+  // workspace memtier e grava `.kilo/graph-key.json`. Bloqueante de propósito
+  // (o bearer é pré-condição das chamadas de dados) e limitado por um orçamento
+  // de parede; roda só quando a chave está ausente, então o boot normal não paga
+  // latência. Nunca lança — falha degrada para o caminho 401 de sempre.
+  if (config.daemon.manager_token) {
+    const outcome = await ensureWorkspaceKey({
+      url: config.daemon.url,
+      managerToken: config.daemon.manager_token,
+      workspace,
+      program: config.daemon.program,
+      keyFile,
+    });
+    if (outcome.reason === "failed") {
+      // Falha é VISÍVEL (não só debug): o operador precisa saber que o
+      // provisionamento não persistiu a chave — senão só verá 401 adiante.
+      log(`provision falhou workspace=${workspace} (chave não gravada)`);
+    } else {
+      debug(`provision outcome=${outcome.reason}`);
+    }
+  }
+
   const client = new MemtierClient({
     url: config.daemon.url,
     workspace,
     program: config.daemon.program,
     token: config.daemon.token,
-    token_file: resolveTokenFile(dir, config.daemon.token_file),
+    token_file: keyFile,
     timeout_ms: config.daemon.health_timeout_ms,
     health_timeout_ms: config.daemon.health_timeout_ms,
     recall_timeout_ms: config.inject.timeout_ms,
@@ -103,6 +159,15 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
     timeout_ms: config.mcp.timeout_ms,
   });
 
+  // E4: o `kilo.db` é lido do **runtime do Kilo** (`client.path.get().state` →
+  // `<state>/kilo.db`), nunca de `process.cwd()` nem de env var: o runtime já
+  // determinou, no boot, onde está o banco configurado. Resolve uma vez (o
+  // caminho é estável na sessão) e só quando a ingestão está ligada; nunca lança
+  // — degrada para o db default. Desligada, o provider nem é aberto.
+  const dbPath = config.ingest.enabled
+    ? await resolveRuntimeDbPath(ctx.client as RuntimePathClient | undefined, dir)
+    : "";
+
   // E4: ingestion hooks. Construído fora do objeto de retorno para que o
   // `dispose` (que fecha o handle do SQLite) seja referenciável no shutdown.
   const ingestHooks = ingestHook({
@@ -111,7 +176,7 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
       batch_size: config.ingest.batch_size,
       max_hashes: config.ingest.max_hashes,
     },
-    dbPath: config.ingest.db_path || findKiloDb(dir),
+    dbPath,
     statePath: join(dir, INGEST_STATE_REL_PATH),
     client,
   });

@@ -117,7 +117,9 @@ test("e2e: código indexado ⇒ bloco graph-code no turno com o caminho real", {
   // 2) O PLUGIN injeta o bloco de código no turno (boot real + transform real).
   const { dir, tokenFile } = makeWorkspace();
   try {
-    assert.equal(workspaceName(dir), WS, `basename deve resolver para ${WS}`);
+    // Derivado = `<stem>-<sha1 8>`; o token legado é escopado ao nome EXATO, então
+    // o boot PINA a identidade via `daemon.workspace`.
+    assert.match(workspaceName(dir), new RegExp(`^${WS}-[0-9a-f]{8}$`));
     const hooks = await pluginModule.server(
       { directory: dir, worktree: null },
       {
@@ -125,6 +127,7 @@ test("e2e: código indexado ⇒ bloco graph-code no turno com o caminho real", {
           url: MEMTIER_URL,
           token_file: tokenFile,
           program: PROGRAM,
+          workspace: WS,
           health_timeout_ms: 3000,
         },
         inject: {

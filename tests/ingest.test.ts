@@ -28,9 +28,9 @@ import {
   createBackendProvider,
   DEFAULT_DB_PATH,
   fakeBackend,
-  findKiloDb,
   IngestReadError,
   readBatch,
+  resolveRuntimeDbPath,
   type DbRow,
   type IngestMessage,
   type SqliteBackend,
@@ -198,26 +198,45 @@ test("batch_threshold: só envia com o lote CHEIO (rows >= batch)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// db.ts — localização e leitura
+// db.ts — localização (pelo runtime) e leitura
 // ---------------------------------------------------------------------------
 
-test("db_find_project: `.kilo/kilo.db` do projeto tem prioridade", () => {
-  const exists = (p: string) => p === join("/repo", ".kilo", "kilo.db");
-  assert.equal(findKiloDb("/repo", exists), join("/repo", ".kilo", "kilo.db"));
+test("db_runtime_path: usa client.path.get().state + `kilo.db`", async () => {
+  const dir = "/ws";
+  const seen: string[] = [];
+  const client = {
+    path: {
+      get: async (opts: { query: { directory: string } }) => {
+        seen.push(opts.query.directory);
+        return { data: { state: "/home/u/.local/share/kilo" } };
+      },
+    },
+  };
+  assert.equal(
+    await resolveRuntimeDbPath(client, dir),
+    join("/home/u/.local/share/kilo", "kilo.db"),
+  );
+  assert.deepEqual(seen, [dir], "o directory vai no query do runtime");
 });
 
-test("db_find_devcontainer: segundo candidato quando não há `.kilo/`", () => {
-  const dev = join("/repo", ".devcontainer", "kilo", "local", "kilo.db");
-  assert.equal(findKiloDb("/repo", (p) => p === dev), dev);
+test("db_runtime_path_no_client: sem client.path ⇒ db default do runtime", async () => {
+  assert.equal(await resolveRuntimeDbPath(undefined, "/ws"), DEFAULT_DB_PATH);
 });
 
-test("db_find_walks_up: sobe até 5 níveis atrás de `<parent>/.kilo/kilo.db`", () => {
-  const target = join("/a", ".kilo", "kilo.db");
-  assert.equal(findKiloDb("/a/b/c/d", (p) => p === target), target);
+test("db_runtime_path_bad_state: `state` ausente ⇒ db default do runtime", async () => {
+  const client = { path: { get: async () => ({ data: {} }) } };
+  assert.equal(await resolveRuntimeDbPath(client, "/ws"), DEFAULT_DB_PATH);
 });
 
-test("db_find_fallback: nada encontrado ⇒ banco global", () => {
-  assert.equal(findKiloDb("/nope", () => false), DEFAULT_DB_PATH);
+test("db_runtime_path_error: erro do runtime ⇒ db default (nunca lança)", async () => {
+  const client = {
+    path: {
+      get: async () => {
+        throw new Error("runtime offline");
+      },
+    },
+  };
+  assert.equal(await resolveRuntimeDbPath(client, "/ws"), DEFAULT_DB_PATH);
 });
 
 test("db_read_batch: remonta texto (user+assistant), cursor por tupla e sem OFFSET", () => {

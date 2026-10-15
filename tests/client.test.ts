@@ -185,6 +185,76 @@ test("token_absent: sem env nem arquivo ⇒ sem header (borda decide 401)", asyn
   assert.equal(auth, undefined);
 });
 
+// Defeito medido: o cache fixava `""` na primeira leitura vazia (o `health()` do
+// boot), então uma chave que aparecesse DEPOIS era ignorada até reiniciar.
+test("token_appears_later: chave criada após a 1ª leitura vazia é usada", async () => {
+  let present = false;
+  const auths: Array<string | undefined> = [];
+  const client = new MemtierClient({
+    url: "http://memtier:8400",
+    token_file: "/ws/.kilo/graph-key.json",
+    readFile: () => {
+      if (!present) throw new Error("ENOENT");
+      return JSON.stringify({ token: "late-token" });
+    },
+    fetch: stubFetch(200, { status: "ok" }, (_i, init) => {
+      auths.push(new Headers(init?.headers).get("Authorization") ?? undefined);
+    }),
+  });
+  await client.health(); // 1ª leitura: ausente ⇒ sem header
+  assert.equal(auths[0], undefined);
+  present = true; // provisionamento/rotação externa cria a chave
+  await client.health(); // deve RELER e usar
+  assert.equal(auths[1], "Bearer late-token", "não pode fixar o vazio para sempre");
+});
+
+test("token_empty_is_not_cached: arquivo corrompido depois consertado é relido", async () => {
+  let raw = "not json";
+  let auth: string | undefined;
+  const client = new MemtierClient({
+    url: "http://memtier:8400",
+    token_file: "/ws/.kilo/graph-key.json",
+    readFile: () => raw,
+    fetch: stubFetch(200, { status: "ok" }, (_i, init) => {
+      auth = new Headers(init?.headers).get("Authorization") ?? undefined;
+    }),
+  });
+  await client.health();
+  assert.equal(auth, undefined);
+  raw = JSON.stringify({ token: "fixed" });
+  await client.health();
+  assert.equal(auth, "Bearer fixed");
+});
+
+test("token_whitespace_env: env só-espaços NÃO vence o arquivo", async () => {
+  let auth: string | undefined;
+  const client = new MemtierClient({
+    url: "http://memtier:8400",
+    token: "   ",
+    token_file: "/ws/.kilo/graph-key.json",
+    readFile: () => JSON.stringify({ token: "filetoken" }),
+    fetch: stubFetch(200, { status: "ok" }, (_i, init) => {
+      auth = new Headers(init?.headers).get("Authorization") ?? undefined;
+    }),
+  });
+  await client.health();
+  assert.equal(auth, "Bearer filetoken", "só-espaços cai no arquivo, não em `Bearer    `");
+});
+
+test("token_file_whitespace_token: token só-espaços no arquivo ⇒ sem header", async () => {
+  let auth: string | undefined = "unset";
+  const client = new MemtierClient({
+    url: "http://memtier:8400",
+    token_file: "/ws/.kilo/graph-key.json",
+    readFile: () => JSON.stringify({ token: "   " }),
+    fetch: stubFetch(200, { status: "ok" }, (_i, init) => {
+      auth = new Headers(init?.headers).get("Authorization") ?? undefined;
+    }),
+  });
+  await client.health();
+  assert.equal(auth, undefined);
+});
+
 test("http_401_typed: request 401 ⇒ AuthError", async () => {
   const client = new MemtierClient({
     url: "http://memtier:8400",

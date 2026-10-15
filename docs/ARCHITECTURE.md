@@ -442,7 +442,7 @@ Nada hardcoded no script (FR-303). **JSON** + env vars, precedência:
 > `INJECT_MAX_CODE_CHUNKS`, `INDEX_ENABLED`, `INDEXER_BIN`,
 > `INDEX_SYNC_TIMEOUT_MS`, `MCP_ENABLED`, `MCP_NAME`, `DEBUG`,
 > `INGEST_ENABLED`, `INGEST_BATCH_SIZE`, `INGEST_MAX_HASHES`, `INGEST_TIMEOUT_MS`,
-> `INGEST_DB_PATH`. O prefixo da env de config é `KILOCODE_GRAPH_` (o
+> `MANAGER_TOKEN`. O prefixo da env de config é `KILOCODE_GRAPH_` (o
 > `openviking` do antecessor mudou).
 
 > **Defaults desligados** para indexação e injeção — é a preferência registrada
@@ -454,8 +454,10 @@ Nada hardcoded no script (FR-303). **JSON** + env vars, precedência:
 > **exceção consciente**: o E3c não estava specado quando o E1 fechou (a segunda
 > onda era "spec sob demanda"), então a epic dona as declara e a exceção é
 > registrada no histórico do BACKLOG. As chaves de `ingest.*` foram declaradas
-> pela própria **E4** (`ingest.enabled`/`batch_size`/`max_hashes`/`timeout_ms`/
-> `db_path`; default `enabled=false`).
+> pela própria **E4** (`ingest.enabled`/`batch_size`/`max_hashes`/`timeout_ms`;
+> default `enabled=false`). O caminho do `kilo.db` **não** é config: vem do
+> **runtime do Kilo** (`client.path.get().state` → `<state>/kilo.db`) — a env
+> `INGEST_DB_PATH` foi removida.
 
 
 ## 7. Adaptadores multi-CLI

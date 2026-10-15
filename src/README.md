@@ -2,17 +2,21 @@
 
 Estado: **E1 (fundação), E2 (injeção de memória), E3a (coletor de código), E3b
 (registro do MCP), E3c (injeção de código) e E4 (ingestão assíncrona)
-implementadas**; a segunda onda (E5–E7) ainda é forma e contratos. O que existe
-hoje em `src/` é `index.ts`, `config.ts`, `client.ts`, `workspace.ts`,
-`logger.ts`, `types.ts`, `hooks/{messages,collect,ingest}.ts`,
-`inject/{memory,code,budget}.ts`,
+implementadas**. Além delas, o plugin ganhou duas capacidades novas (sem número
+de epic): **provisionamento do workspace memtier 1:1** (`provision.ts`) e
+**escopo por workspace no boot** (config e `kilo.db` lidos do workspace
+resolvido no runtime, nunca de `process.cwd()`). A segunda onda (E5–E7) ainda é
+forma e contratos. O que existe hoje em `src/` é `index.ts`, `config.ts`,
+`provision.ts`, `client.ts`, `workspace.ts`, `logger.ts`, `types.ts`,
+`hooks/{messages,collect,ingest}.ts`, `inject/{memory,code,budget}.ts`,
 `index/{runner,collector,edges,manifest,trigger}.ts`,
 `ingest/{db,batch,state,routine}.ts` e `mcp/{register,kilo-config}.ts`.
 
 ```
 src/
-├── index.ts              # registro dos hooks + disparo do coletor + registro MCP
-├── config.ts             # graph-plugin.json + env vars
+├── index.ts              # registro dos hooks + coleta no boot + registro MCP + provisionamento
+├── config.ts             # graph-plugin.json (do workspace) + env vars
+├── provision.ts          # ⬅ NOVO — cria o workspace memtier 1:1 e grava .kilo/graph-key.json
 ├── client.ts             # HTTP client do memtier
 ├── workspace.ts          # diretório → nome lógico
 ├── inject/
@@ -145,7 +149,9 @@ async function injectContextIntoMessages(messages, rt): Promise<void>
 ### `ingest/` (E4 — implementado)
 ```ts
 // db.ts — fonte de verdade (o evento NUNCA carrega conteúdo, ADR-007).
-findKiloDb(projectDir, exists?): string            // .kilo/kilo.db … global
+resolveRuntimeDbPath(client, directory): Promise<string>  // <state>/kilo.db do runtime
+//   o caminho do banco vem de `client.path.get().state` (runtime do Kilo),
+//   NUNCA de cwd/env var; degrada para o db default do runtime.
 readBatch(backend, sessionId, cursor, limit, onPoison?): ReadBatch
 //   cursor = { last_ts, last_id } — (time_created, id), SEM OFFSET (ADR-008);
 //   lança `IngestReadError` em falha transitória (não avança o cursor).
@@ -172,6 +178,121 @@ function ingestHook(rt): { event, dispose }
 //   background; `dispose` fecha o handle do SQLite. Nunca bloqueia o turno.
 ```
 
+### `provision.ts` (provisionamento do workspace 1:1 — implementado)
+```ts
+function hasUsableKey(keyFile, io?): boolean                  // há `token` não-vazio no key file
+async function ensureWorkspaceKey(opts): Promise<ProvisionOutcome>
+//   { provisioned, reason } — reason: disabled | exists | provisioned | failed
+function writeKeyFile(opts, key): void                        // tmp+rename atômico, modo 0600
+// Quando KILOCODE_GRAPH_MANAGER_TOKEN existe E a chave do workspace está ausente,
+// cria o workspace memtier 1:1 no plano de controle e grava a chave do usuário:
+//   POST /v1/mgmt/programs    (409 = já existe ⇒ segue)
+//   POST /v1/mgmt/workspaces  (1:1 com o workspace Kilo; 200 idempotente)
+//   POST /v1/mgmt/invites     (kind:"user", escopado ao par programa/workspace)
+//   POST /v1/auth/claim-user  (bearer show-once; must_rotate=true)
+//   POST /v1/auth/rotate      (OBRIGATÓRIO: sem rotacionar, o plano de dados
+//                              devolve 403 `rotation_required`)
+//   ⇒ grava { token, workspace, program } em <workspace>/.kilo/graph-key.json
+// `ensureWorkspaceKey` NUNCA lança (NFR-03): falha vira log e o boot segue (a
+// borda responde 401, como quando a chave está ausente). Roda só quando a chave
+// está ausente — o boot normal (chave presente) não paga latência. Um único
+// `AbortSignal.timeout` cobre os 5 requests (orçamento de parede do fluxo).
+//
+// Guardas de contrato:
+// - **Só cria, nunca sobrescreve chave utilizável**: `hasUsableKey` (token
+//   não-vazio) ⇒ `reason:"exists"`, sem rede e sem tocar o arquivo.
+// - **keyFile vazio** ⇒ `failed` ANTES de qualquer request (não queima um bearer
+//   show-once sem onde persistir).
+// - **Concorrência (mesmo processo)**: trava por `keyFile` — o 2º chamador reusa
+//   o resultado do 1º (um só fluxo de 5 passos, uma só gravação).
+// - **Rotate que ecoa o claim** ⇒ `failed` (não persiste um bearer `must_rotate`).
+// - **`.tmp` único por pid + `chmod 0600` explícito + limpeza**: sem `.tmp` órfão
+//   com bearer vivo e sem corrida de truncamento entre boots.
+```
+
+### Nome do workspace (identidade 1:1 — implementado)
+
+`workspaceName(dir)` = **`<stem>-<sha1 8 do caminho resolvido>`** — sempre com o
+sufixo de hash. Ex.: `/home/u/kilocode-graph-plugin` ⇒
+`kilocode-graph-plugin-<sha1 8>`. O `stem` vem do basename saneado ao charset da
+borda (`^[a-z0-9][a-z0-9_-]{0,63}$`); basename vazio/reservado ⇒ `stem = "ws"`.
+
+O sufixo **sempre presente** garante injetividade dir→workspace: dois diretórios
+distintos nunca colidem, mesmo com basename idêntico (`/a/foo` vs `/b/foo`), com
+saneamento *lossy* (símbolos/espaços) ou truncamento (basename >64). Determinístico
+(o mesmo caminho sempre gera o mesmo nome); teto de 64 chars.
+
+> **Por que um override.** O memtier escopa o bearer ao nome **EXATO** do
+> workspace (medido: `alfa` ⇒ 200; `alfa-1a2b3c4d` ⇒ **403**). Como o derivado
+> carrega o hash do caminho, quem tem token **pré-escopado** (E2E com tokens
+> legados, migração de um binding existente) precisa pinar o nome via
+> **`daemon.workspace`** (env `KILOCODE_GRAPH_WORKSPACE`). Setado, ele é usado
+> **como veio** (sem hash) e vence o derivado; vazio (default) ⇒ deriva do `dir`.
+
+### Escopo por workspace no boot (implementado)
+
+O diretório do workspace vem do **runtime do Kilo** (`ctx.worktree` >
+`ctx.directory` > cwd) e é a fonte de escopo mesmo com o plugin instalado
+globalmente:
+
+- o `.kilo/graph-plugin.json` do workspace é lido **desse** diretório
+  (`loadConfig(options, dir)`), nunca de `process.cwd()` — que num plugin global
+  aponta para o processo do Kilo, não para o projeto. O merge global↔workspace é
+  **profundo** (chaves aninhadas não se anulam);
+- o `token_file` é **confinado** ao workspace: um caminho absoluto fora do `dir`
+  (ou com `../..`) é recusado e cai no default `.kilo/graph-key.json` — o
+  provisionamento nunca escreve fora do workspace;
+- o caminho do `kilo.db` vem de `client.path.get({ query: { directory } }).state`
+  + `/kilo.db` (`resolveRuntimeDbPath`) — o runtime já determinou, no boot, onde
+  está o banco configurado. Não há env var nem heurística de cwd; se o runtime não
+  responde, degrada para o default do próprio runtime (`~/.local/share/kilo/kilo.db`).
+
+## Variáveis de ambiente
+
+Toda env var do plugin é prefixada com `KILOCODE_GRAPH_` e lida em `config.ts`.
+Precedência: `options` (do `kilo.jsonc`) > env var > arquivo JSON
+(`.kilo/graph-plugin.json` mesclado sobre `~/.config/kilo/graph-plugin.json`) >
+default. Em `options`, o placeholder `{env:VAR}` resolve a env var citada
+(`config.ts:resolveOverride`).
+
+| Chave de config | Env var | Default |
+|---|---|---|
+| `daemon.url` | `KILOCODE_GRAPH_URL` | `http://127.0.0.1:8400` |
+| `daemon.token_file` | `KILOCODE_GRAPH_TOKEN_FILE` | `.kilo/graph-key.json` |
+| `daemon.token` | `KILOCODE_GRAPH_TOKEN` | `""` (vazio — env vence o `token_file`) |
+| `daemon.manager_token` | `KILOCODE_GRAPH_MANAGER_TOKEN` | `""` (vazio — provisionamento desligado) |
+| `daemon.program` | `KILOCODE_GRAPH_PROGRAM` | `default` |
+| `daemon.workspace` | `KILOCODE_GRAPH_WORKSPACE` | `""` (vazio — deriva `<stem>-<sha1 8>` do dir) |
+| `daemon.health_timeout_ms` | `KILOCODE_GRAPH_HEALTH_TIMEOUT_MS` | `2000` |
+| `inject.enabled` | `KILOCODE_GRAPH_INJECT_ENABLED` | `false` |
+| `inject.max_memories` | `KILOCODE_GRAPH_INJECT_MAX_MEMORIES` | `5` |
+| `inject.max_chars` | `KILOCODE_GRAPH_INJECT_MAX_CHARS` | `3000` |
+| `inject.max_tokens` | `KILOCODE_GRAPH_INJECT_MAX_TOKENS` | `2000` |
+| `inject.timeout_ms` | `KILOCODE_GRAPH_INJECT_TIMEOUT_MS` | `4000` |
+| `inject.code_enabled` | `KILOCODE_GRAPH_INJECT_CODE_ENABLED` | `false` |
+| `inject.max_code_chunks` | `KILOCODE_GRAPH_INJECT_MAX_CODE_CHUNKS` | `3` |
+| `code_index.enabled` | `KILOCODE_GRAPH_INDEX_ENABLED` | `false` |
+| `code_index.indexer_bin` | `KILOCODE_GRAPH_INDEXER_BIN` | `""` (vazio — sem coletor) |
+| `code_index.sync_timeout_ms` | `KILOCODE_GRAPH_INDEX_SYNC_TIMEOUT_MS` | `120000` |
+| `ingest.enabled` | `KILOCODE_GRAPH_INGEST_ENABLED` | `false` |
+| `ingest.batch_size` | `KILOCODE_GRAPH_INGEST_BATCH_SIZE` | `20` |
+| `ingest.max_hashes` | `KILOCODE_GRAPH_INGEST_MAX_HASHES` | `5000` |
+| `ingest.timeout_ms` | `KILOCODE_GRAPH_INGEST_TIMEOUT_MS` | `15000` |
+| `mcp.enabled` | `KILOCODE_GRAPH_MCP_ENABLED` | `true` |
+| `mcp.name` | `KILOCODE_GRAPH_MCP_NAME` | `memtier` |
+| `mcp.timeout_ms` | `KILOCODE_GRAPH_MCP_TIMEOUT_MS` | `15000` |
+| `debug` | `KILOCODE_GRAPH_DEBUG` | `false` |
+
+Env vars fora do prefixo:
+
+| Env var | Uso | Default |
+|---|---|---|
+| `XDG_CONFIG_HOME` | Base do config global (`<XDG_CONFIG_HOME>/kilo/graph-plugin.json`); ausente ⇒ `~/.config/kilo` | — |
+
+> **Booleans/ints estritos.** `resolveBool` aceita só `"true"`/`"false"`;
+> `resolveInt`/`resolvePositiveInt` rejeitam `NaN`/`≤0` — qualquer outro valor cai
+> no default (nunca um modo degenerado silencioso).
+
 ## Regras
 
 1. **O passo de injeção tem orçamento de 4s.** Recall mediano = 0,85s. Não
@@ -188,6 +309,37 @@ function ingestHook(rt): { event, dispose }
      ocorre no 1º uso do workspace. "Repo esvaziado" não é representável
      (`files` `min_length=1`). Limitação **aceita** — ver `RFC-001`.
 8. **Aresta com alvo ausente é descartada** — senão 422 no lote inteiro.
+9. **Escopo é o workspace resolvido no runtime**, nunca `process.cwd()` — config
+   (`loadConfigFile`), `token_file` (confinado ao `dir`) e caminho do banco
+   (`resolveRuntimeDbPath`) saem do `dir` do workspace; o plugin roda por
+   workspace mesmo instalado globalmente.
+10. **Provisionamento só cria, nunca sobrescreve chave utilizável.** Roda apenas
+    com `KILOCODE_GRAPH_MANAGER_TOKEN` definido **e** a chave do workspace
+    ausente/inválida; a chave resultante é a **rotacionada** (nunca a show-once do
+    claim). Segredos (bearer do gestor, token do workspace) **nunca** vão para o log.
+
+## Verificação (o que prova cada afirmação)
+
+| Afirmação | Teste |
+|---|---|
+| Config do workspace vem do `dir` resolvido, não do cwd | `tests/config.test.ts` — `config_workspace_dir`, `config_workspace_dir_ignores_cwd` |
+| Merge global↔workspace é profundo | `tests/config.test.ts` — `config_deep_merge*` (via `XDG_CONFIG_HOME`) |
+| `token_file` é confinado ao workspace | `tests/token-file.test.ts` — `token_file_escape_relative`, `..._absolute_outside` |
+| Provisionamento: 5 passos, bearer por rota, chave rotacionada | `tests/provision.test.ts` — `provision_happy` |
+| **Só cria, nunca sobrescreve chave utilizável** | `tests/provision.test.ts` — `provision_exists` (sem rede, arquivo intacto); E2E `test_e2e_provision.test.ts` (2º boot) |
+| Provisionamento não queima bearer sem onde persistir | `tests/provision.test.ts` — `provision_empty_keyfile` |
+| Concorrência (mesmo processo) ⇒ um só fluxo | `tests/provision.test.ts` — `provision_concurrent_same_process` |
+| Degradação: falha em cada passo ⇒ `failed`, nunca lança | `tests/provision.test.ts` — `provision_fail_*`, `provision_fail_network` |
+| Token que aparece depois é usado (cache não fixa `""`) | `tests/client.test.ts` — `token_appears_later` |
+| **E2E real do provisionamento** (boot → cria → grava → chave autentica) | `tests/e2e/test_e2e_provision.test.ts` (gated `E2E=1` + `E2E_MANAGER_TOKEN`) |
+| `workspaceName` = `<stem>-<sha1 8>` (sempre) e injetivo | `tests/workspace.test.ts` — `..._always_hashed`, `..._basename_collision`, `..._truncation_collision`, `..._sanitize_collision` |
+| `daemon.workspace` pina a identidade (override do derivado) | `tests/config.test.ts` — `config_workspace_override`; E2E que pinam `alfa`/`beta`/`kilocode-graph-plugin` |
+
+> **Limitação conhecida:** dois diretórios com o MESMO basename válido (ex.: dois
+> checkouts chamados `foo`) mapeiam para o mesmo workspace memtier — desambiguar
+> exigiria hash em todo nome, o que quebraria o binding já provisionado (o
+> `graph-key.json` real usa o basename). Pinado em
+> `tests/workspace.test.ts:workspace_name_basename_collision_KNOWN_LIMITATION`.
 
 ## Reuso do plugin OpenViking
 

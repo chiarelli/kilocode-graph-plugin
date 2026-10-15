@@ -707,3 +707,68 @@ redescobertas no meio do loop.
      episódio novo.
   6. Unit **304 · 290 pass · 0 fail · 14 skip**; `tsc --noEmit` limpo;
      `rg "TODO\(tracer-bullet\)" src/` → **zero**. **Épico E4 FECHADO.**
+
+- **2026-10-15 — Provisionamento do workspace 1:1 + escopo por workspace (sem
+  número de epic).** Capacidade nova, fora da taxonomia E1–E7 (o **E5** deste
+  backlog é **Degradação**; os comentários chegaram a rotular o provisionamento
+  como "E5" — rótulo removido). Entrega:
+  1. `src/provision.ts`: com `KILOCODE_GRAPH_MANAGER_TOKEN` (env) e a chave do
+     workspace ausente, roda o plano de controle do memtier no boot
+     (program→workspace→invite→claim-user→**rotate**) e grava
+     `<workspace>/.kilo/graph-key.json` (`0600`). **A rotação é obrigatória**
+     (bearer de claim ⇒ 403 `rotation_required` no plano de dados).
+  2. **Escopo por workspace:** `loadConfig(options, dir)` lê o
+     `<dir>/.kilo/graph-plugin.json` do diretório resolvido no runtime
+     (`ctx.worktree` > `ctx.directory` > cwd) — nunca `process.cwd()`; merge
+     **profundo** global↔workspace; `token_file` **confinado** ao workspace; o
+     `kilo.db` vem de `client.path.get().state` (runtime), não de env var
+     (removida `KILOCODE_GRAPH_INGEST_DB_PATH`).
+  3. **Revisão adversarial (3 perfis) + correções.** Achados materiais corrigidos
+     na mesma base, cada um com teste de discriminação: **estrutural** —
+     `workspaceName` colidia em saneamento/truncamento (novo sufixo de hash do
+     caminho ⇒ injetividade dir→workspace nas fronteiras lossy); cache de token
+     fixava `""` (não relia chave que aparecesse depois); `token_file` absoluto
+     escapava do workspace; `env` só-espaços (`URL`/`PROGRAM`/`TOKEN`) era
+     honrada; `manager_token` desligado só-espaços; `.tmp` de provisionamento
+     colidia entre boots + modo não reaplicado + `.tmp` órfão; `keyFile` vazio
+     queimava um bearer; `rotate` que ecoasse o claim seria persistido.
+     **Refutados por medição** (não eram defeitos): `POST /v1/mgmt/workspaces`
+     duplicado devolve **200** idempotente (não 409); `rotate` do memtier real
+     **sempre** emite token novo (`iam.py:1334`, burn-and-replace).
+  4. **Cobertura:** `tests/provision.test.ts` (16 casos, `fetch` fake: 5 passos,
+     bearer por rota, 409/200, cada falha, concorrência, `hasUsableKey`,
+     `writeKeyFile`), `tests/token-file.test.ts` (confinamento),
+     `tests/config.test.ts` (discriminação `dir` vs cwd + merge profundo),
+     `tests/client.test.ts` (token que aparece depois). **E2E real**
+     `tests/e2e/test_e2e_provision.test.ts` (gated `E2E=1` + `E2E_MANAGER_TOKEN`):
+     boot → cria → grava `0600` → a chave **autentica** em `/v1/recall` (200 ⇒
+     rotacionada) → 2º boot não reescreve; sem gestor ⇒ nenhuma chave. Medido
+     **2/2** contra o memtier vivo (gestor emitido pelo admin e rotacionado).
+  5. Unit **343 · 327 pass · 0 fail · 16 skip**; `tsc --noEmit` limpo. Tabela de
+     verificação por afirmação em `src/README.md`.
+
+- **2026-10-15 — `workspaceName` = `<stem>-<sha1 8>` (sempre) + override de
+  identidade.** Decisão do dono: anexar **sempre** o `sha1` curto do caminho ao
+  nome do workspace memtier (`kilocode-graph-plugin-<sha1 8>`), para minimizar
+  colisões — substitui o desenho anterior (hash só como fallback/sufixo de
+  saneamento) e elimina a limitação de colisão de basename puro.
+  1. `src/workspace.ts`: `workspaceName(dir)` = `<stem>-<sha1 8 do caminho
+     resolvido>`, sempre. `stem` = basename saneado (charset da borda); vazio ou
+     reservado ⇒ `ws`. Teto de 64 (o `stem` trunca para caber o sufixo).
+     Injetivo em todas as fronteiras (basename idêntico, saneamento, truncamento).
+  2. **Override `daemon.workspace`** (env `KILOCODE_GRAPH_WORKSPACE`, default
+     vazio): setado, é a identidade usada **como veio** (sem hash) e vence o
+     derivado. Necessário porque o memtier escopa o bearer ao nome **exato**
+     (medido: `alfa` ⇒ 200; `alfa-1a2b3c4d` ⇒ **403**) — tokens pré-escopados
+     (E2E legado, migração) pinam o nome.
+  3. **Testes:** `tests/workspace.test.ts` reescrito para o contrato sempre-hash
+     (`..._always_hashed`, `..._basename_collision` — o antigo
+     `KNOWN_LIMITATION` virou `notEqual`); `config_workspace_override` no
+     `config.test.ts`. E2E que usam token pré-escopado (`recall_inject`, `ingest`,
+     `mcp`, `inject_code`) passam a pinar via `daemon.workspace` e assertam o
+     derivado `<WS>-<sha1 8>`; `provision` passou a usar programa **único por
+     execução** (um programa só é owned pelo gestor que o criou).
+  4. **Prova viva (medida 2026-10-15):** provision **2/2**, health+recall_inject+
+     inject_code **7/7** (1 falha transitória do provision por programa fixo já
+     owned — corrigida para programa único), mcp+lifecycle+collector **5/5**.
+     Unit **344 · 328 pass · 0 fail · 16 skip**; `tsc --noEmit` limpo.

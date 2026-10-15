@@ -22,6 +22,8 @@ const WORKSPACE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const RESERVED_NAMES = new Set(["_iam"]);
 
 const MAX_LEN = 64;
+/** Comprimento do hash curto (`shortHash`) usado como sufixo de desambiguação. */
+const HASH_LEN = 8;
 
 function isUsable(value: string | null | undefined): value is string {
   return typeof value === "string" && value.trim() !== "" && value !== "/";
@@ -60,13 +62,27 @@ function shortHash(dir: string): string {
 }
 
 /**
- * Nome lógico do workspace derivado do diretório. Vazio ou reservado ⇒ fallback
- * estável `ws-<sha1 curto do caminho>`. O mesmo caminho sempre gera o mesmo nome.
+ * Nome lógico do workspace derivado do diretório: `<stem>-<sha1 8 do caminho>`.
+ *
+ * **SEMPRE** anexa o `sha1` curto (8 hex) do caminho **completo** resolvido —
+ * ex.: `/home/u/kilocode-graph-plugin` ⇒ `kilocode-graph-plugin-<sha1 8>`. Isso
+ * minimiza colisões: o `stem` vem do basename (saneado ao charset da borda),
+ * mas dois diretórios distintos nunca compartilham o mesmo nome, mesmo com
+ * basename idêntico (`/a/foo` vs `/b/foo`), com saneamento *lossy* (basenames
+ * com símbolos/espaços) ou com truncamento (basename >64). Garante a
+ * injetividade dir→workspace exigida pelo vínculo 1:1 Kilo↔memtier.
+ *
+ * Basename vazio ou reservado ⇒ `stem = "ws"` (o hash continua distinguindo).
+ * Determinístico: o mesmo caminho sempre gera o mesmo nome. Teto de 64 chars
+ * (o `stem` é truncado para caber o sufixo `-<sha1 8>`).
  */
 export function workspaceName(dir: string): string {
-  const fallback = `ws-${shortHash(dir)}`;
-  const base = basename(resolve(dir));
+  const resolved = resolve(dir);
+  const base = basename(resolved);
   const sanitized = sanitize(base);
-  if (sanitized === "" || RESERVED_NAMES.has(sanitized)) return fallback;
-  return sanitized;
+  const stem =
+    sanitized === "" || RESERVED_NAMES.has(sanitized) ? "ws" : sanitized;
+  const budget = MAX_LEN - HASH_LEN - 1;
+  const head = stem.slice(0, budget).replace(/-+$/g, "") || "ws";
+  return `${head}-${shortHash(resolved)}`;
 }

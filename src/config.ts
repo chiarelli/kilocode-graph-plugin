@@ -8,9 +8,15 @@
  * E3b são **declaradas aqui com default** e lidas pela epic dona — declarar todas
  * evita churn de config entre epics (decisão do dono, 2026-10-14).
  *
- * Arquivo: `.kilo/graph-plugin.json` (por workspace) e
+ * Arquivo: `<workspace>/.kilo/graph-plugin.json` (por workspace) e
  * `~/.config/kilo/graph-plugin.json` (global). JSON fixado (o ecossistema Kilo
  * usa JSON no `.kilo/`); o ARCH §6 é ajustado para refletir isso na E1-S3.
+ *
+ * **Escopo por workspace.** O arquivo de config do workspace é lido do
+ * diretório resolvido do workspace (`ctx.worktree` > `ctx.directory` > cwd), lido
+ * no **runtime do Kilo** — NUNCA de `process.cwd()`, que num plugin instalado
+ * globalmente aponta para o processo do Kilo, não para o projeto. `loadConfig`
+ * recebe esse diretório como segundo argumento.
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -25,7 +31,17 @@ export const DEFAULTS = {
     url: "http://127.0.0.1:8400",
     token_file: ".kilo/graph-key.json",
     program: "default",
+    // Vazio ⇒ o nome do workspace é DERIVADO do diretório
+    // (`workspaceName(dir)` = `<stem>-<sha1 8 do caminho>`). Setado ⇒ identidade
+    // EXPLÍCITA, usada como veio (escapa do derivado). Necessário porque o
+    // memtier escopa o bearer ao nome EXATO do workspace (medido: `alfa` vs
+    // `alfa-1a2b3c4d` ⇒ 403), então quem tem token pré-escopado (E2E, migração)
+    // precisa pinar o nome. NÃO recebe o sufixo de hash.
+    workspace: "",
     health_timeout_ms: 2000,
+    // Provisionamento: bearer do gestor. Vazio ⇒ provisionamento desligado
+    // (a chave do workspace é pré-requisito manual, como antes).
+    manager_token: "",
   },
   inject: {
     enabled: false,
@@ -53,8 +69,6 @@ export const DEFAULTS = {
     max_hashes: 5000,
     // Timeout do `/v1/ingest` (responde 202 imediato; folga p/ fila).
     timeout_ms: 15000,
-    // Override do caminho do `kilo.db` (vazio ⇒ localiza a partir do workspace).
-    db_path: "",
   },
   mcp: {
     enabled: true,
@@ -82,12 +96,25 @@ function resolveOverride(
       const m = /^\{env:(.+)\}$/.exec(val);
       if (m) {
         const resolved = process.env[m[1] as string] ?? fileValue;
-        return resolved !== undefined ? resolved : fallback;
+        return trimOr(resolved, fallback);
       }
     }
-    return String(val);
+    return String(val).trim();
   }
-  return envValue ?? fileValue ?? fallback;
+  return trimOr(envValue ?? fileValue, fallback);
+}
+
+/**
+ * `trim()` de um valor de string; vazio/só-espaços ⇒ `fallback`. Defeito medido:
+ * um env var `" "` (artefato de cópia/quoting) era honrado como setado — ex.:
+ * `KILOCODE_GRAPH_URL=" "` virava base vazia e toda chamada falhava, e
+ * `KILOCODE_GRAPH_PROGRAM=" "` mandava um slug inválido. Vazio agora cai no
+ * default, como se não estivesse setado.
+ */
+function trimOr(raw: string | undefined, fallback: string): string {
+  if (raw === undefined) return fallback;
+  const t = raw.trim();
+  return t === "" ? fallback : t;
 }
 
 /** Lê o valor de `options` aninhado (ex.: `options.daemon.url`). */
@@ -133,20 +160,46 @@ function globalConfigDir(): string {
   return join(homedir(), ".config", "kilo");
 }
 
-/** Carrega `.kilo/graph-plugin.json` (workspace) mesclado sobre o global. */
-function loadConfigFile(): Record<string, unknown> {
+/** Objeto simples (não array/nulo) — candidato a merge recursivo. */
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/**
+ * Merge **profundo** (só um nível de recursão basta: a config é `{secao:{chave}}`).
+ * Um objeto aninhado do arquivo do workspace complementa o do global em vez de
+ * substituí-lo inteiro — sem isso, split de chaves entre os dois arquivos (ex.:
+ * `daemon.url` no global, `daemon.program` no workspace) descartava uma delas.
+ */
+function deepMerge(
+  base: Record<string, unknown>,
+  over: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...base };
+  for (const [k, v] of Object.entries(over)) {
+    const prev = out[k];
+    out[k] = isPlainObject(prev) && isPlainObject(v) ? deepMerge(prev, v) : v;
+  }
+  return out;
+}
+
+/**
+ * Carrega `.kilo/graph-plugin.json` do workspace (resolvido no runtime do Kilo)
+ * mesclado sobre o global `~/.config/kilo/graph-plugin.json`. O `dir` do
+ * workspace é a fonte de escopo — nunca `process.cwd()` (plugin global). O merge
+ * é **profundo** (ver `deepMerge`).
+ */
+function loadConfigFile(dir: string): Record<string, unknown> {
   const paths = [
     join(globalConfigDir(), "graph-plugin.json"),
-    join(process.cwd(), ".kilo", "graph-plugin.json"),
+    join(dir, ".kilo", "graph-plugin.json"),
   ];
   let result: Record<string, unknown> = {};
   for (const p of paths) {
     if (!existsSync(p)) continue;
     try {
       const parsed = JSON.parse(readFileSync(p, "utf-8")) as unknown;
-      if (parsed && typeof parsed === "object") {
-        result = { ...result, ...(parsed as Record<string, unknown>) };
-      }
+      if (isPlainObject(parsed)) result = deepMerge(result, parsed);
     } catch {
       // Arquivo de config corrompido não é fatal — defaults assumem.
     }
@@ -171,12 +224,16 @@ function filePick(
 
 /**
  * Monta a configuração efetiva. `options` vem do `kilo.jsonc`; env e arquivos
- * são lidos do ambiente/workspace. Puro o suficiente para teste (chamadores de
- * teste isolam o cwd/global — ver `tests/config.test.ts`).
+ * são lidos do ambiente/workspace. `dir` é o diretório do workspace resolvido
+ * no runtime do Kilo (`resolveWorkspaceDir(ctx)`); default `process.cwd()` só
+ * para chamadas legadas/teste — o boot de produção SEMPRE passa o `dir`.
  */
-export function loadConfig(options?: PluginOptions): Config {
+export function loadConfig(
+  options?: PluginOptions,
+  dir: string = process.cwd(),
+): Config {
   const env = process.env;
-  const file = loadConfigFile();
+  const file = loadConfigFile(dir);
 
   const resolve = (
     key: string,
@@ -193,11 +250,21 @@ export function loadConfig(options?: PluginOptions): Config {
         "KILOCODE_GRAPH_TOKEN_FILE",
         DEFAULTS.daemon.token_file,
       ),
-      token: env.KILOCODE_GRAPH_TOKEN ?? "",
+      // `trim()`: um token só-espaços não pode vencer o `token_file` (defeito
+      // medido — virava `Authorization: Bearer    ` e o arquivo nunca era lido).
+      token: env.KILOCODE_GRAPH_TOKEN?.trim() ?? "",
+      // Env-only, como `token`: o bearer do gestor é credencial viva, não config
+      // de arquivo. Vazio ⇒ provisionamento desligado.
+      manager_token: env.KILOCODE_GRAPH_MANAGER_TOKEN?.trim() ?? "",
       program: resolve(
         "daemon.program",
         "KILOCODE_GRAPH_PROGRAM",
         DEFAULTS.daemon.program,
+      ),
+      workspace: resolve(
+        "daemon.workspace",
+        "KILOCODE_GRAPH_WORKSPACE",
+        DEFAULTS.daemon.workspace,
       ),
       health_timeout_ms: resolveInt(
         resolve(
@@ -321,11 +388,6 @@ export function loadConfig(options?: PluginOptions): Config {
           String(DEFAULTS.ingest.timeout_ms),
         ),
         DEFAULTS.ingest.timeout_ms,
-      ),
-      db_path: resolve(
-        "ingest.db_path",
-        "KILOCODE_GRAPH_INGEST_DB_PATH",
-        DEFAULTS.ingest.db_path,
       ),
     },
     mcp: {

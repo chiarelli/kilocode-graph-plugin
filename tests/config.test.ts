@@ -9,7 +9,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, afterEach, before, test } from "node:test";
@@ -113,7 +113,6 @@ test("config_ingest_defaults: as chaves de `ingest.*` (E4) têm os defaults decl
   assert.equal(cfg.ingest.batch_size, 20);
   assert.equal(cfg.ingest.max_hashes, 5000);
   assert.equal(cfg.ingest.timeout_ms, 15000);
-  assert.equal(cfg.ingest.db_path, "");
 });
 
 test("config_ingest_env: `KILOCODE_GRAPH_INGEST_*` são honradas end-to-end", () => {
@@ -122,13 +121,11 @@ test("config_ingest_env: `KILOCODE_GRAPH_INGEST_*` são honradas end-to-end", ()
   process.env.KILOCODE_GRAPH_INGEST_BATCH_SIZE = "7";
   process.env.KILOCODE_GRAPH_INGEST_MAX_HASHES = "123";
   process.env.KILOCODE_GRAPH_INGEST_TIMEOUT_MS = "9000";
-  process.env.KILOCODE_GRAPH_INGEST_DB_PATH = "/tmp/x.db";
   const cfg = loadConfig();
   assert.equal(cfg.ingest.enabled, true);
   assert.equal(cfg.ingest.batch_size, 7);
   assert.equal(cfg.ingest.max_hashes, 123);
   assert.equal(cfg.ingest.timeout_ms, 9000);
-  assert.equal(cfg.ingest.db_path, "/tmp/x.db");
 });
 
 test("config_ingest_batch_size_positive: 0/negativo/ inválido cai no default (não vira LIMIT 0/-n)", () => {
@@ -144,4 +141,143 @@ test("config_ingest_batch_size_positive: 0/negativo/ inválido cai no default (n
   // Um positivo válido passa.
   process.env.KILOCODE_GRAPH_INGEST_BATCH_SIZE = "1";
   assert.equal(loadConfig().ingest.batch_size, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Escopo por workspace: o config do workspace vem do `dir` RESOLVIDO, não do cwd
+// ---------------------------------------------------------------------------
+
+/** Cria `<dir>/.kilo/graph-plugin.json` com o conteúdo dado. */
+function writeWorkspaceConfig(dir: string, content: unknown): void {
+  mkdirSync(join(dir, ".kilo"), { recursive: true });
+  writeFileSync(
+    join(dir, ".kilo", "graph-plugin.json"),
+    JSON.stringify(content),
+  );
+}
+
+test("config_workspace_dir: o arquivo do WORKSPACE (`dir`) é lido, não o do cwd", () => {
+  clearEnv();
+  // `dir` com uma config; cwd (sandbox) com OUTRA — devem divergir.
+  const dir = mkdtempSync(join(tmpdir(), "graph-ws-"));
+  try {
+    writeWorkspaceConfig(dir, { daemon: { program: "from-workspace" } });
+    writeWorkspaceConfig(sandbox, { daemon: { program: "from-cwd" } });
+    const cfg = loadConfig(undefined, dir);
+    assert.equal(
+      cfg.daemon.program,
+      "from-workspace",
+      "o `dir` vence o cwd (plugin global instalado não lê o cwd do processo)",
+    );
+    assert.notEqual(cfg.daemon.program, "from-cwd");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(join(sandbox, ".kilo"), { recursive: true, force: true });
+  }
+});
+
+test("config_workspace_dir_ignores_cwd: config só no cwd NÃO é lida se o dir não a tem", () => {
+  clearEnv();
+  const dir = mkdtempSync(join(tmpdir(), "graph-ws-"));
+  try {
+    writeWorkspaceConfig(sandbox, { daemon: { program: "from-cwd" } });
+    // `dir` vazio ⇒ cai no default, NUNCA no arquivo do cwd.
+    assert.equal(loadConfig(undefined, dir).daemon.program, "default");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(join(sandbox, ".kilo"), { recursive: true, force: true });
+  }
+});
+
+test("config_deep_merge: chaves aninhadas de global+workspace NÃO se anulam", () => {
+  clearEnv();
+  const dir = mkdtempSync(join(tmpdir(), "graph-ws-"));
+  const xdg = mkdtempSync(join(tmpdir(), "graph-xdg-"));
+  const prevXdg = process.env.XDG_CONFIG_HOME;
+  try {
+    // Global define `daemon.url`; o workspace define só `daemon.program`. Com
+    // merge raso, o `daemon` do workspace substituiria o inteiro e a `url` do
+    // global se perderia (voltando ao default) — defeito medido.
+    mkdirSync(join(xdg, "kilo"), { recursive: true });
+    writeFileSync(
+      join(xdg, "kilo", "graph-plugin.json"),
+      JSON.stringify({ daemon: { url: "http://from-global:7777" } }),
+    );
+    process.env.XDG_CONFIG_HOME = xdg;
+    writeWorkspaceConfig(dir, { daemon: { program: "from-workspace" } });
+    const cfg = loadConfig(undefined, dir);
+    assert.equal(cfg.daemon.program, "from-workspace");
+    assert.equal(
+      cfg.daemon.url,
+      "http://from-global:7777",
+      "a `url` do global sobrevive ao merge do `daemon` do workspace",
+    );
+  } finally {
+    if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = prevXdg;
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(xdg, { recursive: true, force: true });
+  }
+});
+
+test("config_deep_merge_workspace_wins: chave nos dois arquivos ⇒ workspace vence", () => {
+  clearEnv();
+  const dir = mkdtempSync(join(tmpdir(), "graph-ws-"));
+  const xdg = mkdtempSync(join(tmpdir(), "graph-xdg-"));
+  const prevXdg = process.env.XDG_CONFIG_HOME;
+  try {
+    mkdirSync(join(xdg, "kilo"), { recursive: true });
+    writeFileSync(
+      join(xdg, "kilo", "graph-plugin.json"),
+      JSON.stringify({ daemon: { url: "http://global:1", program: "gp" } }),
+    );
+    process.env.XDG_CONFIG_HOME = xdg;
+    writeWorkspaceConfig(dir, { daemon: { program: "wp" } });
+    const cfg = loadConfig(undefined, dir);
+    assert.equal(cfg.daemon.program, "wp", "workspace vence o global na mesma chave");
+    assert.equal(cfg.daemon.url, "http://global:1", "chave só-global é preservada");
+  } finally {
+    if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = prevXdg;
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(xdg, { recursive: true, force: true });
+  }
+});
+
+test("config_env_trim: env só-espaços cai no default (não vira base vazia)", () => {
+  clearEnv();
+  process.env.KILOCODE_GRAPH_URL = "   ";
+  process.env.KILOCODE_GRAPH_PROGRAM = "   ";
+  const cfg = loadConfig();
+  assert.equal(cfg.daemon.url, DEFAULTS.daemon.url);
+  assert.equal(cfg.daemon.program, DEFAULTS.daemon.program);
+});
+
+test("config_env_trim_spaces: env com espaços em volta é trimada", () => {
+  clearEnv();
+  process.env.KILOCODE_GRAPH_URL = "  http://h:9000  ";
+  assert.equal(loadConfig().daemon.url, "http://h:9000");
+});
+
+test("config_token_whitespace: token só-espaços vira vazio (não vence o arquivo)", () => {
+  clearEnv();
+  process.env.KILOCODE_GRAPH_TOKEN = "   ";
+  assert.equal(loadConfig().daemon.token, "");
+});
+
+test("config_manager_token: default vazio e env honrada (env-only)", () => {
+  clearEnv();
+  assert.equal(loadConfig().daemon.manager_token, "");
+  process.env.KILOCODE_GRAPH_MANAGER_TOKEN = "  mgr-tok  ";
+  assert.equal(loadConfig().daemon.manager_token, "mgr-tok");
+});
+
+test("config_workspace_override: default vazio e env/options honradas", () => {
+  clearEnv();
+  // Vazio ⇒ o boot deriva de `workspaceName(dir)` (não pina identidade).
+  assert.equal(loadConfig().daemon.workspace, "");
+  process.env.KILOCODE_GRAPH_WORKSPACE = "alfa";
+  assert.equal(loadConfig().daemon.workspace, "alfa");
+  const cfg = loadConfig({ daemon: { workspace: "pinned-ws" } });
+  assert.equal(cfg.daemon.workspace, "pinned-ws", "options vence o env");
 });
