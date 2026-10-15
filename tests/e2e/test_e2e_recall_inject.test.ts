@@ -99,7 +99,12 @@ test("e2e: plugin boota com inject.enabled e injeta bloco de memória no turno",
           workspace: WS,
           health_timeout_ms: 3000,
         },
-        inject: { enabled: true, max_memories: 5, max_chars: 3000, max_tokens: 2000 },
+        inject: {
+          enabled: true,
+          max_memories: 5,
+          memory_max_tokens: 2000,
+          code_max_tokens: 2000,
+        },
         debug: true,
       },
     );

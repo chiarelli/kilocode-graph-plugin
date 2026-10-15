@@ -335,6 +335,9 @@ Env vars fora do prefixo:
 | **E2E real do provisionamento** (boot → cria → grava → chave autentica) | `tests/e2e/test_e2e_provision.test.ts` (gated `E2E=1` + `E2E_MANAGER_TOKEN`) |
 | `workspaceName` = `<stem>-<sha1 8>` (sempre) e injetivo | `tests/workspace.test.ts` — `..._always_hashed`, `..._basename_collision`, `..._truncation_collision`, `..._sanitize_collision` |
 | `daemon.workspace` pina a identidade (override do derivado) | `tests/config.test.ts` — `config_workspace_override`; E2E que pinam `alfa`/`beta`/`kilocode-graph-plugin` |
+| **Teto de tokens por endpoint** (`memory_max_tokens`/`code_max_tokens`) corta cada bloco de forma independente | `tests/code_s2.test.ts` — `code_body_uses_code_tokens`, `endpoints_independent`; E2E `tests/e2e/test_e2e_inject_limits.test.ts` (gated `E2E=1`) |
+| Envs de limite legadas ⇒ **um** aviso de depreciação (nunca silêncio) | `tests/config.test.ts` — casos `config_legacy_*_warns` e `config_no_legacy_no_warning` |
+| Teto fora de `[1,16000]` (422 no servidor) cai no default | `tests/config.test.ts` — `config_token_cap_clamped` |
 
 > **Limitação conhecida:** dois diretórios com o MESMO basename válido (ex.: dois
 > checkouts chamados `foo`) mapeiam para o mesmo workspace memtier — desambiguar

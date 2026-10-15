@@ -772,3 +772,48 @@ redescobertas no meio do loop.
      inject_code **7/7** (1 falha transitória do provision por programa fixo já
      owned — corrigida para programa único), mcp+lifecycle+collector **5/5**.
      Unit **344 · 328 pass · 0 fail · 16 skip**; `tsc --noEmit` limpo.
+
+- **2026-10-15 — Injeção: limites por endpoint (tokens) + fim do `max_chars` —
+  `ADR-009` Bloco A (`S1`+`S2`).** Mudança de **arquitetura** sobre código em
+  produção (E2/E3c implementados), não feature nova: refactor + contrato aditivo
+  na **mesma base**, sem rewrite. Nenhuma mudança no memtier (plug-in-only).
+  1. **Unidade única = tokens** (`chars/4`, o tipo do memtier). Morreram o
+     `max_chars` (cliente, teto de chars do bloco conjunto) e o `max_tokens`
+     **compartilhado** (servidor); o `ADR-004` fica marcado como **superado**.
+  2. **Um teto por endpoint** (o campo `max_tokens` já existe por body): saem
+     `inject.max_chars`/`inject.max_tokens`, entram `inject.memory_max_tokens`
+     (`KILOCODE_GRAPH_INJECT_MEMORY_MAX_TOKENS` → `/v1/recall`) e
+     `inject.code_max_tokens` (`KILOCODE_GRAPH_INJECT_CODE_MAX_TOKENS` →
+     `/v1/code/search`), default `2000` cada. `max_memories`/`max_code_chunks`
+     **permanecem** como cortes de contagem.
+  3. **`applyBudget`/`applyJointBudget` só contagem:** removidos `maxChars` e os
+     callbacks `render`/`RenderFacts`/`RenderTotal`. Sem teto conjunto no cliente
+     (a decisão do dono é per-endpoint); corte sempre por fato/chunk inteiro.
+  4. **Migração de config — exceção registrada:** as chaves `inject.max_chars`/
+     `inject.max_tokens` (declaradas pelo **E2/E3c**, ver entradas acima) são
+     **reescritas** pela `S1`. Envs legadas setadas ⇒ **um** log de aviso de
+     depreciação (depreciação + chave substituta), nunca silêncio. Chaves antigas
+     em `options`/arquivo são ignoradas (env/arquivo/options só leem as novas).
+  5. **Robustez:** `resolveTokenCap` clampa o teto a `[1, 16000]` (`<=0` e
+     `>MAX_RESPONSE_TOKENS` são **422** no servidor) — o cliente nunca envia
+     acima do teto interno.
+  6. **Testes (S1 unit):** `config` (novas chaves, defaults, aviso das legadas,
+     clamp), `inject` (`recall_body_uses_memory_tokens`, orçamento só-contagem),
+     `code_s2` (`code_body_uses_code_tokens`, `endpoints_independent`,
+     `joint_budget_counts_only`, `hook_joint_budget`). **E2E (S2):**
+     `tests/e2e/test_e2e_inject_limits.test.ts` (gated `E2E=1`, workspace `alfa`):
+     teto de memória corta só a memória, teto de código corta só o código, e os
+     dois tetos não se misturam — evidência é o **bloco injetado**, não o retorno
+     da chamada.
+  7. **Docs:** `ARCHITECTURE.md` §6 (tabela de config + envs), `src/README.md`
+     (envs + tabela de verificação), `docs/RUNBOOK-E2E.md` (suíte nova, glob
+     **19/19**).
+  8. **Prova viva (medida 2026-10-15):** `bun run typecheck` limpo; unit
+     **336 · 0 fail · 16 skip**; `E2E=1` (glob, quatro tokens)
+     **19 · 19 pass · 0 fail · 0 skip**; `rg
+     "max_char|maxChars|INJECT_MAX_CHARS|INJECT_MAX_TOKENS" src/` → **zero**.
+     Revisão adversarial (BLIND-HUNTER/EDGE-CASE-HUNTER/VERIFICATION-GAP em
+     paralelo, agentes nomeados): achados materiais corrigidos na mesma base
+     (testes de body por endpoint ausentes; prosa obsoleta do orçamento conjunto;
+     ausência de clamp do teto). **`S3` (piso `min_score`) fora de escopo —
+     Bloco B, bloqueado pelo memtier.**

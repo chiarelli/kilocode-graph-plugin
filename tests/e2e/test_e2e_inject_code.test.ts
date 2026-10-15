@@ -134,8 +134,8 @@ test("e2e: código indexado ⇒ bloco graph-code no turno com o caminho real", {
           enabled: false, // só código: prova o push de código isolado
           code_enabled: true,
           max_code_chunks: 3,
-          max_chars: 3000,
-          max_tokens: 2000,
+          memory_max_tokens: 2000,
+          code_max_tokens: 2000,
           timeout_ms: 4000,
         },
         debug: true,

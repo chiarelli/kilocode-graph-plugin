@@ -205,7 +205,7 @@ src/
 ├── inject/
 │   ├── memory.ts         # formata o bloco de memória
 │   ├── code.ts           # formata o bloco de código
-│   └── budget.ts         # maxChars / maxMemories / maxCodeChunks
+│   └── budget.ts         # maxMemories / maxCodeChunks (corte de contagem)
 ├── ingest/               # ⬅ NOVO (E4) — a INGESTÃO (o conteúdo vem do banco)
 │   ├── db.ts             # localiza o kilo.db; lê message+part; cursor (ts,id)
 │   ├── batch.ts          # monta o lote, hash djb2, reference_time, limiar
@@ -269,7 +269,7 @@ Se o usuário **já** definiu o MCP lá, o plugin não registra por cima
 (idempotência). A diferença do antecessor: `type:"remote"` (URL `/v1/mcp` +
 header de auth) em vez de `type:"local"`.
 
-### `inject/budget.ts` — orçamento
+### `inject/budget.ts` — orçamento (contagem)
 
 Limites configuráveis, com defaults conservadores. A injeção é poluição em
 potencial: se o recall trouxer ruído, a resposta piora. O orçamento é o freio.
@@ -277,8 +277,14 @@ potencial: se o recall trouxer ruído, a resposta piora. O orçamento é o freio
 ```
 maxMemories:   5
 maxCodeChunks: 3
-maxChars:      3000
 ```
+
+> **Só contagem** (ADR-009). O teto de **volume** é por endpoint, no **servidor**:
+> cada injector manda o SEU `max_tokens` no body (`inject.memory_max_tokens` →
+> `/v1/recall`; `inject.code_max_tokens` → `/v1/code/search`). O `max_chars`
+> (cliente, conjunto) e o `max_tokens` compartilhado do ADR-004 **morreram** — a
+> unidade única é tokens (`chars/4`, o tipo do memtier). O corte do cliente é por
+> **fato/chunk inteiro** (nunca pela metade).
 
 ### `ingest/` — a rotina de ingestão (E4)
 
@@ -312,7 +318,7 @@ diferença entre os gatilhos é **um parâmetro** (`drainAll`):
       ├── POST /v1/recall       (memória) ─┐
       └── POST /v1/code/search  (código) ─┴─ EM PARALELO (allSettled,
                                               AbortSignal por chamada)
-      └── orçamento do TOTAL (maxChars; código prioritário)
+      └── orçamento de contagem por família (maxMemories/maxCodeChunks; ADR-009)
       └── injeta 1 part por família (memória antes do código)
 3. LLM responde (pode usar tools MCP — pull)
 4. evento message.updated   → ACORDA a rotina (background; não bloqueia)
@@ -379,11 +385,12 @@ func SaveInvoice(ctx context.Context, inv *Invoice) error {
 </context>
 ```
 
-> **Ordem e orçamento.** A memória é injetada **antes** do código. `maxChars` é o
-> teto do **total** (memória + código): quando estoura, corta fatos **inteiros**
-> de memória primeiro (do fim); só então chunks **inteiros** de código — o código
-> tem prioridade (chunk truncado não compila). Um chunk nunca é cortado pela
-> metade.
+> **Ordem e orçamento.** A memória é injetada **antes** do código. O teto de
+> **volume** é por endpoint, no servidor (`inject.memory_max_tokens` /
+> `inject.code_max_tokens` → `max_tokens` no body de cada rota; ADR-009): cada
+> bloco obedece só ao SEU teto. O cliente só corta por **contagem**
+> (`maxMemories` / `maxCodeChunks`), por fato/chunk **inteiro** — um chunk nunca é
+> cortado pela metade.
 >
 > **Sanitização.** Tanto o `fact` quanto o `code` vêm de fora (grafo/repo). O
 > texto é neutralizado (`<`/`>` → `&lt;`/`&gt;`) para que nenhum conteúdo possa
@@ -417,8 +424,8 @@ Nada hardcoded no script (FR-303). **JSON** + env vars, precedência:
   "inject": {
     "enabled": false,                     // FR-304, preferência do dono
     "max_memories": 5,
-    "max_chars": 3000,                    // KILOCODE_GRAPH_INJECT_MAX_CHARS
-    "max_tokens": 2000,                   // A1 — orçamento de resposta no servidor
+    "memory_max_tokens": 2000,            // KILOCODE_GRAPH_INJECT_MEMORY_MAX_TOKENS
+    "code_max_tokens": 2000,              // KILOCODE_GRAPH_INJECT_CODE_MAX_TOKENS
     "timeout_ms": 4000,                   // orçamento do hook (por chamada)
     "code_enabled": false,                // E3c — injeção de código (desligada)
     "max_code_chunks": 3                  // E3c — nº de chunks de código
@@ -437,13 +444,18 @@ Nada hardcoded no script (FR-303). **JSON** + env vars, precedência:
 ```
 
 > **Envs** (todas `KILOCODE_GRAPH_*`): `URL`, `TOKEN`, `TOKEN_FILE`, `PROGRAM`,
-> `INJECT_ENABLED`, `INJECT_MAX_MEMORIES`, `INJECT_MAX_CHARS`,
-> `INJECT_MAX_TOKENS`, `INJECT_TIMEOUT_MS`, `INJECT_CODE_ENABLED`,
+> `INJECT_ENABLED`, `INJECT_MAX_MEMORIES`, `INJECT_MEMORY_MAX_TOKENS`,
+> `INJECT_CODE_MAX_TOKENS`, `INJECT_TIMEOUT_MS`, `INJECT_CODE_ENABLED`,
 > `INJECT_MAX_CODE_CHUNKS`, `INDEX_ENABLED`, `INDEXER_BIN`,
 > `INDEX_SYNC_TIMEOUT_MS`, `MCP_ENABLED`, `MCP_NAME`, `DEBUG`,
 > `INGEST_ENABLED`, `INGEST_BATCH_SIZE`, `INGEST_MAX_HASHES`, `INGEST_TIMEOUT_MS`,
-> `MANAGER_TOKEN`. O prefixo da env de config é `KILOCODE_GRAPH_` (o
+> `MANAGER_TOKEN`, `WORKSPACE`. O prefixo da env de config é `KILOCODE_GRAPH_` (o
 > `openviking` do antecessor mudou).
+>
+> **Envs de limite legadas (ADR-009).** `INJECT_MAX_CHARS` e `INJECT_MAX_TOKENS`
+> deixaram de ser lidas; se setadas no ambiente, o boot emite **um** log de
+> depreciação e as ignora (quem calibrou não perde o ajuste em silêncio) — as
+> substitutas são `INJECT_MEMORY_MAX_TOKENS`/`INJECT_CODE_MAX_TOKENS`.
 
 > **Defaults desligados** para indexação e injeção — é a preferência registrada
 > do dono no plugin atual.

@@ -277,3 +277,21 @@ valor default é o **medido**, não o palpite 0.35.
   conjunto em `src/README.md`/`hooks/messages.ts` (corrigida); `max_tokens`
   fora de `[1,16000]` era enviado cru (422 garantido) — novo `resolveTokenCap`
   degrada ao default. **Não** toquei `min_score` (Bloco B / `S3`).
+- **2026-10-15 — `S2` IMPLEMENTADA (Bloco A FECHADO).** E2E dos tetos
+  independentes + docs + zero referências legadas. Novo
+  `tests/e2e/test_e2e_inject_limits.test.ts` (gated `E2E=1`, workspace `alfa`,
+  token `e2e-tok-a`), 3 casos: `e2e_memory_tokens_limits_block`,
+  `e2e_code_tokens_limits_block` e `e2e_endpoints_independent` — a evidência é o
+  **bloco injetado** (fatos/chunks contados nos parts), nunca o retorno da
+  chamada; o servidor devolve um **prefixo** quando `max_tokens` trunca (medido).
+  E2E existentes (`recall_inject`, `inject_code`) deixaram de passar as chaves
+  legadas mortas (`max_chars`/`max_tokens`) e passam as novas. Docs:
+  `ARCHITECTURE.md` §6 (config + envs + orçamento), `src/README.md` (envs +
+  tabela de verificação), `RUNBOOK-E2E.md` (suíte nova; glob **19/19**).
+  `BACKLOG.md`: entrada nova registrando a **exceção** (chaves `inject.max_chars`/
+  `inject.max_tokens` declaradas pelo E2/E3c e reescritas pela S1). Verificação:
+  `bun run typecheck` limpo; `npm test` **336 pass · 0 fail · 16 skip**;
+  `E2E=1` (glob, quatro tokens) **19 pass · 0 fail · 0 skip**;
+  `rg "max_char|maxChars|INJECT_MAX_CHARS|INJECT_MAX_TOKENS" src/` → **zero**.
+  Revisão adversarial (VERIFICATION-GAP nas E2E): sem gap material. **Bloco A
+  fechado. `S3` (Bloco B) permanece bloqueada pelo memtier — não iniciada.**

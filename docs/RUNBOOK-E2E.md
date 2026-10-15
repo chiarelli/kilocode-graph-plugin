@@ -15,7 +15,7 @@ E2E=1 \
   E2E_MCP_TOKEN="$(python3 -c 'import json;print(json.load(open(".kilo/graph-key.json"))["token"])')" \
   E2E_MANAGER_TOKEN="<bearer de gestor — ver Pré-requisitos>" \
   node --test "tests/e2e/**/*.test.ts"
-# → # tests 16 / pass 16 / fail 0 / skipped 0   (pós E4 + provision; ~7 min)
+# → # tests 19 / pass 19 / fail 0 / skipped 0   (pós E4 + provision + S2/ADR-009; ~6-7 min)
 ```
 
 Cada suíte usa um token de escopo **distinto**; por isso há **quatro** variáveis
@@ -51,6 +51,9 @@ E2E=1 E2E_INGEST_TOKEN=e2e-tok-a node --test tests/e2e/test_e2e_ingest.test.ts  
 # beta
 E2E=1 E2E_CODE_TOKEN=e2e-tok-b node --test tests/e2e/test_e2e_collector.test.ts   # 1/1
 E2E=1 E2E_CODE_TOKEN=e2e-tok-b node --test tests/e2e/test_e2e_inject_code.test.ts # 1/1
+
+# alfa — S2 (ADR-009 Bloco A): tetos de tokens por endpoint
+E2E=1 E2E_TOKEN=e2e-tok-a node --test tests/e2e/test_e2e_inject_limits.test.ts   # 3/3
 
 # bearer real do graph-key.json
 E2E=1 E2E_MCP_TOKEN="$(python3 -c 'import json;print(json.load(open(".kilo/graph-key.json"))["token"])')" \
