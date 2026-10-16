@@ -4,9 +4,12 @@
  */
 
 import assert from "node:assert/strict";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join as pjoin } from "node:path";
 import { test } from "node:test";
 
-import { buildCommand, controlForEvent, controlLine, parseLine, runIndexer } from "../src/index/runner.ts";
+import { buildCommand, controlForEvent, controlLine, jobErrorFromEvent, parseLine, runIndexer } from "../src/index/runner.ts";
 
 test("runner_no_bin: indexer_bin vazio ⇒ não spawna, skipped, sem lançar", async () => {
   const result = await runIndexer({ bin: "", repoRoot: "/tmp", mode: "full" });
@@ -120,4 +123,106 @@ test("control_line_shape: ack com job_id e count", () => {
   assert.equal(cmd.command, "ack");
   assert.equal(cmd.job_id, "job-1");
   assert.equal(cmd.payload.count, 500);
+});
+
+// --- E3a-S6/GIT_UNAVAILABLE: erro de job não-recuperável -------------------
+
+test("jobErrorFromEvent_git_unavailable: code/recoverable extraídos", () => {
+  const err = jobErrorFromEvent({
+    event: "error",
+    payload: { code: "GIT_UNAVAILABLE", message: "load_ignores requires git", recoverable: false },
+  });
+  assert.deepEqual(err, {
+    code: "GIT_UNAVAILABLE",
+    message: "load_ignores requires git",
+    recoverable: false,
+  });
+});
+
+test("jobErrorFromEvent_recoverable_explicit: BACKPRESSURE é recuperável", () => {
+  const err = jobErrorFromEvent({
+    event: "error",
+    payload: { code: "BACKPRESSURE", recoverable: true },
+  });
+  assert.equal(err?.recoverable, true);
+});
+
+test("jobErrorFromEvent_default_fatal: sem `recoverable` explícito ⇒ fatal", () => {
+  // Na dúvida, tratar como fatal: nunca destruir o grafo por erro ambíguo.
+  const err = jobErrorFromEvent({ event: "error", payload: { code: "WALKER_ERROR" } });
+  assert.equal(err?.recoverable, false);
+  assert.equal(err?.message, "WALKER_ERROR", "sem message ⇒ usa o code");
+});
+
+test("jobErrorFromEvent_non_error_event: chunk_emitted ⇒ null", () => {
+  assert.equal(jobErrorFromEvent({ event: "chunk_emitted", payload: {} }), null);
+});
+
+test("jobErrorFromEvent_malformed: payload não-objeto ⇒ null", () => {
+  assert.equal(jobErrorFromEvent({ event: "error", payload: null }), null);
+});
+
+test("jobErrorFromEvent_array_payload: array ⇒ null (não um falso fatal UNKNOWN)", () => {
+  // Array passa em `typeof === "object"`; sem a guarda, viraria fatal `UNKNOWN`.
+  assert.equal(jobErrorFromEvent({ event: "error", payload: [] }), null);
+  assert.equal(jobErrorFromEvent({ event: "error", payload: [{ code: "X" }] }), null);
+});
+
+// --- runIndexer: propagação REAL do erro até `result.error` ----------------
+
+/** Escreve um "indexer" falso em shell que emite as linhas JSONL dadas. */
+function fakeIndexer(lines: string[]): string {
+  const dir = mkdtempSync(pjoin(tmpdir(), "fake-idx-"));
+  const bin = pjoin(dir, "idx.sh");
+  const body = lines.map((l) => `echo ${JSON.stringify(l)}`).join("\n");
+  writeFileSync(bin, `#!/bin/sh\n${body}\nexit 0\n`);
+  chmodSync(bin, 0o755);
+  return bin;
+}
+
+test("runIndexer_error_event: error fatal + job_completed ⇒ result.error", async () => {
+  const bin = fakeIndexer([
+    JSON.stringify({
+      event: "error",
+      payload: { code: "GIT_UNAVAILABLE", message: "no git", recoverable: false },
+    }),
+    JSON.stringify({ event: "job_completed", payload: { processed: 0, errors: 1 } }),
+  ]);
+  try {
+    const result = await runIndexer({ bin, repoRoot: "/tmp", mode: "full" });
+    assert.equal(result.error?.code, "GIT_UNAVAILABLE");
+    assert.equal(result.skipped, false);
+  } finally {
+    rmSync(pjoin(bin, ".."), { recursive: true, force: true });
+  }
+});
+
+test("runIndexer_error_no_completed: error fatal SEM job_completed ⇒ não trava; result.error", async () => {
+  // `INVALID_PAYLOAD` faz early-return sem `job_completed`; o processo sai e o
+  // `close` deve propagar o erro (não esperar o timeout perder o `jobError`).
+  const bin = fakeIndexer([
+    JSON.stringify({
+      event: "error",
+      payload: { code: "INVALID_PAYLOAD", message: "missing payload", recoverable: false },
+    }),
+  ]);
+  try {
+    const result = await runIndexer({ bin, repoRoot: "/tmp", mode: "full" });
+    assert.equal(result.error?.code, "INVALID_PAYLOAD");
+  } finally {
+    rmSync(pjoin(bin, ".."), { recursive: true, force: true });
+  }
+});
+
+test("runIndexer_recoverable_error: erro recuperável NÃO vira result.error", async () => {
+  const bin = fakeIndexer([
+    JSON.stringify({ event: "error", payload: { code: "BACKPRESSURE", recoverable: true } }),
+    JSON.stringify({ event: "job_completed", payload: { processed: 1, errors: 0 } }),
+  ]);
+  try {
+    const result = await runIndexer({ bin, repoRoot: "/tmp", mode: "full" });
+    assert.equal(result.error, undefined, "recuperável ⇒ segue o fluxo normal");
+  } finally {
+    rmSync(pjoin(bin, ".."), { recursive: true, force: true });
+  }
 });

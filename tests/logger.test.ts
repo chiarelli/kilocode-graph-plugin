@@ -13,6 +13,7 @@ import {
   formatBootLine,
   formatInjectRaw,
   formatToken,
+  log,
   logFatal,
   writeInjectRaw,
 } from "../src/logger.ts";
@@ -74,6 +75,54 @@ test("logFatal_keeps_small_messages_intact", () => {
   assert.equal(lines.length, 1);
   assert.ok(lines[0]!.includes("boom"));
   assert.ok(!lines[0]!.includes("truncat"), "não deve truncar mensagem curta");
+});
+
+test("logFatal_respects_cap_exactly: linha final (com marca) nunca excede o teto", () => {
+  // O teto é 8192; a marca de corte era ANEXADA além dele (estourava ~27 chars)
+  // e o `log()` ainda adicionava prefixo. Agora o timestamp/prefixo entram na
+  // conta do teto e a marca cabe DENTRO dele.
+  const lines: string[] = [];
+  __setLogSink((line) => lines.push(line));
+  try {
+    logFatal("collect sync (422)", giantError(5_000_000));
+  } finally {
+    __setLogSink(null);
+  }
+  assert.ok(lines[0]!.length <= 8_192, `linha tem ${lines[0]!.length} chars`);
+});
+
+test("logFatal_console_leg_bounded: console.error também respeita o teto", () => {
+  // A perna do `console.error` era o vetor que TRAVOU a UI (linha pré-corte,
+  // ~8219 chars). Deve estar limitada ao teto como o arquivo.
+  const seen: string[] = [];
+  const orig = console.error;
+  console.error = ((s: unknown) => {
+    seen.push(String(s));
+  }) as typeof console.error;
+  const lines: string[] = [];
+  __setLogSink((line) => lines.push(line));
+  try {
+    logFatal("collect sync (422)", giantError(5_000_000));
+  } finally {
+    __setLogSink(null);
+    console.error = orig;
+  }
+  assert.equal(seen.length, 1);
+  assert.ok(seen[0]!.length <= 8_192, `console.error tem ${seen[0]!.length} chars`);
+  assert.ok(seen[0]!.includes("truncated"));
+});
+
+test("log_caps_direct_giant: `log()` também respeita o teto (não só logFatal)", () => {
+  // `debug()`/`log()` diretos com um `err.message` gigante escreviam sem limite.
+  const lines: string[] = [];
+  __setLogSink((line) => lines.push(line));
+  try {
+    log("big: " + "x".repeat(5_000_000));
+  } finally {
+    __setLogSink(null);
+  }
+  assert.equal(lines.length, 1);
+  assert.ok(lines[0]!.length <= 8_192, `linha tem ${lines[0]!.length} chars`);
 });
 
 // ---------------------------------------------------------------------------

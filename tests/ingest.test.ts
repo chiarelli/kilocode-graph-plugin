@@ -238,6 +238,40 @@ test("db_runtime_path_no_xdg: sem env ⇒ default do runtime (nunca Path.state)"
   assert.ok(!DEFAULT_DB_PATH.includes("/.local/state/"), DEFAULT_DB_PATH);
 });
 
+test("db_runtime_path_xdg_relative_ignored: XDG_DATA_HOME relativo cai no default", () => {
+  // Um XDG_DATA_HOME relativo resolveria contra o cwd do daemon (lugar errado);
+  // a regra do runtime o ignora. Sem isto, o plugin abriria um banco inexistente.
+  assert.equal(
+    defaultDbPath({ XDG_DATA_HOME: "rel/dir" }, "/home/u"),
+    join("/home/u/.local/share/kilo", "kilo.db"),
+  );
+});
+
+test("db_runtime_path_kilo_db_blank: KILO_DB vazio/whitespace cai no default", () => {
+  assert.equal(
+    defaultDbPath({ KILO_DB: "" }, "/home/u"),
+    join("/home/u/.local/share/kilo", "kilo.db"),
+  );
+  assert.equal(
+    defaultDbPath({ KILO_DB: "   " }, "/home/u"),
+    join("/home/u/.local/share/kilo", "kilo.db"),
+  );
+});
+
+test("db_runtime_path_kilo_db_subpath: subcaminho relativo é resolvido em Path.data", () => {
+  assert.equal(
+    defaultDbPath({ XDG_DATA_HOME: "/data", KILO_DB: "sub/dir.db" }, "/home/u"),
+    join("/data", "kilo", "sub/dir.db"),
+  );
+});
+
+test("db_runtime_path_xdg_whitespace: XDG_DATA_HOME com espaços é trimado", () => {
+  assert.equal(
+    defaultDbPath({ XDG_DATA_HOME: "  /data/x  " }, "/home/u"),
+    join("/data/x", "kilo", "kilo.db"),
+  );
+});
+
 test("db_read_batch: remonta texto (user+assistant), cursor por tupla e sem OFFSET", () => {
   const msgs = genMsgs(3, 100);
   const backend = makeBackend(msgs);

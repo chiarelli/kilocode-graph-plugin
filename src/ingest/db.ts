@@ -45,7 +45,8 @@ export function runtimeDataDir(
   env: RuntimeEnv = process.env,
   home: string = homedir(),
 ): string {
-  const base = env.XDG_DATA_HOME?.trim() || join(home, ".local", "share");
+  const xdg = env.XDG_DATA_HOME?.trim();
+  const base = xdg && isAbsolute(xdg) ? xdg : join(home, ".local", "share");
   return join(base, "kilo");
 }
 
@@ -55,8 +56,18 @@ export function runtimeDataDir(
  *
  *   - `KILO_DB` setado: `:memory:` ou caminho absoluto ⇒ usado como está;
  *     caso contrário, relativo a `Path.data`;
- *   - sem `KILO_DB`: `join(Path.data, "kilo.db")` (o canal default do build é
- *     `latest`, e/ou `KILO_DISABLE_CHANNEL_DB` — ambos caem em `kilo.db`).
+ *   - sem `KILO_DB`: `join(Path.data, "kilo.db")`.
+ *
+ * `Path.data` = `XDG_DATA_HOME ?? ~/.local/share` + `/kilo`. `XDG_DATA_HOME`
+ * deve ser **absoluto**; um valor relativo é ignorado (cairia no cwd do daemon e
+ * apontaria para o lugar errado).
+ *
+ * `KILO_DB` relativo é resolvido com `join(Path.data, KILO_DB)` **sem
+ * sanitização de `..`** — espelha a regra do runtime. O plugin não inventa uma
+ * política própria: se o runtime apontar o banco para outro lugar via `KILO_DB`,
+ * o plugin deve ler o MESMO arquivo (`KILO_DB` é env do próprio runtime, não
+ * entrada não-confiável de rede). Divergir aqui apontaria para um banco que o
+ * runtime não usa.
  */
 export function defaultDbPath(
   env: RuntimeEnv = process.env,
@@ -203,15 +214,16 @@ export interface BackendProvider {
 
 /**
  * Fonte do caminho do `kilo.db`: uma string fixa **ou** um resolvedor lazy.
- * O resolvedor existe para **não bloquear o boot** do plugin: quando o caminho
- * vem do próprio runtime (`client.path.get`, uma chamada HTTP ao servidor Kilo),
- * aguardá-lo dentro do `server()` **trava** — o servidor ainda não atende
- * requisições enquanto roda o `server()` do plugin (deadlock medido: `server()`
- * nunca retorna, `/session` e `/path` ficam pendurados e a UI não abre sessão).
- * Com o resolvedor, a resolução acontece na **primeira abertura do backend**
- * (já no ar, disparada por evento), fora do caminho crítico do boot.
+ *
+ * O resolvedor é aceito por dois motivos: (a) desacopla a resolução do boot —
+ * um resolver que consulte o runtime não trava o `server()` do plugin (deadlock
+ * medido quando a resolução aguardava rede no boot); (b) permite resolver **sem
+ * I/O** (`resolveRuntimeDbPath`, a regra do runtime aplicada ao env herdado) na
+ * primeira abertura do backend, fora do caminho crítico. Aceita resolver
+ * **síncrono ou assíncrono** (`string | Promise<string>`): a resolução in-process
+ * é síncrona e não deve pagar o custo/risco de virar `Promise`.
  */
-export type DbPathSource = string | (() => Promise<string>);
+export type DbPathSource = string | (() => string | Promise<string>);
 
 /** Provedor real (abre `dbPath` sob demanda); `open`/`onError` injetáveis. */
 export function createBackendProvider(

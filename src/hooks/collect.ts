@@ -171,6 +171,19 @@ export async function collectCode(rt: CollectRuntime): Promise<SyncResult | null
     return null;
   }
 
+  // Erro NÃO-recuperável do indexer (ex.: `GIT_UNAVAILABLE` com `load_ignores`
+  // sem git): o stream NÃO é um estado completo. Tratá-lo como "present vazio"
+  // num full marcaria TODO o manifest como removido e apagaria o grafo
+  // (chunks:[]). Aborta sem sincronizar — o grafo fica intacto.
+  if (result.error) {
+    log(
+      `collect: indexer abortou (${result.error.code}: ${result.error.message}); ` +
+        `sync cancelado (grafo preservado)`,
+    );
+    logCollection(indexerMs, 0, 0, 0);
+    return null;
+  }
+
   const present = collectPresent(result.events);
   // Removidos só se detectam no FULL: no incremental o stream traz apenas os
   // arquivos alterados no range — tratá-los como "estado completo" marcaria

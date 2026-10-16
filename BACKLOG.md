@@ -733,8 +733,9 @@ redescobertas no meio do loop.
      `<dir>/.kilo/graph-plugin.json` do diretório resolvido no runtime
      (`ctx.worktree` > `ctx.directory` > cwd) — nunca `process.cwd()`; merge
      **profundo** global↔workspace; `token_file` **confinado** ao workspace; o
-     `kilo.db` vem de `client.path.get().state` (runtime), não de env var
-     (removida `KILOCODE_GRAPH_INGEST_DB_PATH`).
+     `kilo.db` vem da **regra do runtime** (`Path.data` = `XDG_DATA_HOME ??
+     ~/.local/share` + `/kilo`, com `KILO_DB`; [ADR-010](docs/adr/010-fonte-do-kilo-db.md)),
+     não de env var (removida `KILOCODE_GRAPH_INGEST_DB_PATH`).
   3. **Revisão adversarial (3 perfis) + correções.** Achados materiais corrigidos
      na mesma base, cada um com teste de discriminação: **estrutural** —
      `workspaceName` colidia em saneamento/truncamento (novo sufixo de hash do
@@ -824,8 +825,99 @@ redescobertas no meio do loop.
      **336 · 0 fail · 16 skip**; `E2E=1` (glob, quatro tokens)
      **19 · 19 pass · 0 fail · 0 skip**; `rg
      "max_char|maxChars|INJECT_MAX_CHARS|INJECT_MAX_TOKENS" src/` → **zero**.
-     Revisão adversarial (BLIND-HUNTER/EDGE-CASE-HUNTER/VERIFICATION-GAP em
-     paralelo, agentes nomeados): achados materiais corrigidos na mesma base
-     (testes de body por endpoint ausentes; prosa obsoleta do orçamento conjunto;
-     ausência de clamp do teto). **`S3` (piso `min_score`) fora de escopo —
-     Bloco B, bloqueado pelo memtier.**
+      Revisão adversarial (BLIND-HUNTER/EDGE-CASE-HUNTER/VERIFICATION-GAP em
+      paralelo, agentes nomeados): achados materiais corrigidos na mesma base
+      (testes de body por endpoint ausentes; prosa obsoleta do orçamento conjunto;
+      ausência de clamp do teto). **`S3` (piso `min_score`) fora de escopo —
+      Bloco B, bloqueado pelo memtier.**
+
+- **2026-10-16 — Correções da branch `feature/load-ignores` (loop de verificação
+  adversarial).** Seis commits de fix/feat (`38b12dc`, `9a4705d`, `18e60b1`,
+  `b095893`, `066238d`, `e74a464`) passaram por 3 revisores adversariais
+  independentes (ingest/db, logging/client, code-index/debug) + auditoria
+  doc/ADR/spec. Achados materiais corrigidos na **mesma base** (sem rewrite):
+  1. **HIGH — `GIT_UNAVAILABLE` apagava o grafo.** Com `load_ignores=true` num
+     diretório sem git, o indexer aborta com `error code=GIT_UNAVAILABLE` e 0
+     chunks; o coletor tratava o stream como "full vazio" e marcava TODO o
+     manifest como removido (`chunks:[]`) — limpava o workspace no memtier.
+     Correção: `runner.ts` captura o evento `error` não-recuperável
+     (`jobErrorFromEvent`, `recoverable` só quando **explícito**) e `collect.ts`
+     **aborta sem sincronizar** quando há `result.error` (grafo preservado).
+     Testes: `jobErrorFromEvent_*` (4) + `collect_job_error_aborts`/
+     `collect_job_error_skips_removed`.
+  2. **HIGH — `typecheck` vermelho.** `types.ts` `Config.code_index` sem
+     `load_ignores`; `hooks/messages.ts` anotava `injection` como `{block}` e
+     perdia `facts`; `index.ts` passava resolver síncrono onde `DbPathSource`
+     exigia `Promise`. Correções: `load_ignores: boolean` no tipo; `injection:
+     InjectionResult`; `DbPathSource = string | (() => string | Promise<string>)`
+     (resolução síncrona in-process não paga o custo de virar Promise). `tsc`
+     exit 0. Teste: `debug_dump_counts_facts` (a contagem volta ao dump).
+  3. **HIGH — `provision.ts` bypassava o teto de erro HTTP.** 5 call sites
+     passavam `res.text()` cru a `httpError` (medido: `message` de 4 MB). O cap
+     subiu para **dentro de `httpError`** (defesa em profundidade) e
+     `extractHttpDetail` agora mantém a marca de corte **dentro** do teto (antes
+     a estourava em ~27 chars; a lista de `msg` cortava **sem** marca). Testes:
+     `httpError_caps_detail`, `extractHttpDetail_never_exceeds_cap`.
+  4. **MED — teto de texto do chunk.** `capChunkText` (marca dentro do teto)
+     aplicado **também ao `Symbol`** (um símbolo >100k derrubava o lote); md5
+     recalculado só quando houve corte (idempotência preservada sem corte); o
+     `FullFile` sintético usa `end_line` do texto **enviado**. Testes:
+     `capChunkText_*`, `fullfile_truncation`, `symbol_truncation`,
+     `symbol_no_truncation_keeps_indexer_md5`.
+  5. **MED — `log()`/`debug()` sem teto.** O cap existia só em `logFatal`; agora
+     `log()` trunca com marca dentro do teto (timestamp/prefixo entram na conta).
+     Testes: `logFatal_respects_cap_exactly`, `log_caps_direct_giant`.
+  6. **MED — regra do db.** `XDG_DATA_HOME` relativo agora é **ignorado**
+     (resolveria contra o cwd). Teste: `db_runtime_path_xdg_relative_ignored`.
+     Comentários stale (deadlock via `client.path.get`, canal `KILO_DISABLE_CHANNEL_DB`
+     não implementado) corrigidos. Fonte documentada em **ADR-010**.
+  7. **Binário do indexer.** `rust-ast-indexer` `master` (`77f5b10`, via
+     `feature/load-ignores`) reconstruído: `cargo build --release --bins` ⇒ binário
+     com `load_ignores` + `GIT_UNAVAILABLE` (sem ele, `load_ignores` é no-op no
+     plugin — o CLI não parseava o campo).
+  8. **Docs.** `README.md`/`ARCHITECTURE.md`/`BACKLOG.md`: fonte do `kilo.db`
+     corrigida (`Path.state` → `Path.data`, ADR-010); `code_index.load_ignores`
+     nas 3 tabelas (env/JSON/`specs/e1`); `specs/e4` e o fake do E2E alinhados à
+     regra (`KILO_DB`); path do binário no RFC-002 corrigido.
+
+- **2026-10-16 — Segunda rodada adversarial (BLIND-HUNTER / EDGE-CASE-HUNTER /
+  VERIFICATION-GAP) sobre as correções acima.** Achados novos, corrigidos na
+  mesma base (sem rewrite), cada um com teste:
+  1. **HIGH — o erro fatal se perdia no timeout.** `runner.ts` só carregava o
+     `jobError` em `close`/`job_completed`; `INVALID_PAYLOAD`/`INVALID_COMMAND`
+     fazem **early-return sem `job_completed`** e deixam o processo vivo até o
+     timeout — que descartava o erro e reintroduzia o wipe do grafo. Agora o
+     timeout, o `exit!=0` e o `close` limpo propagam o erro corrente, e um erro
+     fatal **encerra o job na hora** (não espera `job_completed`). Testes:
+     `runIndexer_error_event`, `runIndexer_error_no_completed`,
+     `runIndexer_recoverable_error`.
+  2. **HIGH — `console.error` de `logFatal` estourava o teto.** A perna do
+     console imprimia a linha PRÉ-corte (~8219 > 8192) — o vetor que travou a UI.
+     Agora passa por `truncateLine`; a dupla truncagem `logFatal`→`log` deixou de
+     subnotificar o total descartado. Teste: `logFatal_console_leg_bounded`.
+  3. **MED — `capChunkText` partia par substituto.** Corte em UTF-16 deixava
+     surrogate solto (Unicode inválido) com emoji na fronteira. Novo
+     `sliceWholeChars` recua 1 unidade. Teste: `capChunkText_never_splits_surrogate_pair`.
+  4. **MED — `end_line` stale após corte.** `toChunk` mantinha o `end_line` do
+     indexer mesmo cortando o texto (60.000 linhas → 44.995 enviadas). Agora
+     reflete o texto emitido. Testes: `symbol_truncation_end_line`,
+     `fullfile_truncation` (fixture multilinha + limite inferior).
+  5. **MED — md5 dessincronizado com `text` ausente.** `toChunk({text:undefined})`
+     virava `""` mas conservava o md5 do indexer. Agora recalcula quando o texto
+     enviado difere do original. Teste: `toChunk_non_string_text_recomputes_md5`.
+  6. **LOW — `jobErrorFromEvent(payload=[])`.** Array passava no `typeof object` e
+     virava falso-fatal `UNKNOWN`; agora rejeitado. Teste:
+     `jobErrorFromEvent_array_payload`.
+  7. **Robustez — EPIPE assíncrono no stdin.** `child.stdin.write` podia emitir
+     `error` depois do retorno (processo já morto) e virar `uncaughtException`;
+     handler de `error` no stdin adicionado (exposto pelos novos testes de spawn).
+  8. **Prova end-to-end do cap no `provision`.** O cap central de `httpError`
+     cobre os 5 call sites; teste com body de 4 MB prova que `logFatal("provision")`
+     fica ≤8192 e preserva a msg útil. Teste: `provision_error_body_bounded`.
+  9. **Docs/testes refinados:** asserção auto-referente de `end_line` corrigida;
+     `debug_dump_counts_facts` agora exige a contagem exata (`2 itens`);
+     `KILO_DB` vazio/whitespace/subpath e `XDG_DATA_HOME` com espaços cobertos;
+     fake do E2E alinhado ao shape real do SDK (`{state,config,worktree,directory}`).
+  `KILO_DB` relativo com `..` **mantido sem sanitização** de propósito (espelha a
+  regra do runtime — divergir apontaria para outro banco) e documentado.
+  Unit **403 · 384 pass · 0 fail · 19 skip**; `tsc --noEmit` limpo.

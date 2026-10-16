@@ -83,7 +83,7 @@ diretório do workspace vem do **runtime do Kilo** (`ctx.worktree` >
 | Config do plugin | `<workspace>/.kilo/graph-plugin.json` > `~/.config/kilo/graph-plugin.json` | workspace/global |
 | Nome do workspace | derivado do dir = `<stem>-<sha1 8>`; override `KILOCODE_GRAPH_WORKSPACE` | — |
 | Bearer do workspace | arquivo `.kilo/graph-key.json` = `{ token, workspace, program }` (`0600`) | `./.kilo/` do workspace |
-| Banco de sessões | `client.path.get().state` + `/kilo.db` (runtime do Kilo) | runtime |
+| Banco de sessões | `Path.data` do runtime (`XDG_DATA_HOME ?? ~/.local/share` + `/kilo`) + regra `KILO_DB` | runtime |
 | Bearer do **gestor** | env `KILOCODE_GRAPH_MANAGER_TOKEN` (opcional) | — |
 
 **Mapeamento 1:1.** Cada workspace Kilo corresponde a um workspace memtier. O

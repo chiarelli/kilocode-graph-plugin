@@ -93,8 +93,10 @@ por **um** gatilho.
 - `client.ingest(body, referenceTime)` — se ainda não existe.
 
 **Testes (unit):** montagem do lote e `batchHash` determinístico; limiar não
-atingido ⇒ não envia; localização do `kilo.db` (caminhos do antecessor:
-`.kilo/kilo.db` no projeto ou até 5 níveis acima, fallback `~/.local/share/kilo/`).
+atingido ⇒ não envia; localização do `kilo.db` pela **regra do runtime**
+(`Path.data` = `XDG_DATA_HOME ?? ~/.local/share` + `/kilo`, com `KILO_DB`:
+`:memory:`/absoluto usados como estão, relativo resolvido em `Path.data`).
+**Não** usa `client.path.get().state` (ver [ADR-010](../docs/adr/010-fonte-do-kilo-db.md)).
 
 **E2E (gated):** 1 lote real chega ao memtier (202) e o episódio aparece no grafo.
 

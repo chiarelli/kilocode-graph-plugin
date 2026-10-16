@@ -137,7 +137,7 @@ A parte do **evento de remoção** procede. Mas a afirmação de que
   que executa `git diff --name-only from to` (`infra/git.rs:66-75`).
 - O `explicit_files` resultante é honrado por `index_path_parallel`
   (`application/indexer.rs:128`), que parseia **apenas** essa lista.
-- **Prova com o binário real** (`/workspace/.kilo/bin/rust_indexer`): repo de
+- **Prova com o binário real** (`rust_indexer/target/release/rust_indexer`): repo de
   teste com 2 arquivos, commit alterando **só `src/b.go`**, então
   `incremental_index` com `git_range` de `HEAD1`→`HEAD2`:
 
@@ -211,7 +211,7 @@ provavelmente acidental, não uma decisão desenhada.
 - **Incremental por commit:** leitura de `src/index/trigger.ts` e
   `infra/git.rs::get_git_diff_files`.
 - **`incremental_index` funcional (contra-achado):** execução do binário real
-  (`/workspace/.kilo/bin/rust_indexer`) contra um repo de teste com commit de 1
+  (`rust_indexer/target/release/rust_indexer`) contra um repo de teste com commit de 1
   arquivo; eventos JSONL mostram `file_listed`/`chunk_emitted` apenas do arquivo
   alterado.
 

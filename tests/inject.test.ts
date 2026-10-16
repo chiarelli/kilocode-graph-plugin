@@ -521,3 +521,25 @@ test("D-1: sem `id` no info ⇒ fallback pelo indice (não injeta 2x no mesmo tu
   await injectMemoryIntoMessages(semId, true, injector);
   assert.equal(semId[0]?.parts.length, 2, "mesmo turno ⇒ dedup mantido");
 });
+
+test("debug_dump_counts_facts: nº de fatos (numérico) chega ao dump do raw", async () => {
+  // Regressão de tipo/runtime: a injeção devolve `InjectionResult` com `facts`
+  // numérico; o dump (`writeInjectRaw`) deve receber a contagem, não `undefined`.
+  const { setDebug } = await import("../src/logger.ts");
+  const { __setLogSink } = await import("../src/logger.ts");
+  const lines: string[] = [];
+  __setLogSink((line) => lines.push(line));
+  setDebug(true);
+  try {
+    const messages = userTurn("qual o timeout do billing?", "turno-dump");
+    const { enabled, injector } = rt([fact("timeout = 30s"), fact("retry = 3")]);
+    await injectMemoryIntoMessages(messages, enabled, injector);
+  } finally {
+    setDebug(false);
+    __setLogSink(null);
+  }
+  const dump = lines.find((l) => l.includes("MEMÓRIA"));
+  assert.ok(dump, "o dump do raw foi emitido");
+  // Contagem EXATA (não só "tem número"): 2 fatos injetados ⇒ "2 itens".
+  assert.match(dump!, /2 itens ·/, "a contagem correta (2) aparece no dump");
+});

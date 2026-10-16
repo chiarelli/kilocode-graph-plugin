@@ -25,6 +25,7 @@ import { debug, log, logFatal, writeInjectRaw } from "../logger.ts";
 import { applyJointBudget, type JointBudget } from "../inject/budget.ts";
 import {
   MemoryInjector,
+  type InjectionResult,
   type MemoryPrep,
   type RecallClient,
   type RecallConfig,
@@ -151,7 +152,7 @@ export async function injectMemoryIntoMessages(
     return;
   }
 
-  let injection: { block: string } | null;
+  let injection: InjectionResult | null;
   try {
     injection = await injector.inject(turnoId, text);
   } catch (err) {

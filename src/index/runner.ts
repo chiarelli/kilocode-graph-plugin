@@ -11,10 +11,15 @@
  *
  * Backpressure (S4, protocolo two-way — `protocol.md:159` e §"Armadilhas"): se a
  * fila do indexer encher, ele pausa e espera resposta. Um runner que só lê trava
- * para sempre. Trata as DUAS formas do protocolo:
+ * para sempre. Trata:
  *   - evento `pause` ⇒ responde `ack {count}` (drena a fila; resume automático);
- *   - `error` com `code=BACKPRESSURE` ⇒ responde `resume` (spec §E3a-S1).
- * Também manda `resume` no evento `resume` (idempotente, mantém o job fluindo).
+ *   - evento `resume` ⇒ responde `resume` (idempotente, mantém o job fluindo);
+ *   - `error` com `code=BACKPRESSURE` ⇒ responde `ack` (**defensivo**: a versão
+ *     atual do indexer sinaliza backpressure por `pause`, não por esse código).
+ *
+ * Erro de job NÃO-recuperável (ex.: `GIT_UNAVAILABLE`, `INVALID_PAYLOAD`) ⇒ o
+ * job é encerrado já, carregando o erro: o stream não representa um estado
+ * completo e o coletor não pode tratá-lo como "full vazio" (apagaria o grafo).
  */
 
 import { spawn } from "node:child_process";
@@ -57,6 +62,40 @@ export interface RunIndexerResult {
   skipped: boolean;
   /** Detalhe da degradação (binário ausente, exit != 0, timeout). */
   reason?: string;
+  /**
+   * Erro **não-recuperável** do job (evento `error` com `recoverable:false`,
+   * ex.: `GIT_UNAVAILABLE` quando `load_ignores` exige git). Presente ⇒ o
+   * stream NÃO é um estado completo: o coletor não pode tratá-lo como "todos
+   * os demais arquivos foram removidos".
+   */
+  error?: IndexerJobError;
+}
+
+/** Erro de job do indexer (evento `error`), tipado para o coletor decidir. */
+export interface IndexerJobError {
+  /** Código do protocolo (`GIT_UNAVAILABLE`, `WALKER_ERROR`, …). */
+  code: string;
+  message: string;
+  /** `true` quando o job pode continuar (ex.: `BACKPRESSURE`); default `false`. */
+  recoverable: boolean;
+}
+
+/**
+ * Extrai o erro de um evento `error` como `IndexerJobError` (ou `null` se o
+ * payload for malformado). `recoverable` só é `true` quando **explícito** — na
+ * dúvida, trata como fatal (nunca destruir o grafo por um erro ambíguo).
+ */
+export function jobErrorFromEvent(event: IndexerEvent): IndexerJobError | null {
+  if (event.event !== "error") return null;
+  const payload = event.payload as
+    | { code?: unknown; message?: unknown; recoverable?: unknown }
+    | null;
+  // Array também é `typeof "object"`; não é um payload de erro válido (payload
+  // array viraria um falso fatal `UNKNOWN`). Exige um objeto simples.
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const code = typeof payload.code === "string" ? payload.code : "UNKNOWN";
+  const message = typeof payload.message === "string" ? payload.message : code;
+  return { code, message, recoverable: payload.recoverable === true };
 }
 
 const DEFAULT_JOB_TIMEOUT_MS = 300_000;
@@ -171,6 +210,8 @@ export async function runIndexer(
     }
 
     let settled = false;
+    /** Erro não-recuperável do job (o último visto) — decide a degradação. */
+    let jobError: IndexerJobError | null = null;
     const finish = (result: RunIndexerResult): void => {
       if (settled) return;
       settled = true;
@@ -183,9 +224,21 @@ export async function runIndexer(
       }
       resolve(result);
     };
+    /** Resolve o job já, carregando o erro corrente (se houver). */
+    const finishWithError = (reason?: string): void => {
+      finish({
+        events,
+        skipped: false,
+        ...(reason ? { reason } : {}),
+        ...(jobError ? { error: jobError } : {}),
+      });
+    };
 
     const timer = setTimeout(() => {
-      finish({ events, skipped: false, reason: `timeout do job (${timeoutMs}ms)` });
+      // Timeout também propaga o erro corrente: um erro fatal sem `job_completed`
+      // (ex.: `INVALID_PAYLOAD`, que faz early-return e deixa o processo vivo)
+      // chega aqui — omiti-lo reintroduziria o wipe do grafo no modo full.
+      finishWithError(`timeout do job (${timeoutMs}ms)`);
     }, timeoutMs);
 
     child.on("error", (err) => {
@@ -195,11 +248,12 @@ export async function runIndexer(
 
     child.on("close", (code) => {
       if (code && code !== 0) {
-        finish({ events, skipped: false, reason: `indexer exit=${code}` });
+        finishWithError(`indexer exit=${code}`);
         return;
       }
-      // Sem `job_completed` mas saiu limpo: devolve o que veio.
-      finish({ events, skipped: false });
+      // Sem `job_completed` mas saiu limpo: devolve o que veio, com o erro
+      // corrente (se houve) para o coletor não tratar o stream como completo.
+      finishWithError();
     });
 
     const rl = createInterface({ input: child.stdout });
@@ -218,12 +272,30 @@ export async function runIndexer(
           // stdin fechado (processo saindo): o `close` resolve o job.
         }
       }
-      if (ev.event === "job_completed") finish({ events, skipped: false });
+      // Erro NÃO-recuperável: guarda e ENCERRA já (não espera `job_completed` —
+      // nem todo erro o emite; `INVALID_PAYLOAD`/`INVALID_COMMAND`/`JOB_NOT_FOUND`
+      // fazem early-return e o processo ficaria vivo até o timeout).
+      const jobErr = jobErrorFromEvent(ev);
+      if (jobErr && !jobErr.recoverable) {
+        jobError = jobErr;
+        finishWithError();
+        return;
+      }
+      if (ev.event === "job_completed") finishWithError();
     });
 
     // stderr é diagnóstico; nunca derruba o job.
     child.stderr?.on("data", (buf: Buffer) => {
       debug(`collect: indexer stderr: ${buf.toString().trim().slice(0, 200)}`);
+    });
+
+    // `child.stdin.write` pode falhar DEPOIS do retorno (EPIPE assíncrono) se o
+    // processo já saiu (ex.: erro fatal que encerra o job antes de ler o
+    // comando). O `try/catch` síncrono não cobre isso; sem este handler o
+    // stream emite `error` e vira `uncaughtException`. Aqui é seguro ignorar: o
+    // `close`/timeout resolve o job.
+    child.stdin?.on("error", (err: NodeJS.ErrnoException) => {
+      debug(`collect: indexer stdin (${err.code ?? err.message}); ignorado`);
     });
 
     try {

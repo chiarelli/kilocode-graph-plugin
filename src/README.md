@@ -277,6 +277,7 @@ default. Em `options`, o placeholder `{env:VAR}` resolve a env var citada
 | `code_index.enabled` | `KILOCODE_GRAPH_INDEX_ENABLED` | `false` |
 | `code_index.indexer_bin` | `KILOCODE_GRAPH_INDEXER_BIN` | `""` (vazio — sem coletor) |
 | `code_index.sync_timeout_ms` | `KILOCODE_GRAPH_INDEX_SYNC_TIMEOUT_MS` | `120000` |
+| `code_index.load_ignores` | `KILOCODE_GRAPH_INDEX_LOAD_IGNORES` | `false` |
 | `ingest.enabled` | `KILOCODE_GRAPH_INGEST_ENABLED` | `false` |
 | `ingest.batch_size` | `KILOCODE_GRAPH_INGEST_BATCH_SIZE` | `20` |
 | `ingest.max_hashes` | `KILOCODE_GRAPH_INGEST_MAX_HASHES` | `5000` |
@@ -347,6 +348,12 @@ Env vars fora do prefixo:
 | **Teto de tokens por endpoint** (`memory_max_tokens`/`code_max_tokens`) corta cada bloco de forma independente | `tests/code_s2.test.ts` — `code_body_uses_code_tokens`, `endpoints_independent`; E2E `tests/e2e/test_e2e_inject_limits.test.ts` (gated `E2E=1`) |
 | Envs de limite legadas ⇒ **um** aviso de depreciação (nunca silêncio) | `tests/config.test.ts` — casos `config_legacy_*_warns` e `config_no_legacy_no_warning` |
 | Teto fora de `[1,16000]` (422 no servidor) cai no default | `tests/config.test.ts` — `config_token_cap_clamped` |
+| Erro HTTP com body de MB não vira `message` gigante (UI) | `tests/client.test.ts` — `httpError_caps_detail`, `extractHttpDetail_never_exceeds_cap`; `tests/provision.test.ts` — `provision_error_body_bounded` |
+| Linha de log nunca excede o teto (nem `log`/`debug`, nem o `console.error` do fatal) | `tests/logger.test.ts` — `logFatal_respects_cap_exactly`, `logFatal_console_leg_bounded`, `log_caps_direct_giant` |
+| Chunk (`FullFile`/`Symbol`) acima do teto é truncado com marca | `tests/collector.test.ts` — `fullfile_truncation`, `symbol_truncation` |
+| Erro fatal do indexer (`GIT_UNAVAILABLE`) **não** apaga o grafo | `tests/collect.test.ts` — `collect_job_error_aborts`, `collect_job_error_skips_removed`; `tests/runner.test.ts` — `jobErrorFromEvent_*`, `runIndexer_error_event`, `runIndexer_error_no_completed`, `runIndexer_recoverable_error` |
+| `code_index.load_ignores` propaga ao indexer | `tests/runner.test.ts` — `build_command_load_ignores*`; `tests/collect.test.ts` — `collect_load_ignores*` |
+| Fonte do `kilo.db` = regra do runtime (não `Path.state`) | `tests/ingest.test.ts` — `db_runtime_path*`, `db_runtime_path_xdg_relative_ignored` |
 
 > **Limitação conhecida:** dois diretórios com o MESMO basename válido (ex.: dois
 > checkouts chamados `foo`) mapeiam para o mesmo workspace memtier — desambiguar

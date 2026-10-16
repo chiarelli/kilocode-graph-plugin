@@ -40,7 +40,7 @@ export function setDebug(enabled: boolean): void {
 
 /** Log incondicional (boot, degradação, erro). */
 export function log(msg: string): void {
-  const line = `[${new Date().toISOString()}] ${PREFIX} ${msg}`;
+  const line = truncateLine(`[${new Date().toISOString()}] ${PREFIX} ${msg}`);
   if (testSink) {
     try {
       testSink(line);
@@ -54,6 +54,19 @@ export function log(msg: string): void {
   } catch {
     // Log nunca derruba o plugin.
   }
+}
+
+/**
+ * Corta uma linha ao teto `MAX_LOG_LINE_CHARS`, anexando a marca de corte
+ * **dentro** do limite (o resultado nunca excede o teto). Um `message` de erro
+ * que carregue um body HTTP inteiro não pode despejar megabytes no arquivo/sink.
+ */
+function truncateLine(line: string): string {
+  if (line.length <= MAX_LOG_LINE_CHARS) return line;
+  const omitted = line.length - MAX_LOG_LINE_CHARS;
+  const suffix = `… [truncated ${omitted} chars]`;
+  const keep = Math.max(0, MAX_LOG_LINE_CHARS - suffix.length);
+  return `${line.slice(0, keep)}${suffix}`;
 }
 
 /** Log só quando `debug` está ligado. */
@@ -72,14 +85,13 @@ export function debug(msg: string): void {
 export function logFatal(scope: string, error: unknown): void {
   const message = error instanceof Error ? error.message : String(error);
   const detail = error instanceof Error && error.stack ? `\n${error.stack}` : "";
-  let line = `FATAL ${scope}: ${message}${detail}`;
-  if (line.length > MAX_LOG_LINE_CHARS) {
-    const omitted = line.length - MAX_LOG_LINE_CHARS;
-    line = `${line.slice(0, MAX_LOG_LINE_CHARS)}… [truncated ${omitted} chars]`;
-  }
+  const line = `FATAL ${scope}: ${message}${detail}`;
+  // `log()` já corta (com timestamp/prefixo) para o arquivo/sink; a perna do
+  // `console.error` corta por conta própria para NÃO exceder o teto (antes ela
+  // imprimia a linha pré-corte e estourava o limite — o vetor que travou a UI).
   log(line);
   try {
-    console.error(`${PREFIX} ${line}`);
+    console.error(truncateLine(`${PREFIX} ${line}`));
   } catch {
     // console pode não existir em ambientes embarcados.
   }

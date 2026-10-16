@@ -433,7 +433,8 @@ Nada hardcoded no script (FR-303). **JSON** + env vars, precedência:
   "code_index": {                         // E3a — o coletor
     "enabled": false,                     // ativado por flag, como hoje
     "indexer_bin": "",                    // caminho do rust_indexer (FR-306)
-    "sync_timeout_ms": 120000             // KILOCODE_GRAPH_INDEX_SYNC_TIMEOUT_MS
+    "sync_timeout_ms": 120000,            // KILOCODE_GRAPH_INDEX_SYNC_TIMEOUT_MS
+    "load_ignores": false                 // git ls-files --exclude-standard
   },
   "mcp": {                                // E3b — registro do MCP do memtier
     "enabled": true,
@@ -447,7 +448,7 @@ Nada hardcoded no script (FR-303). **JSON** + env vars, precedência:
 > `INJECT_ENABLED`, `INJECT_MAX_MEMORIES`, `INJECT_MEMORY_MAX_TOKENS`,
 > `INJECT_CODE_MAX_TOKENS`, `INJECT_TIMEOUT_MS`, `INJECT_CODE_ENABLED`,
 > `INJECT_MAX_CODE_CHUNKS`, `INDEX_ENABLED`, `INDEXER_BIN`,
-> `INDEX_SYNC_TIMEOUT_MS`, `MCP_ENABLED`, `MCP_NAME`, `DEBUG`,
+> `INDEX_SYNC_TIMEOUT_MS`, `INDEX_LOAD_IGNORES`, `MCP_ENABLED`, `MCP_NAME`, `DEBUG`,
 > `INGEST_ENABLED`, `INGEST_BATCH_SIZE`, `INGEST_MAX_HASHES`, `INGEST_TIMEOUT_MS`,
 > `MANAGER_TOKEN`, `WORKSPACE`. O prefixo da env de config é `KILOCODE_GRAPH_` (o
 > `openviking` do antecessor mudou).
@@ -467,9 +468,13 @@ Nada hardcoded no script (FR-303). **JSON** + env vars, precedência:
 > onda era "spec sob demanda"), então a epic dona as declara e a exceção é
 > registrada no histórico do BACKLOG. As chaves de `ingest.*` foram declaradas
 > pela própria **E4** (`ingest.enabled`/`batch_size`/`max_hashes`/`timeout_ms`;
-> default `enabled=false`). O caminho do `kilo.db` **não** é config: vem do
-> **runtime do Kilo** (`client.path.get().state` → `<state>/kilo.db`) — a env
-> `INGEST_DB_PATH` foi removida.
+> default `enabled=false`). O caminho do `kilo.db` **não** é config: vem da
+> **regra do runtime do Kilo** (`Path.data` = `XDG_DATA_HOME ?? ~/.local/share`
+> + `/kilo`, com `KILO_DB`; ver [ADR-010](adr/010-fonte-do-kilo-db.md)) — a env
+> `INGEST_DB_PATH` foi removida. `/path` expõe `state`/`config`/`worktree`/
+> `directory`, mas **não** `data` (onde o banco vive) — então derivar de `state`
+> apontava para um diretório sem `kilo.db`.
+> banco.
 
 
 ## 7. Adaptadores multi-CLI

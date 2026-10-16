@@ -165,9 +165,9 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
   // derivado de `client.path.get().state`: `/path` expõe o diretório de ESTADO,
   // enquanto o banco vive em DATA (`~/.local/share/kilo/kilo.db`), então derivar
   // de `state` apontava para um diretório sem banco. A resolução é **síncrona e
-  // sem I/O** (nada de `await` de rede no boot — isso travava o `server()`).
+  // sem I/O** (`resolveRuntimeDbPath`): resolver no boot não trava o `server()`.
   // Desligada a ingestão, o provider nem é aberto.
-  const dbPath: DbPathSource = config.ingest.enabled ? () => resolveRuntimeDbPath() : "";
+  const dbPath: DbPathSource = config.ingest.enabled ? resolveRuntimeDbPath() : "";
 
   // E4: ingestion hooks. Construído fora do objeto de retorno para que o
   // `dispose` (que fecha o handle do SQLite) seja referenciável no shutdown.

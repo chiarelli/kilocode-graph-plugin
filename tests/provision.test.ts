@@ -345,3 +345,33 @@ test("writeKeyFile: grava em `.tmp` e renomeia (atômico), criando o diretório"
     program: "p",
   });
 });
+
+test("provision_error_body_bounded: 422 com body de MB não vira mensagem gigante", async () => {
+  // `provision.ts` passa `res.text()` CRU a `httpError`; se o servidor ecoar o
+  // body inteiro, a `message` do `logFatal("provision", …)` teria MBs (travou a
+  // UI em produção). O cap central de `httpError`/`extractHttpDetail` cobre TODOS
+  // os call sites — prova ponta a ponta: o erro capturado é curto.
+  const huge = JSON.stringify({
+    detail: [{ type: "value_error", msg: "duplicidade de identidade: x:y", input: "z".repeat(4_000_000) }],
+  });
+  const { fetch } = fakePlane({
+    "/v1/mgmt/programs": () =>
+      new Response(huge, { status: 422, headers: { "Content-Type": "application/json" } }),
+  });
+  const captured: string[] = [];
+  const orig = console.error;
+  console.error = ((s: unknown) => {
+    captured.push(String(s));
+  }) as typeof console.error;
+  let out;
+  try {
+    out = await ensureWorkspaceKey(baseOpts({ fetch }));
+  } finally {
+    console.error = orig;
+  }
+  assert.deepEqual(out, { provisioned: false, reason: "failed" }, "degrada, não lança");
+  const line = captured.find((l) => l.includes("provision"));
+  assert.ok(line, "o erro foi logado");
+  assert.ok(line!.length <= 8_192, `linha de log tem ${line!.length} chars`);
+  assert.ok(line!.includes("duplicidade de identidade"), "preserva a msg útil do servidor");
+});

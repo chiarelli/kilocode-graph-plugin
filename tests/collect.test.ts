@@ -268,6 +268,58 @@ test("collect_incremental_merges_manifest: estado pós-incremental preserva inal
   assert.deepEqual(saved[0]?.sort(), ["src/changed.rs", "src/keep.rs"]);
 });
 
+// --- GIT_UNAVAILABLE: erro fatal do job NUNCA apaga o grafo -----------------
+
+test("collect_job_error_aborts: erro não-recuperável ⇒ sem sync (grafo intacto)", async () => {
+  // Reproduz o defeito: `load_ignores=true` num dir sem git ⇒ indexer aborta
+  // `GIT_UNAVAILABLE` com 0 chunks. Tratado como full "vazio", marcaria TODO o
+  // manifest como removido (`chunks:[]`) e limparia o workspace no memtier.
+  let called = false;
+  const rt = runtime({
+    cfg: { enabled: true, indexer_bin: "/fake/indexer", load_ignores: true },
+    run: async () => ({
+      events: [
+        {
+          event: "error",
+          payload: { code: "GIT_UNAVAILABLE", message: "requires git", recoverable: false },
+        },
+        { event: "job_completed", payload: { processed: 0, errors: 1 } },
+      ],
+      skipped: false,
+      error: { code: "GIT_UNAVAILABLE", message: "requires git", recoverable: false },
+    }),
+    state: fakeState(["src/a.rs", "src/b.rs"]),
+    client: {
+      syncCode: async () => {
+        called = true;
+        return EMPTY_SYNC;
+      },
+    },
+  });
+  assert.equal(await collectCode(rt), null);
+  assert.equal(called, false, "nenhum sync ⇒ nenhum arquivo marcado como removido");
+});
+
+test("collect_job_error_skips_removed: erro fatal não gera removidos", async () => {
+  let sentFiles: unknown[] | null = null;
+  const rt = runtime({
+    run: async () => ({
+      events: [{ event: "error", payload: { code: "GIT_UNAVAILABLE", recoverable: false } }],
+      skipped: false,
+      error: { code: "GIT_UNAVAILABLE", message: "requires git", recoverable: false },
+    }),
+    state: fakeState(["src/a.rs"]),
+    client: {
+      syncCode: async (f) => {
+        sentFiles = f;
+        return EMPTY_SYNC;
+      },
+    },
+  });
+  await collectCode(rt);
+  assert.equal(sentFiles, null);
+});
+
 // --- client.syncCode -------------------------------------------------------
 
 test("sync_body_shape: body tem workspace/program/files/edges", async () => {

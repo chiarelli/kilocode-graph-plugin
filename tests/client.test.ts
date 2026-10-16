@@ -11,6 +11,7 @@ import {
   MemtierClient,
   MemtierHttpError,
   extractHttpDetail,
+  httpError,
   type FetchLike,
   type ReadFileLike,
 } from "../src/client.ts";
@@ -336,6 +337,29 @@ test("extractHttpDetail_non_json_truncates_raw", () => {
 test("extractHttpDetail_small_json_unchanged", () => {
   const raw = JSON.stringify({ detail: [{ msg: "boom", input: "x" }] });
   assert.equal(extractHttpDetail(raw), raw);
+});
+
+test("extractHttpDetail_never_exceeds_cap: JSON gigante com msg longa ⇒ capado+marcado", () => {
+  // `detail[].msg` que por si só estoura o teto: o resultado deve ficar DENTRO do
+  // cap (antes a marca de corte era anexada além do limite).
+  const raw = JSON.stringify({ detail: [{ msg: "z".repeat(10_000) }] });
+  const out = extractHttpDetail(raw);
+  assert.ok(out.length <= 2_048, `len=${out.length}`);
+  assert.ok(out.includes("truncated"));
+});
+
+test("httpError_caps_detail: body de vários MB ⇒ message limitada (defesa central)", () => {
+  // Sem isto, qualquer call site (ex.: `provision.ts`, que passa `res.text()` cru)
+  // poderia fabricar uma `message` de MB e travar a UI ao logar.
+  const huge = "z".repeat(4_000_000);
+  const err = httpError(422, huge);
+  assert.ok(err.message.length < 4_096, `message tem ${err.message.length} chars`);
+  assert.ok(err.message.length <= 2_048 + 32, "respeita o teto do detalhe + prefixo");
+});
+
+test("httpError_small_detail_intact: detalhe curto passa como está", () => {
+  const err = httpError(422, "duplicidade de identidade: x:y");
+  assert.ok(err.message.includes("duplicidade de identidade: x:y"));
 });
 
 test("program_in_identity: resolveIdentity devolve {workspace,program}", () => {

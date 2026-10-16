@@ -30,10 +30,11 @@ export interface IngestHookRuntime {
   cfg: IngestConfig;
   /**
    * Caminho do `kilo.db` — string fixa **ou** resolvedor lazy (`DbPathSource`).
-   * O resolvedor é usado quando o caminho vem do próprio runtime
-   * (`client.path.get`, chamada HTTP ao servidor Kilo): resolvê-lo no boot
-   * travaria o `server()` do plugin (deadlock medido). A resolução fica para a
-   * primeira abertura do backend, fora do caminho crítico do boot.
+   * O resolvedor desacopla a resolução do boot: resolver no `server()` do plugin
+   * podia travar quando dependia do runtime (deadlock medido). A resolução fica
+   * para a primeira abertura do backend, fora do caminho crítico. Aceita
+   * resolver síncrono (`resolveRuntimeDbPath`, regra do runtime sem I/O) ou
+   * assíncrono.
    */
   dbPath: DbPathSource;
   /** Caminho do estado (`.kilo/graph-ingest.json`). */
