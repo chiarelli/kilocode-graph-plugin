@@ -130,6 +130,19 @@ rust_indexer (JSONL) ──▶ chunk_emitted / import_edge / call_edge
 
 Fora do caminho crítico do turno. Ver ADR-005 e `docs/ARCHITECTURE.md` §4.
 
+**Gatilho (E3a-S6, [ADR-011](docs/adr/011-gatilho-do-delta-em-runtime.md)).** O
+**CLI standalone** (`src/cli.ts`) é o **único escritor** do grafo. No boot, o
+plugin **não coleta**: ele **invoca o CLI em `auto`** (background: `full` no 1º
+uso, `incremental` depois) e instala **hooks git** (`post-commit`/`post-checkout`/
+`post-merge`/`post-rewrite`, idempotentes, **sem** `core.hooksPath`). Um commit
+com o Kilo aberto atualiza o grafo sem reiniciar: o hook dispara o CLI, que roda
+o **incremental** — guardado por um **sentinela** (`.kilo/graph-ready`, só arma
+após o full inicial), pela **guarda de ancestralidade** (`merge-base --is-ancestor`
+→ senão `full`) e por uma **trava cross-process** (`O_EXCL`). Deleções entram no
+incremental via `git diff --diff-filter=D` (`chunks: []`). Delta **por commit**;
+mudanças não-commitadas ficam fora (FR-507). Ver
+[`docs/rfc/002`](docs/rfc/002-sync-de-delta-em-runtime.md).
+
 ## Não-objetivos
 
 - Implementar o provider de memória (é do **memtier**).

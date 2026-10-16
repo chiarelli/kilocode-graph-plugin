@@ -296,3 +296,13 @@ distinguível do boot; marca o delta como `incremental`/`full` e o gatilho.
   `post-commit`/…), `mode`, `trigger`, `indexer_ms`, `files`, `edges`, `removed`
   e o bloco `sync={…}` (ou `sync=skipped reason=…`). O CLI injeta o `source` no
   runtime; base do E7.
+- **2026-10-16 (g) — S6d (fechamento).** E2E gated
+  `tests/e2e/test_e2e_runtime_delta.test.ts`: repo git **real** + `installHooks`
+  → primeiro boot (full) indexa; um `git commit` dispara o **hook** → CLI
+  (incremental) e o símbolo novo aparece no grafo (efeito conferido do outro
+  lado, por polling — o retorno da chamada não é a evidência); `git rm` + commit
+  ⇒ o arquivo sai (`chunks: []`). Docs alinhadas (README/ARCHITECTURE/src-README/
+  RUNBOOK-E2E); `RFC-002` marcado **implementado**; `E3a-S6` fechado no
+  `BACKLOG.md`. `bun run typecheck` limpo; `npm test` verde; `E2E=1` verde
+  (20/20); `rg "TODO\(tracer-bullet\)" src/` = **zero**. (O binário do indexer
+  precisa de `--features parsing` — anotado no runbook.)

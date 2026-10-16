@@ -14,27 +14,33 @@ forma e contratos. O que existe hoje em `src/` é `index.ts`, `config.ts`,
 
 ```
 src/
-├── index.ts              # registro dos hooks + coleta no boot + registro MCP + provisionamento
-├── config.ts             # graph-plugin.json (do workspace) + env vars
-├── provision.ts          # ⬅ NOVO — cria o workspace memtier 1:1 e grava .kilo/graph-key.json
+├── index.ts              # registro dos hooks + INVOCA o CLI no boot (background) + instala hooks git + MCP + provisionamento
+├── cli.ts                # ⬅ NOVO (E3a-S6) — CLI standalone: ÚNICO escritor do grafo (full+incremental)
+├── cli-spawn.ts          # ⬅ NOVO (E3a-S6) — o boot spawna o CLI em `auto` (destacado, fire-and-forget)
+├── token-file.ts         # ⬅ NOVO (E3a-S6) — resolve/confinamento do token_file (boot × CLI)
+├── config.ts             # graph-plugin.json (do workspace) + env vars + estado persistido (graph-config.json)
+├── provision.ts          # cria o workspace memtier 1:1 e grava .kilo/graph-key.json
 ├── client.ts             # HTTP client do memtier
 ├── workspace.ts          # diretório → nome lógico
 ├── inject/
 │   ├── memory.ts
 │   ├── code.ts
 │   └── budget.ts
-├── ingest/               # ⬅ NOVO (E4) — a INGESTÃO (conteúdo vem do kilo.db)
+├── ingest/               # (E4) — a INGESTÃO (conteúdo vem do kilo.db)
 │   ├── db.ts             # localiza o kilo.db; lê message+part; cursor (ts,id)
 │   ├── batch.ts          # lote, hash djb2, reference_time, limiar
 │   ├── state.ts          # .kilo/graph-ingest.json (hashes + cursor; atômico)
 │   └── routine.ts        # a rotina única: lê, decide, envia; trava por sessão
-├── index/                # ⬅ NOVO (E3a) — o COLETOR
+├── index/                # (E3a) — o COLETOR (chamado pelo CLI)
 │   ├── runner.ts         # spawn do rust_indexer; JSONL; pause/resume
 │   ├── collector.ts      # eventos → files[]/edges[]
 │   ├── edges.ts          # import/call → to_file/to_symbol_id (alvo existe?)
-│   ├── manifest.ts       # estado por workspace → detecta removidos (chunks: [])
-│   └── trigger.ts        # híbrido: full no 1º uso; incremental depois
-├── mcp/                  # ⬅ NOVO (E3b) — registro do MCP do memtier
+│   ├── manifest.ts       # estado por workspace → detecta removidos (chunks: []); tmp por processo
+│   ├── trigger.ts        # híbrido: full no 1º uso; incremental depois + guarda de ancestralidade + sentinela
+│   ├── git.ts            # ⬅ NOVO (E3a-S6) — porta de git (HEAD, ancestry, removidos, hooks dir)
+│   ├── lock.ts           # ⬅ NOVO (E3a-S6) — trava cross-process (O_EXCL) + reclaim de órfão
+│   └── install-hooks.ts  # ⬅ NOVO (E3a-S6) — instala os hooks git (idempotente, sem core.hooksPath)
+├── mcp/                  # (E3b) — registro do MCP do memtier
 │   ├── register.ts       # client.mcp.add(type:remote) + connect; implícito
 │   └── kilo-config.ts    # lê kilo.jsonc (JSONC) → override (idempotência)
 └── adapters/
@@ -61,22 +67,41 @@ class MemtierClient {
 // fatia `limit` em 50 (MAX_SEARCH_LIMIT) e NUNCA envia `labels` (lista vazia é 422).
 ```
 
-### `index/` (E3a — implementado)
+### `index/` (E3a — implementado; delta em runtime na E3a-S6)
 ```ts
-runIndexer(opts): Promise<{ events; skipped; reason? }>  // spawn + JSONL + ack/resume
+runIndexer(opts): Promise<{ events; skipped; reason?; error? }>  // spawn + JSONL + ack/resume
 buildSyncBody(events, identity, opts?): { workspace, program, files, edges }
 resolveEdges(imports, calls, files): CodeEdge[]           // alvo E origem existem, senão descarta
-loadManifest/saveManifest/removedFiles/mergeManifest      // estado por workspace (atômico)
-decideTrigger(manifest): { mode, gitRange? }              // full no 1º uso; incremental depois
+loadManifest/saveManifest/removedFiles/mergeManifest      // estado por workspace (atômico); tmp por PID
+decideTrigger(manifest, { isAncestor? }): { mode, gitRange? }  // full no 1º uso; incremental só se ancestral (§4)
+shouldWaitForReady(decision, ready): boolean              // gate do sentinela `graph-ready` (§3)
+createGitPort(exec?): GitPort   // HEAD/isAncestor/deletedFiles/hooksDir (injetável)
+acquireLock({ path, … }): Promise<LockHandle|null>  // trava cross-process O_EXCL + reclaim de órfão
+installHooks({ repoRoot, cliPath, git, io? }): InstallHooksResult  // idempotente, sem core.hooksPath
 // FullFile sintético quando o indexer só emitiu Symbol (habilita import_edge).
-// Removidos (`chunks: []`) só no FULL (o incremental só traz os alterados).
+// Removidos: no FULL = manifest−present; no INCREMENTAL = git diff --no-renames --diff-filter=D.
+// Config persistida (§7): `persistConfigState`/`loadConfigState` (sem segredos).
+```
+
+### `cli.ts` (E3a-S6 — implementado)
+```ts
+// node src/cli.ts --workspace <repo-root> --mode auto --source <boot|post-commit|…>
+// CLI standalone: ÚNICO escritor do grafo. Resolve a MESMA config do boot (§7),
+// guarda de sentinela + ancestralidade, trava cross-process; CHAMA `collectCode`.
+// O boot o spawna em `auto` (destacado) — o plugin NÃO coleta (E3a-S6 §1b).
+parseArgs(argv): CliArgs | { error }   // --workspace obrigatório
+runCli(args, deps?): Promise<number>   // exit code; nunca lança
 ```
 
 ### `hooks/collect.ts` (E3a — implementado)
 ```ts
-collectHook(rt): { boot: Promise<void> }   // dispara no boot, fora do turno (FR-510)
-// nunca lança; degrada em indexer/sync fora do ar. Log de observabilidade:
-// `collect indexer_ms=… files=… edges=… removed=… sync={…}`.
+collectCode(rt): Promise<SyncResult|null>   // decide trigger, roda, monta body, sincroniza
+// `rt.git` habilita guarda de ancestralidade + removidos no incremental; `rt.lockPath`
+// serializa entre processos; `rt.ready` é o gate do sentinela; `rt.onFullComplete`
+// arma o incremental. Nunca lança; degrada em indexer/sync fora do ar.
+formatCollectLine({ source, mode, trigger, indexer_ms, files, edges, removed, sync? })
+// Log de observabilidade (S6c): `collect source=… mode=… trigger=… indexer_ms=… files=…
+// edges=… removed=… sync={upserted,deleted,changed,skipped}` (ou `sync=skipped reason=…`).
 ```
 
 ### `mcp/register.ts` + `mcp/kilo-config.ts` (E3b — implementado; endurecido no E3b-S4)

@@ -61,17 +61,16 @@ Convenções válidas para todas as epics:
 - [x] **E3a-S3** — Ciclo de vida: manifest por workspace → removidos com `chunks: []`; idempotência por `chunk_md5`
 - [x] **E3a-S4** — Trigger híbrido + backpressure (`pause`/`resume`) + paginação do sync
 - [x] **E3a-S5** — Fechamento: E2E do ciclo de vida real, docs, zero marcadores
-- [ ] **E3a-S6** — **Sync de delta em runtime** (decisão: [ADR-011](docs/adr/011-gatilho-do-delta-em-runtime.md) · spec: [`specs/e3a-s6-stories.md`](specs/e3a-s6-stories.md)):
-      hoje `collectCode` só roda **no boot**; commit com o Kilo
-      aberto só entra no grafo após reiniciar. **Decidido (Opção A):** gatilho por
-      **hook git pós-commit** (`post-commit`/`post-checkout`/`post-merge`/
-      `post-rewrite`, instalados no boot de forma **idempotente**, **sem**
-      `core.hooksPath`) → **CLI standalone** (`src/cli.ts`, fire-and-forget) →
-      incremental; **sentinela** `.kilo/graph-ready` (só arma o incremental **depois** do
-      full inicial); **guarda de ancestralidade** (`merge-base --is-ancestor`); **removidos no
+- [x] **E3a-S6** — **Sync de delta em runtime** (decisão: [ADR-011](docs/adr/011-gatilho-do-delta-em-runtime.md) · spec: [`specs/e3a-s6-stories.md`](specs/e3a-s6-stories.md) · achado: [RFC-002](docs/rfc/002-sync-de-delta-em-runtime.md)):
+      o gatilho por **hook git pós-commit** (`post-commit`/`post-checkout`/
+      `post-merge`/`post-rewrite`, instalados no boot de forma **idempotente**,
+      **sem** `core.hooksPath`) → **CLI standalone** (`src/cli.ts`,
+      fire-and-forget) → incremental; **sentinela** `.kilo/graph-ready`;
+      **guarda de ancestralidade** (`merge-base --is-ancestor`); **removidos no
       incremental** (`--diff-filter=D`). Delta **por commit** (não-commitado fica
-      fora — FR-507). Stories S6a–S6d na spec.
-      - [x] **E3a-S6a** — *in progress (tracer)*: hook git + CLI `src/cli.ts` +
+      fora — FR-507). O **CLI é o único escritor** (o plugin não coleta; o boot
+      invoca em `auto` e instala hooks). Stories S6a–S6d na spec.
+      - [x] **E3a-S6a** — tracer: hook git + CLI `src/cli.ts` +
         `install-hooks.ts` + trava cross-process (`O_EXCL`) + sentinela +
         ancestralidade + removidos no incremental + config persistida (§7);
         boot **invoca o CLI em `auto`** (híbrido) e instala hooks — **não** coleta
@@ -83,7 +82,9 @@ Convenções válidas para todas as epics:
       - [x] **E3a-S6c** — observabilidade do delta: `formatCollectLine` com
         `source`/`mode`/`trigger`/`indexer_ms`/`files`/`edges`/`removed`/`sync`
         (base do E7)
-      - [ ] **E3a-S6d** — fechamento (E2E gated, docs, zero marcadores)
+      - [x] **E3a-S6d** — fechamento: E2E gated (`test_e2e_runtime_delta` —
+        commit real → delta no grafo; `git rm` → sai com `chunks: []`), docs e
+        zero marcadores `TODO(tracer-bullet)`
 
 ### E3b — Registro do MCP do memtier
 - [x] **E3b-S1** — Tracer bullet: registrar o MCP remoto no boot (`status`→`add`→`connect`)

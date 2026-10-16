@@ -1,9 +1,10 @@
 # RFC-002 — O delta de código é coletado só no boot (não há sync incremental em runtime)
 
-**Status:** **decidido** (Opção A — sync de delta em runtime) · **Data:** 2026-10-16
+**Status:** **implementado** (Opção A — sync de delta em runtime) · **Data:** 2026-10-16
 **Decisão:** [ADR-011](../adr/011-gatilho-do-delta-em-runtime.md) (hook git
 pós-commit + CLI standalone) · **Spec:** [`specs/e3a-s6-stories.md`](../../specs/e3a-s6-stories.md)
-· **Ticket:** `E3a-S6` (implementação pendente)
+· **Ticket:** `E3a-S6` (**fechado**: S6a–S6d implementadas; E2E
+`tests/e2e/test_e2e_runtime_delta.test.ts` verde)
 **Autor:** verificação empírica (workspace `workspace-8af22c44`, programa `graphplugin`)
 **Componentes afetados:** este plugin (`src/hooks/collect.ts`, `src/index.ts`, `src/index/trigger.ts`)
 **Relacionados:** [ADR-005](../adr/005-plugin-e-o-coletor.md) (o plugin é o coletor), [ADR-007](../adr/007-gatilho-da-ingestao.md) (gatilho da **ingestão** de memória — não do código), [RFC-001](001-navegacao-e-integridade-do-grafo-de-codigo.md)
@@ -230,6 +231,25 @@ provavelmente acidental, não uma decisão desenhada.
 | Item | Dono | Ação |
 |---|---|---|
 | 1. Definir: runtime delta ou boot-only | dono | ✅ **decidido: Opção A** (runtime), via hook git — [ADR-011](../adr/011-gatilho-do-delta-em-runtime.md) |
-| 2. Se A: **ticket de sync de delta em runtime** | este plugin | ✅ **criado**: `E3a-S6`, especificado em [`specs/e3a-s6-stories.md`](../../specs/e3a-s6-stories.md) (S6a–S6d); **implementação pendente** |
+| 2. Se A: **ticket de sync de delta em runtime** | este plugin | ✅ **implementado**: `E3a-S6` (S6a–S6d) — CLI standalone + hooks git; E2E verde |
 | 3. Corrigir o BACKLOG | este plugin | ✅ feito (o item afirma que `incremental_index` não roda `git diff` — falsificado) |
-| 4. Deleção no incremental | este plugin | ✅ **decidido**: tratar removidos no incremental (`--diff-filter=D`), na S6a |
+| 4. Deleção no incremental | este plugin | ✅ **implementado**: removidos no incremental (`git diff --no-renames --diff-filter=D` → `chunks: []`), na S6a |
+
+## Fechamento (2026-10-16)
+
+Implementado por [`E3a-S6`](../../specs/e3a-s6-stories.md) (S6a–S6d), na ordem
+declarada. Resumo do entregue:
+
+- **S6a** — CLI standalone (`src/cli.ts`), instalador de hooks
+  (`src/index/install-hooks.ts`), trava cross-process (`src/index/lock.ts`),
+  porta de git (`src/index/git.ts`); o boot **invoca o CLI em `auto`** e instala
+  os hooks (não coleta). Paridade de config boot×CLI (§7).
+- **S6b** — `--workspace` resolvido em runtime (`--show-toplevel`) para
+  worktrees; degradações (não-git, indexer vazio, manifest corrompido→full,
+  working tree fora, trava CLI×CLI).
+- **S6c** — observabilidade: `formatCollectLine` com
+  `source`/`mode`/`trigger`/`indexer_ms`/`files`/`edges`/`removed`/`sync`.
+- **S6d** — E2E gated `test_e2e_runtime_delta`: um `git commit` REAL atualiza o
+  grafo (incremental) e um `git rm` faz o arquivo sair (`chunks: []`).
+
+A RFC-001 (navegação/`import (`/`uuid`) permanece fora deste escopo (outro dono).

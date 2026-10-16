@@ -30,7 +30,13 @@ D-1/D-2 abaixo).
 | `E2E_INGEST_TOKEN` | (fallback `E2E_TOKEN`) | `alfa` / `default` | `ingest` (opcional; o padrão cai em `E2E_TOKEN`) |
 | `E2E_CODE_TOKEN` | `e2e-tok-b` | `beta` / `default` | `collector`, `inject_code` |
 | `E2E_MCP_TOKEN` | bearer de `.kilo/graph-key.json` | `kilocode-graph-plugin` / `graphplugin` | `mcp` |
+| `E2E_DELTA_TOKEN` | `e2e-delta-tok` (default) | `delta-e2e` / `default` | `runtime_delta` (S6d) |
 | — | — | — | `health` (sem token) |
+
+> O binário do indexer **precisa** ser buildado com `--features parsing` (senão
+> só emite `FullFile`, sem `Symbol`/`call_edge`, e a navegação do E2E do coletor
+> falha sem relação com o plugin):
+> `cd rust_indexer && cargo build --release --bins --features parsing`.
 
 > ⚠️ **A suíte `ingest` é lenta** (o worker do memtier é **serial**,
 > `add_episode` ~70–115 s/job) e enfileira vários jobs: reserve ~5–10 min para
@@ -51,6 +57,12 @@ E2E=1 E2E_INGEST_TOKEN=e2e-tok-a node --test tests/e2e/test_e2e_ingest.test.ts  
 # beta
 E2E=1 E2E_CODE_TOKEN=e2e-tok-b node --test tests/e2e/test_e2e_collector.test.ts   # 1/1
 E2E=1 E2E_CODE_TOKEN=e2e-tok-b node --test tests/e2e/test_e2e_inject_code.test.ts # 1/1
+
+# delta em runtime (E3a-S6d): token PRÓPRIO (escopo `delta-e2e`), pois o bearer é
+# escopado ao nome EXATO do workspace. O stack define o token via
+# `MEMTIER_API_TOKENS={"e2e-delta-tok":["delta-e2e"], ...}`; `E2E_DELTA_TOKEN`
+# sobrescreve o default. Roda contra repo git real (hook → CLI → incremental).
+E2E=1 E2E_DELTA_TOKEN=e2e-delta-tok node --test tests/e2e/test_e2e_runtime_delta.test.ts # 1/1
 
 # alfa — S2 (ADR-009 Bloco A): tetos de tokens por endpoint
 E2E=1 E2E_TOKEN=e2e-tok-a node --test tests/e2e/test_e2e_inject_limits.test.ts   # 3/3

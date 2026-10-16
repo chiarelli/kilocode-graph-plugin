@@ -13,6 +13,12 @@
 > resolve arestas e chama `/v1/code/sync`. Também alinha o contrato com o estado
 > real do memtier (`sync`, `neighbors`, `program`, `max_tokens`, `/v1/mcp`).
 > Ver ADR-005 (coletor) e ADR-006 (push vs pull).
+>
+> **Delta 0.3 (E3a-S6).** O **gatilho** sai do plugin: o **CLI standalone** vira o
+> **único escritor** e o delta roda por **hook git pós-commit** (ver §"Gatilho em
+> runtime" abaixo e [ADR-011](adr/011-gatilho-do-delta-em-runtime.md)). O plugin
+> segue dono da **tradução** (agrupar/arestas/sync) — ela agora vive no CLI, que
+> chama `collectCode`.
 
 ---
 
@@ -198,26 +204,32 @@ validada por middleware **antes** de qualquer tool (sem token → 401; IAM down 
 
 ```
 src/
-├── index.ts              # registro dos hooks + disparo do coletor + registro MCP
-├── config.ts             # plugin.yaml + env vars (nada hardcoded)
+├── index.ts              # registro dos hooks + INVOCA o CLI no boot + instala hooks git + registro MCP
+├── cli.ts                # ⬅ NOVO (E3a-S6) — CLI standalone: único escritor do grafo
+├── cli-spawn.ts          # ⬅ NOVO (E3a-S6) — spawn do CLI no boot (destacado)
+├── token-file.ts         # ⬅ NOVO (E3a-S6) — resolve/confinamento do token_file
+├── config.ts             # plugin.yaml + env vars + estado persistido (graph-config.json)
 ├── client.ts             # HTTP client do memtier (timeout, retry, auth)
 ├── workspace.ts          # diretório do projeto → nome lógico
 ├── inject/
 │   ├── memory.ts         # formata o bloco de memória
 │   ├── code.ts           # formata o bloco de código
 │   └── budget.ts         # maxMemories / maxCodeChunks (corte de contagem)
-├── ingest/               # ⬅ NOVO (E4) — a INGESTÃO (o conteúdo vem do banco)
+├── ingest/               # (E4) — a INGESTÃO (o conteúdo vem do banco)
 │   ├── db.ts             # localiza o kilo.db; lê message+part; cursor (ts,id)
 │   ├── batch.ts          # monta o lote, hash djb2, reference_time, limiar
 │   ├── state.ts          # .kilo/graph-ingest.json (sentBatchHashes + cursor)
 │   └── routine.ts        # a rotina única: lê, decide, envia; trava por sessão
-├── index/                # ⬅ NOVO (E3a) — o COLETOR
+├── index/                # (E3a) — o COLETOR (chamado pelo CLI)
 │   ├── runner.ts         # spawn do rust_indexer; consome JSONL; trata pause/resume
 │   ├── collector.ts      # eventos → files[]/edges[] (agrupa por arquivo)
 │   ├── edges.ts          # import_edge/call_edge → to_file/to_symbol_id (alvo existe?)
-│   ├── manifest.ts       # estado por workspace → detecta removidos (chunks: [])
-│   └── trigger.ts        # híbrido: full no 1º uso; incremental_index depois
-├── mcp/                  # ⬅ NOVO (E3b) — registro do MCP do memtier
+│   ├── manifest.ts       # estado por workspace → detecta removidos (chunks: []); tmp por PID
+│   ├── trigger.ts        # híbrido + guarda de ancestralidade + gate do sentinela
+│   ├── git.ts            # ⬅ NOVO (E3a-S6) — porta de git (HEAD/ancestry/removidos/hooks dir)
+│   ├── lock.ts           # ⬅ NOVO (E3a-S6) — trava cross-process (O_EXCL)
+│   └── install-hooks.ts  # ⬅ NOVO (E3a-S6) — instala hooks git (idempotente, sem core.hooksPath)
+├── mcp/                  # (E3b) — registro do MCP do memtier
 │   └── register.ts       # client.mcp.add(type:remote) + connect; implícito
 └── adapters/
     ├── kilo.ts           # referência (hooks JS)
@@ -249,19 +261,40 @@ rust_indexer (JSONL stdio)
 O `manifest.ts` guarda, por workspace, o conjunto de arquivos já sincronizados —
 para mandar `chunks: []` aos que sumiram (FR-504) e para saber se é o 1º sync. O
 `trigger.ts` decide full (`index_path`) vs incremental (`incremental_index` +
-`git_range`) (FR-507).
+`git_range`), agora com a **guarda de ancestralidade** (§4) e o **gate do
+sentinela** (FR-507).
 
 > ⚠️ **O `rust_indexer` não tem watch mode** (verificado 2026-10-14: sem crate de
 > watch no `Cargo.toml`; 9 comandos, nenhum `watch`; `cli/args.rs` só aceita
-> `--mcp`/`--quiet`). O indexer é **pull**: o plugin decide quando rodar. A
-> detecção de mudança é do plugin, e o modo incremental só cobre o que o **git**
-> vê — **mudanças não-commitadas não entram** no MVP.
+> `--mcp`/`--quiet`). O indexer é **pull**: o CLI decide quando rodar. A detecção
+> de mudança é por **commit** (hook git), e o modo incremental só cobre o que o
+> **git** vê — **mudanças não-commitadas não entram** no MVP (FR-507).
 
-> ⏳ **Gatilho em runtime (decidido, não implementado).** Hoje a coleta roda **só
-> no boot** (único call site; sem watcher/timer). O delta em runtime — **hook git
-> pós-commit → CLI standalone** — está decidido em
-> [ADR-011](adr/011-gatilho-do-delta-em-runtime.md) e especificado em
-> [`specs/e3a-s6-stories.md`](../specs/e3a-s6-stories.md) (ticket `E3a-S6`).
+**Gatilho em runtime (E3a-S6 — implementado).** O **CLI standalone**
+(`src/cli.ts`) é o **único escritor** do grafo ([ADR-011](adr/011-gatilho-do-delta-em-runtime.md)).
+No boot o plugin **não coleta**: **invoca o CLI em `auto`** (híbrido — `full` no
+1º uso, `incremental` depois; **não** full fixo) em background e **instala os
+hooks git** em `git rev-parse --git-path hooks` (resolvendo o caminho relativo;
+**sem** `core.hooksPath`; idempotente; nunca sobrescreve hook do usuário; o script
+resolve o `--workspace` por `--show-toplevel`, cobrindo worktrees). Hooks:
+`post-commit`/`post-checkout`/`post-merge`/`post-rewrite` → CLI (destacado,
+fire-and-forget) → incremental → `/v1/code/sync`:
+
+- **Sentinela** `.kilo/graph-ready`: o incremental só roda depois do full inicial
+  (que o cria) — fecha a corrida de um commit durante o full.
+- **Guarda de ancestralidade**: `git merge-base --is-ancestor <last> HEAD`; não
+  ancestral (checkout para trás/rebase) ⇒ `full`.
+- **Removidos no incremental**: `git diff --no-renames --diff-filter=D` =
+  `chunks: []`.
+- **Trava cross-process** (`O_EXCL`, `.kilo/graph.lock`) + **tmp por processo** no
+  manifest: boot e commit são **processos SO distintos**.
+- **Paridade de config (§7)**: no boot o plugin grava a `Config` efetiva (sem
+  segredos) em `.kilo/graph-config.json`; o CLI a lê — o CLI standalone não vê o
+  `options` inline do `kilo.jsonc` (o plugin é carregado pelo **runtime Kilo**,
+  não pelo `kilo.jsonc` deste repo).
+
+Referência: [`specs/e3a-s6-stories.md`](../specs/e3a-s6-stories.md) (S6a–S6d) e
+[`docs/rfc/002`](rfc/002-sync-de-delta-em-runtime.md).
 
 Referência validada (probe-grade, portar): `~/spikes/010-navegabilidade-codigo/probe_e2e_lifecycle.py`
 (`montar_body`, resolução de módulo Rust, materialização de `FullFile`).
@@ -534,13 +567,18 @@ Log por lote de ingestão (E4) — fora do turno:
   "accepted_not_confirmed": true }
 ```
 
-Log por ciclo de coleta (E3a) — separa o trabalho do turno:
+Log por ciclo de coleta (E3a; com o `source` do gatilho na E3a-S6c) — separa o
+trabalho do turno:
 
-```json
-{ "collect": "incremental", "indexer_ms": 412, "files": 12, "edges": 30,
-  "sync": { "upserted": 9, "deleted": 2, "changed": 9, "skipped": 40 },
-  "removed": ["src/old.rs"] }
 ```
+collect source=post-commit mode=incremental trigger=auto indexer_ms=412
+        files=12 edges=30 removed=2
+        sync={upserted:9,deleted:2,changed:9,skipped:40}
+```
+
+O `source` (`boot`/`post-commit`/`post-checkout`/`post-merge`/`post-rewrite`)
+distingue o delta de runtime da coleta de boot; quando não há sync, a linha traz
+`sync=skipped reason=<…>` (sentinela, indexer vazio, erro fatal, trava).
 
 Sem isso é impossível calibrar os limiares do §5 — e a suspeita de que a injeção
 está piorando as respostas fica sem evidência.
