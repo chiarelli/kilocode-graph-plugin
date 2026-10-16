@@ -16,64 +16,90 @@
 
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 
-import { debug, log, logFatal } from "../logger.ts";
+import { debug } from "../logger.ts";
 
 /** Nome do arquivo do banco de sessões do Kilo (fixo por decisão do runtime). */
 export const KILO_DB_FILENAME = "kilo.db";
 
-/**
- * Fallback determinístico quando o runtime não responde: é o **próprio default
- * do runtime** no Linux (`~/.local/share/kilo/kilo.db`). Nunca é um caminho
- * inventado pelo plugin — apenas a última reserva se `GET /path` falhar.
- */
-export const DEFAULT_DB_PATH = join(homedir(), ".local/share", "kilo", KILO_DB_FILENAME);
-
-/**
- * Porta mínima de `client.path` do Kilo (o runtime expõe `GET /path` → diretórios
- * de estado/config do workspace). Estrutural: um fake em teste a implementa.
- */
-export interface RuntimePathClient {
-  path?: {
-    get(opts: { query: { directory: string } }): Promise<{
-      data?: { state?: unknown };
-      error?: unknown;
-    }>;
-  };
+/** Subconjunto de env que o runtime consulta para localizar o `kilo.db`. */
+export interface RuntimeEnv {
+  XDG_DATA_HOME?: string;
+  KILO_DB?: string;
 }
 
 /**
- * Resolve o caminho do `kilo.db` a partir do **runtime do Kilo** — o valor que o
- * runtime já determinou no boot (nunca `process.cwd()`, nunca env var). O
- * diretório de estado vem de `client.path.get().state`; o banco é
- * `<state>/kilo.db`. **Nunca lança** (NFR-03): sem a API do client, resposta
- * inválida ou erro ⇒ log e fallback para o default do runtime.
+ * Diretório de **dados** do runtime (`Path.data`), do qual o `kilo.db` deriva.
+ * Replica a regra do binário do Kilo:
+ *
+ *   `data = join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "kilo")`
+ *
+ * **Não** é `Path.state` (`~/.local/state/kilo`): o runtime guarda o banco em
+ * `data`, e `GET /path` — que o plugin antes consultava — só expõe `state`,
+ * `config`, `worktree` e `directory` (nunca `data`). Derivar de `state` apontava
+ * para um diretório sem `kilo.db`. O plugin roda **no mesmo processo** do runtime
+ * e herda o `process.env`, então esta é a própria fonte de verdade do runtime.
  */
-export async function resolveRuntimeDbPath(
-  client: RuntimePathClient | undefined,
-  directory: string,
-): Promise<string> {
-  const pathApi = client?.path;
-  if (!pathApi) {
-    debug("ingest: client.path indisponível; usando o db default do runtime");
-    return DEFAULT_DB_PATH;
+export function runtimeDataDir(
+  env: RuntimeEnv = process.env,
+  home: string = homedir(),
+): string {
+  const xdg = env.XDG_DATA_HOME?.trim();
+  const base = xdg && isAbsolute(xdg) ? xdg : join(home, ".local", "share");
+  return join(base, "kilo");
+}
+
+/**
+ * Caminho do `kilo.db` **como o runtime o registra** — sem heurística nem
+ * fallback inventado pelo plugin. Regra do binário do Kilo:
+ *
+ *   - `KILO_DB` setado: `:memory:` ou caminho absoluto ⇒ usado como está;
+ *     caso contrário, relativo a `Path.data`;
+ *   - sem `KILO_DB`: `join(Path.data, "kilo.db")`.
+ *
+ * `Path.data` = `XDG_DATA_HOME ?? ~/.local/share` + `/kilo`. `XDG_DATA_HOME`
+ * deve ser **absoluto**; um valor relativo é ignorado (cairia no cwd do daemon e
+ * apontaria para o lugar errado).
+ *
+ * `KILO_DB` relativo é resolvido com `join(Path.data, KILO_DB)` **sem
+ * sanitização de `..`** — espelha a regra do runtime. O plugin não inventa uma
+ * política própria: se o runtime apontar o banco para outro lugar via `KILO_DB`,
+ * o plugin deve ler o MESMO arquivo (`KILO_DB` é env do próprio runtime, não
+ * entrada não-confiável de rede). Divergir aqui apontaria para um banco que o
+ * runtime não usa.
+ */
+export function defaultDbPath(
+  env: RuntimeEnv = process.env,
+  home: string = homedir(),
+): string {
+  const data = runtimeDataDir(env, home);
+  const kiloDb = env.KILO_DB?.trim();
+  if (kiloDb) {
+    if (kiloDb === ":memory:" || isAbsolute(kiloDb)) return kiloDb;
+    return join(data, kiloDb);
   }
-  try {
-    const res = await pathApi.get({ query: { directory } });
-    const state = res.data?.state;
-    if (typeof state === "string" && state.trim() !== "") {
-      const dbPath = join(state, KILO_DB_FILENAME);
-      debug(`ingest: db do runtime resolvido em ${dbPath}`);
-      return dbPath;
-    }
-    log(
-      "ingest: `client.path.get` não devolveu `state`; usando o db default do runtime",
-    );
-  } catch (err) {
-    logFatal("ingest resolve db path", err);
-  }
-  return DEFAULT_DB_PATH;
+  return join(data, KILO_DB_FILENAME);
+}
+
+/**
+ * Caminho default do `kilo.db` na instância corrente do runtime. Mantido como
+ * constante para compatibilidade; o valor é calculado uma vez no carregamento
+ * (o env do runtime é estável durante a vida do processo).
+ */
+export const DEFAULT_DB_PATH = defaultDbPath();
+
+/**
+ * Resolve o caminho do `kilo.db` **a partir do runtime do Kilo**. O plugin roda
+ * in-process, então a resolução é a própria regra do runtime (`defaultDbPath`),
+ * aplicada ao `process.env` herdado — nunca `process.cwd()` nem um caminho
+ * derivado de `Path.state`. Síncrona e sem I/O: não bloqueia o boot nem depende
+ * de rede (o `await` de `client.path.get` no boot travava o `server()`).
+ */
+export function resolveRuntimeDbPath(env: RuntimeEnv = process.env): string {
+  const dbPath = defaultDbPath(env);
+  debug(`ingest: db do runtime resolvido em ${dbPath}`);
+  return dbPath;
 }
 
 /** Um resultado cru do SQLite (coluna → valor). */
@@ -186,9 +212,22 @@ export interface BackendProvider {
   close(): void;
 }
 
+/**
+ * Fonte do caminho do `kilo.db`: uma string fixa **ou** um resolvedor lazy.
+ *
+ * O resolvedor é aceito por dois motivos: (a) desacopla a resolução do boot —
+ * um resolver que consulte o runtime não trava o `server()` do plugin (deadlock
+ * medido quando a resolução aguardava rede no boot); (b) permite resolver **sem
+ * I/O** (`resolveRuntimeDbPath`, a regra do runtime aplicada ao env herdado) na
+ * primeira abertura do backend, fora do caminho crítico. Aceita resolver
+ * **síncrono ou assíncrono** (`string | Promise<string>`): a resolução in-process
+ * é síncrona e não deve pagar o custo/risco de virar `Promise`.
+ */
+export type DbPathSource = string | (() => string | Promise<string>);
+
 /** Provedor real (abre `dbPath` sob demanda); `open`/`onError` injetáveis. */
 export function createBackendProvider(
-  dbPath: string,
+  dbPath: DbPathSource,
   opts: {
     open?: (p: string) => Promise<SqliteBackend>;
     onError?: (err: unknown) => void;
@@ -201,7 +240,9 @@ export function createBackendProvider(
     get: async () => {
       if (current) return current;
       if (!inflight) {
-        inflight = open(dbPath)
+        inflight = Promise.resolve()
+          .then(() => (typeof dbPath === "function" ? dbPath() : dbPath))
+          .then((resolved) => open(resolved))
           .then((b) => {
             current = b;
             return b;

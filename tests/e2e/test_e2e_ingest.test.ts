@@ -51,15 +51,18 @@ const BATCH = 20;
 const WORKER_TIMEOUT_MS = Number(process.env.E2E_INGEST_WORKER_MS ?? 480000);
 
 /**
- * Fake do runtime do Kilo: `client.path.get` devolve o **diretório de estado**
- * do workspace (onde vive o `kilo.db`). É a fonte real do caminho do banco — o
- * plugin o resolve por aqui, não por env var/config.
+ * Fake do runtime do Kilo: `client.path.get` devolve o shape REAL do SDK
+ * (`{state, config, worktree, directory}` — não há `data`). O plugin **não** usa
+ * este caminho para o `kilo.db`: a fonte é a regra do runtime (`Path.data` +
+ * `KILO_DB`), então o teste aponta o banco via `process.env.KILO_DB` (ver o
+ * `server(...)` de cada caso). O fake existe só para o boot não quebrar quando
+ * consulta `path.get`.
  */
 function runtimeClient(stateDir: string) {
   return {
     path: {
       get: async (_opts: { query: { directory: string } }) => ({
-        data: { state: stateDir },
+        data: { state: stateDir, config: stateDir, worktree: null, directory: stateDir },
       }),
     },
   };
@@ -164,6 +167,7 @@ test(
     );
     const sessionId = `ses_e2e_${Date.now().toString(36)}`;
     const marker = `ORION_${Date.now().toString(36)}`;
+    process.env.KILO_DB = dbPath;
     await createKiloDb(dbPath, sessionId, marker);
 
     // Derivado = `<stem>-<sha1 8>`; o token legado é escopado ao nome EXATO, então
@@ -208,6 +212,7 @@ test(
       assert.ok(found, `episódio não apareceu no grafo (marcador ${marker})`);
     } finally {
       await hooks.dispose?.();
+      delete process.env.KILO_DB;
       rmSync(base, { recursive: true, force: true });
     }
   },
@@ -230,6 +235,7 @@ test(
       JSON.stringify({ token: TOKEN, workspace: WS, program: PROGRAM }),
     );
     const sessionId = `ses_e2e_${Date.now().toString(36)}`;
+    process.env.KILO_DB = dbPath;
     await createKiloDb(dbPath, sessionId, `ORION_${Date.now().toString(36)}`);
 
     const hooks = await pluginModule.server(
@@ -264,6 +270,7 @@ test(
       assert.equal(JSON.parse(after2).sentBatchHashes.length, 1, "não deve reenviar");
     } finally {
       await hooks.dispose?.();
+      delete process.env.KILO_DB;
       rmSync(base, { recursive: true, force: true });
     }
   },
@@ -298,6 +305,7 @@ test(
     const marker = `VEGA_${Date.now().toString(36)}`;
     // 23 mensagens; o marcador vai na ÚLTIMA (índice 22, dentro do resto de 3)
     // para provar que o resto — e não só o lote cheio — foi ingerido.
+    process.env.KILO_DB = dbPath;
     await createKiloDb(dbPath, sessionId, marker, 23, 22);
 
     const hooks = await pluginModule.server(
@@ -339,6 +347,7 @@ test(
       assert.ok(await waitForFact(marker), "o resto deve aparecer no grafo");
     } finally {
       await hooks.dispose?.();
+      delete process.env.KILO_DB;
       rmSync(base, { recursive: true, force: true });
     }
   },
@@ -378,6 +387,7 @@ test(
     );
     const sessionId = `ses_e2e_${Date.now().toString(36)}`;
     const marker = `ZENITH_${Date.now().toString(36)}`;
+    process.env.KILO_DB = dbPath;
     await createKiloDb(dbPath, sessionId, marker);
 
     const hooks = await pluginModule.server(
@@ -472,6 +482,7 @@ test(
       );
     } finally {
       await hooks.dispose?.();
+      delete process.env.KILO_DB;
       rmSync(base, { recursive: true, force: true });
     }
   },

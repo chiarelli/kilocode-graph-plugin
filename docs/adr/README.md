@@ -13,6 +13,7 @@
 | [007](007-gatilho-da-ingestao.md) | Gatilho da ingestão: os eventos (`message.updated` / `session.idle`) acordam a **mesma rotina**; o conteúdo vem do banco | **proposto** |
 | [008](008-idempotencia-e-cursor.md) | Idempotência e cursor: a garantia é do **plugin** (`sentBatchHashes`); cursor por **`(time_created, id)`**, não `OFFSET` | **proposto** |
 | [009](009-limites-por-endpoint-e-piso-de-confianca.md) | Limites de injeção **por endpoint em tokens** (o tipo do memtier) + **piso de confiança da memória** no servidor (score cru) | **proposto** |
+| [010](010-fonte-do-kilo-db.md) | Fonte do `kilo.db`: a **regra do runtime** (`Path.data` + `KILO_DB`), resolvida in-process **sem rede no boot** | **proposto** |
 
 ## Ordem de leitura para a ingestão (E4)
 

@@ -141,6 +141,13 @@ export interface Config {
     indexer_bin: string;
     /** Timeout por request de sync (ms). Default 120000 (embedding é lento). */
     sync_timeout_ms: number;
+    /**
+     * Fonte de arquivos via git (`git ls-files --exclude-standard`), honrando o
+     * ignore-stack. Default `false` (varre tudo). Quando `true` e o git estiver
+     * ausente ou o diretório não for um repositório, o indexer responde
+     * `GIT_UNAVAILABLE` e aborta o job (sem degradar para um scan completo).
+     */
+    load_ignores: boolean;
   };
   ingest: {
     /** Liga a ingestão assíncrona (default `false`). */

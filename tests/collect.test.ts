@@ -229,6 +229,31 @@ test("collect_incremental_no_removed: incremental não marca inalterados como re
   assert.equal(keep, undefined, "inalterado não deve ser enviado como removido");
 });
 
+test("collect_load_ignores: repassa load_ignores do cfg ao runner", async () => {
+  let seen: { loadIgnores?: boolean } | undefined;
+  const rt = runtime({
+    cfg: { enabled: true, indexer_bin: "/fake/indexer", load_ignores: true },
+    run: async (opts) => {
+      seen = opts;
+      return { events: [chunkEvent("src/a.rs", "a1")], skipped: false };
+    },
+  });
+  await collectCode(rt);
+  assert.equal(seen?.loadIgnores, true);
+});
+
+test("collect_load_ignores_off: default false quando cfg não define", async () => {
+  let seen: { loadIgnores?: boolean } | undefined;
+  const rt = runtime({
+    run: async (opts) => {
+      seen = opts;
+      return { events: [chunkEvent("src/a.rs", "a1")], skipped: false };
+    },
+  });
+  await collectCode(rt);
+  assert.equal(seen?.loadIgnores, false);
+});
+
 test("collect_incremental_merges_manifest: estado pós-incremental preserva inalterados", async () => {
   const saved: string[][] = [];
   const rt = runtime({
@@ -241,6 +266,58 @@ test("collect_incremental_merges_manifest: estado pós-incremental preserva inal
   });
   await collectCode(rt);
   assert.deepEqual(saved[0]?.sort(), ["src/changed.rs", "src/keep.rs"]);
+});
+
+// --- GIT_UNAVAILABLE: erro fatal do job NUNCA apaga o grafo -----------------
+
+test("collect_job_error_aborts: erro não-recuperável ⇒ sem sync (grafo intacto)", async () => {
+  // Reproduz o defeito: `load_ignores=true` num dir sem git ⇒ indexer aborta
+  // `GIT_UNAVAILABLE` com 0 chunks. Tratado como full "vazio", marcaria TODO o
+  // manifest como removido (`chunks:[]`) e limparia o workspace no memtier.
+  let called = false;
+  const rt = runtime({
+    cfg: { enabled: true, indexer_bin: "/fake/indexer", load_ignores: true },
+    run: async () => ({
+      events: [
+        {
+          event: "error",
+          payload: { code: "GIT_UNAVAILABLE", message: "requires git", recoverable: false },
+        },
+        { event: "job_completed", payload: { processed: 0, errors: 1 } },
+      ],
+      skipped: false,
+      error: { code: "GIT_UNAVAILABLE", message: "requires git", recoverable: false },
+    }),
+    state: fakeState(["src/a.rs", "src/b.rs"]),
+    client: {
+      syncCode: async () => {
+        called = true;
+        return EMPTY_SYNC;
+      },
+    },
+  });
+  assert.equal(await collectCode(rt), null);
+  assert.equal(called, false, "nenhum sync ⇒ nenhum arquivo marcado como removido");
+});
+
+test("collect_job_error_skips_removed: erro fatal não gera removidos", async () => {
+  let sentFiles: unknown[] | null = null;
+  const rt = runtime({
+    run: async () => ({
+      events: [{ event: "error", payload: { code: "GIT_UNAVAILABLE", recoverable: false } }],
+      skipped: false,
+      error: { code: "GIT_UNAVAILABLE", message: "requires git", recoverable: false },
+    }),
+    state: fakeState(["src/a.rs"]),
+    client: {
+      syncCode: async (f) => {
+        sentFiles = f;
+        return EMPTY_SYNC;
+      },
+    },
+  });
+  await collectCode(rt);
+  assert.equal(sentFiles, null);
 });
 
 // --- client.syncCode -------------------------------------------------------

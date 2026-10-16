@@ -150,9 +150,11 @@ async function injectContextIntoMessages(messages, rt): Promise<void>
 ### `ingest/` (E4 — implementado)
 ```ts
 // db.ts — fonte de verdade (o evento NUNCA carrega conteúdo, ADR-007).
-resolveRuntimeDbPath(client, directory): Promise<string>  // <state>/kilo.db do runtime
-//   o caminho do banco vem de `client.path.get().state` (runtime do Kilo),
-//   NUNCA de cwd/env var; degrada para o db default do runtime.
+resolveRuntimeDbPath(env?): string  // <Path.data>/kilo.db do runtime (síncrono)
+//   o caminho segue a REGRA DO RUNTIME: Path.data = XDG_DATA_HOME ?? ~/.local/share
+//   + `/kilo`; regra `KILO_DB` (absoluto/`:memory:`/relativo). O plugin roda
+//   in-process e herda `process.env`. NUNCA deriva de `Path.state` (o banco vive
+//   em DATA, e `/path` só expõe `state`). Sem I/O: não bloqueia o boot.
 readBatch(backend, sessionId, cursor, limit, onPoison?): ReadBatch
 //   cursor = { last_ts, last_id } — (time_created, id), SEM OFFSET (ADR-008);
 //   lança `IngestReadError` em falha transitória (não avança o cursor).
@@ -243,10 +245,10 @@ globalmente:
 - o `token_file` é **confinado** ao workspace: um caminho absoluto fora do `dir`
   (ou com `../..`) é recusado e cai no default `.kilo/graph-key.json` — o
   provisionamento nunca escreve fora do workspace;
-- o caminho do `kilo.db` vem de `client.path.get({ query: { directory } }).state`
-  + `/kilo.db` (`resolveRuntimeDbPath`) — o runtime já determinou, no boot, onde
-  está o banco configurado. Não há env var nem heurística de cwd; se o runtime não
-  responde, degrada para o default do próprio runtime (`~/.local/share/kilo/kilo.db`).
+- o caminho do `kilo.db` segue a **regra do runtime do Kilo** (`resolveRuntimeDbPath`):
+  `Path.data` = `XDG_DATA_HOME ?? ~/.local/share` + `/kilo`, com a regra `KILO_DB`.
+  O plugin roda in-process, então usa o próprio `process.env` — NUNCA `Path.state`
+  (o banco vive em DATA; `/path` só expõe `state`, cujo `<state>/kilo.db` não existe).
 
 ## Variáveis de ambiente
 
@@ -275,6 +277,7 @@ default. Em `options`, o placeholder `{env:VAR}` resolve a env var citada
 | `code_index.enabled` | `KILOCODE_GRAPH_INDEX_ENABLED` | `false` |
 | `code_index.indexer_bin` | `KILOCODE_GRAPH_INDEXER_BIN` | `""` (vazio — sem coletor) |
 | `code_index.sync_timeout_ms` | `KILOCODE_GRAPH_INDEX_SYNC_TIMEOUT_MS` | `120000` |
+| `code_index.load_ignores` | `KILOCODE_GRAPH_INDEX_LOAD_IGNORES` | `false` |
 | `ingest.enabled` | `KILOCODE_GRAPH_INGEST_ENABLED` | `false` |
 | `ingest.batch_size` | `KILOCODE_GRAPH_INGEST_BATCH_SIZE` | `20` |
 | `ingest.max_hashes` | `KILOCODE_GRAPH_INGEST_MAX_HASHES` | `5000` |
@@ -283,6 +286,13 @@ default. Em `options`, o placeholder `{env:VAR}` resolve a env var citada
 | `mcp.name` | `KILOCODE_GRAPH_MCP_NAME` | `memtier` |
 | `mcp.timeout_ms` | `KILOCODE_GRAPH_MCP_TIMEOUT_MS` | `15000` |
 | `debug` | `KILOCODE_GRAPH_DEBUG` | `false` |
+
+> **Com `debug=true`, o plugin espelha o contexto injetado.**
+> `/tmp/kilocode-graph-plugin.log` é append-only (histórico); já
+> `/tmp/kilocode-graph-plugin-inject.log` é **truncado a cada escrita** e mostra,
+> em tempo real e em formato legível, o **raw** do que foi injetado no último
+> turno (blocos de memória `graph-memory` e de código `graph-code`, com contagem
+> de fatos/chunks e chars). Sem `debug`, o arquivo não é escrito.
 
 Env vars fora do prefixo:
 
@@ -338,6 +348,12 @@ Env vars fora do prefixo:
 | **Teto de tokens por endpoint** (`memory_max_tokens`/`code_max_tokens`) corta cada bloco de forma independente | `tests/code_s2.test.ts` — `code_body_uses_code_tokens`, `endpoints_independent`; E2E `tests/e2e/test_e2e_inject_limits.test.ts` (gated `E2E=1`) |
 | Envs de limite legadas ⇒ **um** aviso de depreciação (nunca silêncio) | `tests/config.test.ts` — casos `config_legacy_*_warns` e `config_no_legacy_no_warning` |
 | Teto fora de `[1,16000]` (422 no servidor) cai no default | `tests/config.test.ts` — `config_token_cap_clamped` |
+| Erro HTTP com body de MB não vira `message` gigante (UI) | `tests/client.test.ts` — `httpError_caps_detail`, `extractHttpDetail_never_exceeds_cap`; `tests/provision.test.ts` — `provision_error_body_bounded` |
+| Linha de log nunca excede o teto (nem `log`/`debug`, nem o `console.error` do fatal) | `tests/logger.test.ts` — `logFatal_respects_cap_exactly`, `logFatal_console_leg_bounded`, `log_caps_direct_giant` |
+| Chunk (`FullFile`/`Symbol`) acima do teto é truncado com marca | `tests/collector.test.ts` — `fullfile_truncation`, `symbol_truncation` |
+| Erro fatal do indexer (`GIT_UNAVAILABLE`) **não** apaga o grafo | `tests/collect.test.ts` — `collect_job_error_aborts`, `collect_job_error_skips_removed`; `tests/runner.test.ts` — `jobErrorFromEvent_*`, `runIndexer_error_event`, `runIndexer_error_no_completed`, `runIndexer_recoverable_error` |
+| `code_index.load_ignores` propaga ao indexer | `tests/runner.test.ts` — `build_command_load_ignores*`; `tests/collect.test.ts` — `collect_load_ignores*` |
+| Fonte do `kilo.db` = regra do runtime (não `Path.state`) | `tests/ingest.test.ts` — `db_runtime_path*`, `db_runtime_path_xdg_relative_ignored` |
 
 > **Limitação conhecida:** dois diretórios com o MESMO basename válido (ex.: dois
 > checkouts chamados `foo`) mapeiam para o mesmo workspace memtier — desambiguar

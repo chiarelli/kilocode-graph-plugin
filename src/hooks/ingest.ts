@@ -15,6 +15,7 @@ import { debug, logFatal } from "../logger.ts";
 import {
   createBackendProvider,
   type BackendProvider,
+  type DbPathSource,
   type SqliteBackend,
 } from "../ingest/db.ts";
 import {
@@ -27,8 +28,15 @@ import {
 /** Dependências do hook (injetáveis para teste, sem banco/rede reais). */
 export interface IngestHookRuntime {
   cfg: IngestConfig;
-  /** Caminho do `kilo.db` (resolvido do runtime do Kilo no boot). */
-  dbPath: string;
+  /**
+   * Caminho do `kilo.db` — string fixa **ou** resolvedor lazy (`DbPathSource`).
+   * O resolvedor desacopla a resolução do boot: resolver no `server()` do plugin
+   * podia travar quando dependia do runtime (deadlock medido). A resolução fica
+   * para a primeira abertura do backend, fora do caminho crítico. Aceita
+   * resolver síncrono (`resolveRuntimeDbPath`, regra do runtime sem I/O) ou
+   * assíncrono.
+   */
+  dbPath: DbPathSource;
   /** Caminho do estado (`.kilo/graph-ingest.json`). */
   statePath: string;
   client: IngestClient;
@@ -79,7 +87,11 @@ export function ingestHook(rt: IngestHookRuntime) {
     : createBackendProvider(rt.dbPath, {
         // Degradação explícita (ADR-007): sem banco a ingestão não roda — mas
         // nunca é silencioso.
-        onError: (err) => logFatal(`ingest open db (${rt.dbPath})`, err),
+        onError: (err) =>
+          logFatal(
+            `ingest open db (${typeof rt.dbPath === "string" ? rt.dbPath : "runtime"})`,
+            err,
+          ),
       });
 
   return {

@@ -6,10 +6,18 @@
  * escrita falhar). **Nunca** logar token: `formatToken` só expõe `SET(len=N)`.
  */
 
-import { appendFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 
 const LOG_PATH = "/tmp/kilocode-graph-plugin.log";
 const PREFIX = "[graph]";
+
+/**
+ * Teto do que `logFatal` serializa por linha. Um erro HTTP pode embutir o body
+ * inteiro (o memtier ecoa o `input` no detalhe do 422 → vários MB); emitir isso
+ * na UI/console trava o editor. Acima do teto, a linha é truncada com um sufixo
+ * explícito.
+ */
+const MAX_LOG_LINE_CHARS = 8_192;
 
 let debugEnabled = false;
 
@@ -32,7 +40,7 @@ export function setDebug(enabled: boolean): void {
 
 /** Log incondicional (boot, degradação, erro). */
 export function log(msg: string): void {
-  const line = `[${new Date().toISOString()}] ${PREFIX} ${msg}`;
+  const line = truncateLine(`[${new Date().toISOString()}] ${PREFIX} ${msg}`);
   if (testSink) {
     try {
       testSink(line);
@@ -48,6 +56,19 @@ export function log(msg: string): void {
   }
 }
 
+/**
+ * Corta uma linha ao teto `MAX_LOG_LINE_CHARS`, anexando a marca de corte
+ * **dentro** do limite (o resultado nunca excede o teto). Um `message` de erro
+ * que carregue um body HTTP inteiro não pode despejar megabytes no arquivo/sink.
+ */
+function truncateLine(line: string): string {
+  if (line.length <= MAX_LOG_LINE_CHARS) return line;
+  const omitted = line.length - MAX_LOG_LINE_CHARS;
+  const suffix = `… [truncated ${omitted} chars]`;
+  const keep = Math.max(0, MAX_LOG_LINE_CHARS - suffix.length);
+  return `${line.slice(0, keep)}${suffix}`;
+}
+
 /** Log só quando `debug` está ligado. */
 export function debug(msg: string): void {
   if (debugEnabled) log(msg);
@@ -56,17 +77,103 @@ export function debug(msg: string): void {
 /**
  * Log de erro com escopo. Não lança — o chamador decide se degrada ou para.
  * Usa `console.error` além do arquivo, para o erro ser visível na UI.
+ *
+ * A linha é **limitada** a `MAX_LOG_LINE_CHARS`: um erro cujo `message`/`stack`
+ * carrega um body HTTP inteiro (o caso do 422 com o `input` ecoado) não pode
+ * despejar megabytes no console — isso bloqueia a UI do editor.
  */
 export function logFatal(scope: string, error: unknown): void {
   const message = error instanceof Error ? error.message : String(error);
   const detail = error instanceof Error && error.stack ? `\n${error.stack}` : "";
   const line = `FATAL ${scope}: ${message}${detail}`;
+  // `log()` já corta (com timestamp/prefixo) para o arquivo/sink; a perna do
+  // `console.error` corta por conta própria para NÃO exceder o teto (antes ela
+  // imprimia a linha pré-corte e estourava o limite — o vetor que travou a UI).
   log(line);
   try {
-    console.error(`${PREFIX} ${line}`);
+    console.error(truncateLine(`${PREFIX} ${line}`));
   } catch {
     // console pode não existir em ambientes embarcados.
   }
+}
+
+/**
+ * Arquivo do **raw** injetado (RAG de memória + código), quando `debug` está
+ * ligado. Diferente do `LOG_PATH` (append-only, histórico): este reflete apenas
+ * o ÚLTIMO turno observado — cada escrita **trunca** o arquivo, então abrí-lo
+ * dá, em tempo real, exatamente o que foi injetado na última passada do
+ * `experimental.chat.messages.transform`.
+ */
+export const INJECT_RAW_PATH = "/tmp/kilocode-graph-plugin-inject.log";
+
+/** Uma seção do dump de injeção (uma família: memória ou código). */
+export interface InjectRawSection {
+  /** Rótulo humano da seção (ex.: `MEMÓRIA`, `CÓDIGO`). */
+  title: string;
+  /** Bloco cru, exatamente como anexado ao turno (sentinela incluída). */
+  block?: string | null;
+  /** Nº de itens injetados (fatos/chunks), quando conhecido. */
+  count?: number;
+}
+
+/**
+ * Grava o raw do que foi injetado no turno (só com `debug` ligado). Sobrescreve
+ * (trunca) o arquivo a cada chamada — é um "espelho" do último turno, não um
+ * histórico. Nunca lança (NFR-03): falha de escrita não pode afetar o turno.
+ */
+export function writeInjectRaw(sections: InjectRawSection[]): void {
+  if (!debugEnabled) return;
+  if (testSink) {
+    // Em teste, o sink recebe o dump em vez do arquivo (mesma semântica do log).
+    try {
+      testSink(formatInjectRaw(sections));
+    } catch {
+      // Sink de teste nunca derruba o plugin.
+    }
+    return;
+  }
+  try {
+    writeFileSync(INJECT_RAW_PATH, formatInjectRaw(sections));
+  } catch {
+    // Escrita do dump nunca derruba o plugin.
+  }
+}
+
+/** Largura das réguas do dump (só estética — não afeta o conteúdo cru). */
+const RULE = "─".repeat(64);
+
+/**
+ * Monta o dump legível do que foi injetado: cabeçalho com data/hora e um bloco
+ * por família, com título, resumo (`N itens · M chars`) e o **texto cru** logo
+ * abaixo (só as quebras de linha de borda são aparadas para o layout).
+ * Puro e testável.
+ */
+export function formatInjectRaw(
+  sections: InjectRawSection[],
+  now: Date = new Date(),
+): string {
+  const out: string[] = [
+    RULE,
+    "  KILOCODE GRAPH · contexto injetado (raw)",
+    `  ${now.toISOString()}`,
+    RULE,
+  ];
+  for (const s of sections) {
+    const raw = s.block?.replace(/^\n+/, "").replace(/\s+$/, "") ?? "";
+    const meta: string[] = [];
+    if (typeof s.count === "number") meta.push(`${s.count} ${s.count === 1 ? "item" : "itens"}`);
+    meta.push(`${raw.length} chars`);
+    out.push("");
+    out.push(`▌ ${s.title}  (${meta.join(" · ")})`);
+    if (raw) {
+      out.push(RULE);
+      out.push(raw);
+      out.push(RULE);
+    } else {
+      out.push("  (nada injetado)");
+    }
+  }
+  return `${out.join("\n")}\n`;
 }
 
 /**

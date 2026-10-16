@@ -56,6 +56,7 @@ Kilo Code ──hooks──▶ plugin ──HTTP──▶ memtier ──▶ Falk
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Hooks, fluxo do turno, coletor, MCP, adaptadores (v0.2) |
 | [`docs/SPIKE-FINDINGS.md`](docs/SPIKE-FINDINGS.md) | O que o spike provou sobre multi-CLI |
 | [`docs/adr/`](docs/adr/README.md) | Decisões (ADR-005: coletor; ADR-006: push vs pull MCP) |
+| [`docs/rfc/`](docs/rfc/README.md) | RFCs — problemas observados (RFC-001: navegação do grafo e integridade do chunk) |
 
 ## Hooks do Kilo usados
 
@@ -82,7 +83,7 @@ diretório do workspace vem do **runtime do Kilo** (`ctx.worktree` >
 | Config do plugin | `<workspace>/.kilo/graph-plugin.json` > `~/.config/kilo/graph-plugin.json` | workspace/global |
 | Nome do workspace | derivado do dir = `<stem>-<sha1 8>`; override `KILOCODE_GRAPH_WORKSPACE` | — |
 | Bearer do workspace | arquivo `.kilo/graph-key.json` = `{ token, workspace, program }` (`0600`) | `./.kilo/` do workspace |
-| Banco de sessões | `client.path.get().state` + `/kilo.db` (runtime do Kilo) | runtime |
+| Banco de sessões | `Path.data` do runtime (`XDG_DATA_HOME ?? ~/.local/share` + `/kilo`) + regra `KILO_DB` | runtime |
 | Bearer do **gestor** | env `KILOCODE_GRAPH_MANAGER_TOKEN` (opcional) | — |
 
 **Mapeamento 1:1.** Cada workspace Kilo corresponde a um workspace memtier. O
@@ -137,4 +138,6 @@ Fora do caminho crítico do turno. Ver ADR-005 e `docs/ARCHITECTURE.md` §4.
   eventos (agrupar por arquivo, resolver arestas, sincronizar).
 - **Navegação por código vizinho** (`/v1/code/neighbors`) — **travada** até o
   memtier expor a tool MCP (hoje só `recall`/`ingest`/`code_search`/`code_sync`).
+  Ver [`docs/rfc/001`](docs/rfc/001-navegacao-e-integridade-do-grafo-de-codigo.md)
+  (a rota HTTP também é inutilizável: falta o `uuid` de entrada).
 - Migrar as memórias antigas (cancelado no memtier).

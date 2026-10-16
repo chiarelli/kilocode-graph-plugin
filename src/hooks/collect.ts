@@ -32,6 +32,11 @@ import type { SyncResult } from "../types.ts";
 export interface CollectConfig {
   enabled: boolean;
   indexer_bin: string;
+  /**
+   * Fonte de arquivos via git (`load_ignores`). Ausente/`false` ⇒ varre tudo.
+   * Quando `true`, o indexer exige git + repositório (senão `GIT_UNAVAILABLE`).
+   */
+  load_ignores?: boolean;
 }
 
 /** Dependências do hook (injetáveis para teste, sem spawn real). */
@@ -153,6 +158,7 @@ export async function collectCode(rt: CollectRuntime): Promise<SyncResult | null
       repoRoot: rt.repoRoot,
       mode,
       gitRange: trigger.gitRange,
+      loadIgnores: rt.cfg.load_ignores ?? false,
     });
   } catch (err) {
     logFatal("collect indexer", err);
@@ -161,6 +167,19 @@ export async function collectCode(rt: CollectRuntime): Promise<SyncResult | null
   const indexerMs = Date.now() - start;
 
   if (result.skipped) {
+    logCollection(indexerMs, 0, 0, 0);
+    return null;
+  }
+
+  // Erro NÃO-recuperável do indexer (ex.: `GIT_UNAVAILABLE` com `load_ignores`
+  // sem git): o stream NÃO é um estado completo. Tratá-lo como "present vazio"
+  // num full marcaria TODO o manifest como removido e apagaria o grafo
+  // (chunks:[]). Aborta sem sincronizar — o grafo fica intacto.
+  if (result.error) {
+    log(
+      `collect: indexer abortou (${result.error.code}: ${result.error.message}); ` +
+        `sync cancelado (grafo preservado)`,
+    );
     logCollection(indexerMs, 0, 0, 0);
     return null;
   }
@@ -177,10 +196,16 @@ export async function collectCode(rt: CollectRuntime): Promise<SyncResult | null
         )
       : [];
 
+  const buildStart = Date.now();
   const body = buildSyncBody(result.events, rt.identity, {
     repoRoot: rt.repoRoot,
     removed,
   });
+  const buildMs = Date.now() - buildStart;
+  debug(
+    `collect: build files=${body.files.length} edges=${body.edges.length} ` +
+      `build_ms=${buildMs} events=${result.events.length}`,
+  );
   if (body.files.length === 0 && removed.length === 0) {
     debug("collect: nenhum chunk emitido; nada a sincronizar");
     logCollection(indexerMs, 0, 0, 0);

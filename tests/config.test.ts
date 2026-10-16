@@ -193,6 +193,15 @@ test("config_code_sync_timeout: default 120000 e env honrada", () => {
   assert.equal(loadConfig().code_index.sync_timeout_ms, 5000);
 });
 
+test("config_code_load_ignores: default false e env honrada", () => {
+  clearEnv();
+  assert.equal(loadConfig().code_index.load_ignores, false);
+  process.env.KILOCODE_GRAPH_INDEX_LOAD_IGNORES = "true";
+  assert.equal(loadConfig().code_index.load_ignores, true);
+  process.env.KILOCODE_GRAPH_INDEX_LOAD_IGNORES = "false";
+  assert.equal(loadConfig().code_index.load_ignores, false);
+});
+
 test("config_ingest_defaults: as chaves de `ingest.*` (E4) têm os defaults declarados", () => {
   clearEnv();
   const cfg = loadConfig();

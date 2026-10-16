@@ -93,9 +93,59 @@ export class InfraError extends MemtierHttpError {
   }
 }
 
-/** Mapeia um status HTTP não-2xx num erro tipado reconhecível. */
+/** Limite do detalhe de erro HTTP preservado na `message` (bytes de texto). */
+const MAX_HTTP_DETAIL_CHARS = 2_048;
+
+/** Marca de corte; mantida **dentro** do teto (o resultado nunca excede). */
+const TRUNC_MARK = "… [truncated]";
+
+/** Recorta `text` ao teto, anexando a marca de corte sem estourar o limite. */
+function clipWithMark(text: string): string {
+  if (text.length <= MAX_HTTP_DETAIL_CHARS) return text;
+  const keep = Math.max(0, MAX_HTTP_DETAIL_CHARS - TRUNC_MARK.length);
+  return `${text.slice(0, keep)}${TRUNC_MARK}`;
+}
+
+/**
+ * Extrai um detalhe CURTO e útil de um body de erro HTTP. O memtier responde
+ * 422 como `{"detail":[{"msg":"...","input":{...body inteiro...}}]}`; anexar o
+ * body cru produziria uma `message` de vários MB (e travava a UI ao logar).
+ * Prefere `detail[].msg` (a frase útil); senão, recorta o texto cru ao limite.
+ * O resultado **nunca** excede `MAX_HTTP_DETAIL_CHARS`.
+ */
+export function extractHttpDetail(raw: string): string {
+  const text = typeof raw === "string" ? raw : String(raw);
+  if (text.length <= MAX_HTTP_DETAIL_CHARS) return text;
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    const detail = (parsed as { detail?: unknown } | null)?.detail;
+    if (Array.isArray(detail)) {
+      const msgs = detail
+        .map((d) => (d as { msg?: unknown } | null)?.msg)
+        .filter((m): m is string => typeof m === "string" && m.trim() !== "");
+      // Junta as msgs úteis; se elas mesmas estourarem o teto, marca o corte
+      // (o operador precisa saber que a lista foi cortada, não só a raw).
+      if (msgs.length > 0) return clipWithMark(msgs.join("; "));
+    }
+    const message = (parsed as { message?: unknown } | null)?.message;
+    if (typeof message === "string" && message.trim() !== "") {
+      return clipWithMark(message);
+    }
+  } catch {
+    // Body não-JSON: cai no recorte do texto cru abaixo.
+  }
+  return clipWithMark(text);
+}
+
+/**
+ * Mapeia um status HTTP não-2xx num erro tipado reconhecível. O `detail` é
+ * **sempre** passado por `extractHttpDetail` (defesa em profundidade): nenhum
+ * call site pode fabricar um `message` de vários MB — foi o que travou a UI
+ * quando um 422 ecoava o body inteiro. `extractHttpDetail` é idempotente para
+ * um detalhe já curto (retorna como está).
+ */
 export function httpError(status: number, detail: string): MemtierHttpError {
-  const msg = `memtier HTTP ${status}: ${detail}`;
+  const msg = `memtier HTTP ${status}: ${extractHttpDetail(detail)}`;
   if (status === 401 || status === 403) return new AuthError(status, msg);
   if (status === 503) return new InfraError(status, msg);
   return new MemtierHttpError(status, msg);
@@ -396,7 +446,7 @@ export class MemtierClient {
     );
     if (!res.ok) {
       const detail = await res.text().catch(() => "unknown error");
-      throw httpError(res.status, detail);
+      throw httpError(res.status, extractHttpDetail(detail));
     }
     return (await res.json()) as T;
   }

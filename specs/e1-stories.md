@@ -77,6 +77,7 @@ Chaves (todas com env `KILOCODE_GRAPH_*`):
 | `inject.timeout_ms` | `KILOCODE_GRAPH_INJECT_TIMEOUT_MS` | `4000` | orçamento do hook |
 | `code_index.enabled` | `KILOCODE_GRAPH_INDEX_ENABLED` | `false` | desligado por padrão |
 | `code_index.indexer_bin` | `KILOCODE_GRAPH_INDEXER_BIN` | `""` | caminho do binário (FR-306) |
+| `code_index.load_ignores` | `KILOCODE_GRAPH_INDEX_LOAD_IGNORES` | `false` | E3a — fonte via `git ls-files --exclude-standard`; exige git/repo (senão `GIT_UNAVAILABLE`, sem fallback) |
 | `mcp.enabled` | `KILOCODE_GRAPH_MCP_ENABLED` | `true` | E3b |
 | `mcp.name` | `KILOCODE_GRAPH_MCP_NAME` | `memtier` | E3b |
 | `debug` | `KILOCODE_GRAPH_DEBUG` | `false` | log verboso |
