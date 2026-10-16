@@ -56,6 +56,7 @@ Kilo Code ──hooks──▶ plugin ──HTTP──▶ memtier ──▶ Falk
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Hooks, fluxo do turno, coletor, MCP, adaptadores (v0.2) |
 | [`docs/SPIKE-FINDINGS.md`](docs/SPIKE-FINDINGS.md) | O que o spike provou sobre multi-CLI |
 | [`docs/adr/`](docs/adr/README.md) | Decisões (ADR-005: coletor; ADR-006: push vs pull MCP) |
+| [`docs/rfc/`](docs/rfc/README.md) | RFCs — problemas observados (RFC-001: navegação do grafo e integridade do chunk) |
 
 ## Hooks do Kilo usados
 
@@ -137,4 +138,6 @@ Fora do caminho crítico do turno. Ver ADR-005 e `docs/ARCHITECTURE.md` §4.
   eventos (agrupar por arquivo, resolver arestas, sincronizar).
 - **Navegação por código vizinho** (`/v1/code/neighbors`) — **travada** até o
   memtier expor a tool MCP (hoje só `recall`/`ingest`/`code_search`/`code_sync`).
+  Ver [`docs/rfc/001`](docs/rfc/001-navegacao-e-integridade-do-grafo-de-codigo.md)
+  (a rota HTTP também é inutilizável: falta o `uuid` de entrada).
 - Migrar as memórias antigas (cancelado no memtier).

@@ -70,6 +70,11 @@ HTTP: seria uma segunda superfície para o mesmo dado, fora do modelo pull
 escolhido. Quando o memtier expuser a tool, o plugin a herda sem código novo
 (mesmo padrão de registro).
 
+> **Ver [`RFC-001`](../rfc/001-navegacao-e-integridade-do-grafo-de-codigo.md):**
+> além de não ser tool MCP, `/v1/code/neighbors` é **inutilizável de ponta a
+> ponta** mesmo por HTTP — `code_search`/`code_sync` não expõem o `uuid` que o
+> endpoint exige (o contrato de identificador está partido entre as pontas).
+
 ## Implementação (E3b, 2026-10-14)
 
 - `src/mcp/register.ts` — `status` → `add` (`type:"remote"`, `url:…/v1/mcp`,
