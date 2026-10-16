@@ -150,9 +150,11 @@ async function injectContextIntoMessages(messages, rt): Promise<void>
 ### `ingest/` (E4 — implementado)
 ```ts
 // db.ts — fonte de verdade (o evento NUNCA carrega conteúdo, ADR-007).
-resolveRuntimeDbPath(client, directory): Promise<string>  // <state>/kilo.db do runtime
-//   o caminho do banco vem de `client.path.get().state` (runtime do Kilo),
-//   NUNCA de cwd/env var; degrada para o db default do runtime.
+resolveRuntimeDbPath(env?): string  // <Path.data>/kilo.db do runtime (síncrono)
+//   o caminho segue a REGRA DO RUNTIME: Path.data = XDG_DATA_HOME ?? ~/.local/share
+//   + `/kilo`; regra `KILO_DB` (absoluto/`:memory:`/relativo). O plugin roda
+//   in-process e herda `process.env`. NUNCA deriva de `Path.state` (o banco vive
+//   em DATA, e `/path` só expõe `state`). Sem I/O: não bloqueia o boot.
 readBatch(backend, sessionId, cursor, limit, onPoison?): ReadBatch
 //   cursor = { last_ts, last_id } — (time_created, id), SEM OFFSET (ADR-008);
 //   lança `IngestReadError` em falha transitória (não avança o cursor).
@@ -243,10 +245,10 @@ globalmente:
 - o `token_file` é **confinado** ao workspace: um caminho absoluto fora do `dir`
   (ou com `../..`) é recusado e cai no default `.kilo/graph-key.json` — o
   provisionamento nunca escreve fora do workspace;
-- o caminho do `kilo.db` vem de `client.path.get({ query: { directory } }).state`
-  + `/kilo.db` (`resolveRuntimeDbPath`) — o runtime já determinou, no boot, onde
-  está o banco configurado. Não há env var nem heurística de cwd; se o runtime não
-  responde, degrada para o default do próprio runtime (`~/.local/share/kilo/kilo.db`).
+- o caminho do `kilo.db` segue a **regra do runtime do Kilo** (`resolveRuntimeDbPath`):
+  `Path.data` = `XDG_DATA_HOME ?? ~/.local/share` + `/kilo`, com a regra `KILO_DB`.
+  O plugin roda in-process, então usa o próprio `process.env` — NUNCA `Path.state`
+  (o banco vive em DATA; `/path` só expõe `state`, cujo `<state>/kilo.db` não existe).
 
 ## Variáveis de ambiente
 

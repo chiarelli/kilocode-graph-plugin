@@ -20,7 +20,6 @@ import { messagesHook } from "./hooks/messages.ts";
 import {
   resolveRuntimeDbPath,
   type DbPathSource,
-  type RuntimePathClient,
 } from "./ingest/db.ts";
 import { INGEST_STATE_REL_PATH } from "./ingest/state.ts";
 import { debug, formatBootLine, log, logFatal, setDebug } from "./logger.ts";
@@ -160,18 +159,15 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
     timeout_ms: config.mcp.timeout_ms,
   });
 
-  // E4: o `kilo.db` é lido do **runtime do Kilo** (`client.path.get().state` →
-  // `<state>/kilo.db`), nunca de `process.cwd()` nem de env var: o runtime já
-  // determinou, no boot, onde está o banco configurado. A resolução é **lazy**
-  // (um resolver, não `await` aqui): `client.path.get` é uma chamada HTTP ao
-  // próprio servidor Kilo, e aguardá-la dentro do `server()` **trava** — o
-  // servidor só atende requisições depois que `server()` retorna (deadlock
-  // medido: `/session` e `/path` ficam pendurados e a UI não abre sessão). O
-  // resolver roda na primeira abertura do backend (disparada por evento), já
-  // com o servidor no ar. Desligada a ingestão, o provider nem é aberto.
-  const dbPath: DbPathSource = config.ingest.enabled
-    ? () => resolveRuntimeDbPath(ctx.client as RuntimePathClient | undefined, dir)
-    : "";
+  // E4: o `kilo.db` é localizado pela **própria regra do runtime do Kilo**
+  // (`Path.data` = `XDG_DATA_HOME ?? ~/.local/share` + `/kilo`; regra `KILO_DB`),
+  // reproduzida in-process — o plugin roda no mesmo processo e herda o env. Não é
+  // derivado de `client.path.get().state`: `/path` expõe o diretório de ESTADO,
+  // enquanto o banco vive em DATA (`~/.local/share/kilo/kilo.db`), então derivar
+  // de `state` apontava para um diretório sem banco. A resolução é **síncrona e
+  // sem I/O** (nada de `await` de rede no boot — isso travava o `server()`).
+  // Desligada a ingestão, o provider nem é aberto.
+  const dbPath: DbPathSource = config.ingest.enabled ? () => resolveRuntimeDbPath() : "";
 
   // E4: ingestion hooks. Construído fora do objeto de retorno para que o
   // `dispose` (que fecha o handle do SQLite) seja referenciável no shutdown.

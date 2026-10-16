@@ -27,6 +27,7 @@ import {
 import {
   createBackendProvider,
   DEFAULT_DB_PATH,
+  defaultDbPath,
   fakeBackend,
   IngestReadError,
   readBatch,
@@ -201,42 +202,40 @@ test("batch_threshold: só envia com o lote CHEIO (rows >= batch)", () => {
 // db.ts — localização (pelo runtime) e leitura
 // ---------------------------------------------------------------------------
 
-test("db_runtime_path: usa client.path.get().state + `kilo.db`", async () => {
-  const dir = "/ws";
-  const seen: string[] = [];
-  const client = {
-    path: {
-      get: async (opts: { query: { directory: string } }) => {
-        seen.push(opts.query.directory);
-        return { data: { state: "/home/u/.local/share/kilo" } };
-      },
-    },
-  };
+test("db_runtime_path: usa Path.data do runtime (XDG_DATA_HOME) + `kilo.db`", () => {
+  // O runtime guarda o banco em `Path.data`, NUNCA em `Path.state` (~/.local/state).
+  // Aqui, com XDG_DATA_HOME setado, o db deriva dele — não de `state`.
+  const db = resolveRuntimeDbPath({ XDG_DATA_HOME: "/home/u/.local/share" });
+  assert.equal(db, join("/home/u/.local/share", "kilo", "kilo.db"));
+});
+
+test("db_runtime_path_default_data: sem XDG_DATA_HOME ⇒ ~/.local/share/kilo/kilo.db", () => {
+  assert.equal(defaultDbPath({}, "/home/u"), join("/home/u/.local/share/kilo", "kilo.db"));
+});
+
+test("db_runtime_path_kilo_db_abs: KILO_DB absoluto é honrado como está", () => {
   assert.equal(
-    await resolveRuntimeDbPath(client, dir),
-    join("/home/u/.local/share/kilo", "kilo.db"),
+    resolveRuntimeDbPath({ KILO_DB: "/custom/dir/my.db" }),
+    "/custom/dir/my.db",
   );
-  assert.deepEqual(seen, [dir], "o directory vai no query do runtime");
 });
 
-test("db_runtime_path_no_client: sem client.path ⇒ db default do runtime", async () => {
-  assert.equal(await resolveRuntimeDbPath(undefined, "/ws"), DEFAULT_DB_PATH);
+test("db_runtime_path_kilo_db_memory: KILO_DB=:memory: é honrado", () => {
+  assert.equal(resolveRuntimeDbPath({ KILO_DB: ":memory:" }), ":memory:");
 });
 
-test("db_runtime_path_bad_state: `state` ausente ⇒ db default do runtime", async () => {
-  const client = { path: { get: async () => ({ data: {} }) } };
-  assert.equal(await resolveRuntimeDbPath(client, "/ws"), DEFAULT_DB_PATH);
+test("db_runtime_path_kilo_db_relative: KILO_DB relativo cai em Path.data", () => {
+  assert.equal(
+    resolveRuntimeDbPath({ XDG_DATA_HOME: "/data", KILO_DB: "alt.db" }),
+    join("/data", "kilo", "alt.db"),
+  );
 });
 
-test("db_runtime_path_error: erro do runtime ⇒ db default (nunca lança)", async () => {
-  const client = {
-    path: {
-      get: async () => {
-        throw new Error("runtime offline");
-      },
-    },
-  };
-  assert.equal(await resolveRuntimeDbPath(client, "/ws"), DEFAULT_DB_PATH);
+test("db_runtime_path_no_xdg: sem env ⇒ default do runtime (nunca Path.state)", () => {
+  // `DEFAULT_DB_PATH` é a regra do runtime aplicada ao env atual; e nunca aponta
+  // para `.local/state` (o defeito original usava `Path.state`).
+  assert.equal(DEFAULT_DB_PATH, defaultDbPath());
+  assert.ok(!DEFAULT_DB_PATH.includes("/.local/state/"), DEFAULT_DB_PATH);
 });
 
 test("db_read_batch: remonta texto (user+assistant), cursor por tupla e sem OFFSET", () => {
