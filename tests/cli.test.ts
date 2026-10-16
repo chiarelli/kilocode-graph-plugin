@@ -323,6 +323,119 @@ test("cli_workspace_identity_change_forces_full: manifest de outro workspace ⇒
   assert.equal(mode, "full");
 });
 
+// --- S6b: degradações ------------------------------------------------------
+
+test("cli_corrupt_manifest_forces_full: manifest corrompido ⇒ full (nunca incremental)", async () => {
+  // `loadManifest` devolve vazio num JSON corrompido ⇒ o trigger cai em full.
+  const dir = tmpDir();
+  mkdirSync(join(dir, ".kilo"), { recursive: true });
+  writeFileSync(join(dir, ".kilo", "graph-manifest.json"), "{not json");
+  const { loadManifest } = await import("../src/index/manifest.ts");
+  const loaded = loadManifest(join(dir, ".kilo", "graph-manifest.json"), "ws");
+  let mode = "";
+  const rt = runtime({
+    run: async (opts) => {
+      mode = opts.mode;
+      return { events: [chunkEvent("src/a.rs", "a1")], skipped: false };
+    },
+    // O estado real (arquivo corrompido) vira vazio; o trigger decide full.
+    state: {
+      load: () => ({ files: loaded.files, last_git_head: loaded.last_git_head }),
+      save: () => {},
+    },
+    git: fakeGit(),
+    ready: () => true,
+  });
+  await collectCode(rt);
+  assert.equal(mode, "full", "sem head confiável ⇒ full (reindexa)");
+});
+
+test("cli_indexer_bin_empty_no_spawn: indexer_bin vazio ⇒ skipped, sem sync", async () => {
+  // Regressão FR-306: coletor ligado mas binário vazio ⇒ o runner pula; nada é
+  // sincronizado e o manifest não é tocado.
+  let synced = false;
+  let saved = false;
+  const rt = runtime({
+    cfg: { enabled: true, indexer_bin: "" },
+    // Sem `run` stub: usa o `runIndexer` real, que curto-circuita com bin vazio.
+    run: undefined,
+    state: {
+      load: () => ({ files: [], last_git_head: null }),
+      save: () => void (saved = true),
+    },
+    git: fakeGit(),
+    client: {
+      syncCode: async () => {
+        synced = true;
+        return EMPTY_SYNC;
+      },
+    },
+  });
+  assert.equal(await collectCode(rt), null);
+  assert.equal(synced, false, "bin vazio nunca chama o sync");
+  assert.equal(saved, false, "bin vazio não grava manifest");
+});
+
+test("cli_non_committed_stays_out: working tree sujo não entra (só o range do git)", async () => {
+  // FR-507: o delta é POR COMMIT. Um arquivo modificado não-commitado não aparece
+  // no stream do indexer incremental (o modo git não o pega) — o body só tem o
+  // que o range cobre.
+  let sentFiles: Array<{ file_path: string }> = [];
+  const rt = runtime({
+    run: async (opts) => {
+      assert.equal(opts.mode, "incremental");
+      assert.deepEqual(opts.gitRange, { from: "old", to: "NEW" });
+      // O indexer devolve SÓ o commitado no range; o arquivo sujo não vem.
+      return { events: [chunkEvent("src/committed.rs", "c1")], skipped: false };
+    },
+    state: memState({ files: ["src/committed.rs"], last_git_head: "old" }),
+    git: fakeGit({ head: () => "NEW" }),
+    ready: () => true,
+    client: {
+      syncCode: async (f) => {
+        sentFiles = f as never;
+        return EMPTY_SYNC;
+      },
+    },
+  });
+  await collectCode(rt);
+  assert.deepEqual(
+    sentFiles.map((f) => f.file_path),
+    ["src/committed.rs"],
+    "só o que o range cobre entra; o sujo fica fora",
+  );
+});
+
+test("cli_lock_serializes_two_runs: duas coletas concorrentes ⇒ uma espera, manifest íntegro", async () => {
+  // CLI × CLI no MESMO processo: a trava `O_EXCL` serializa; a 2ª só roda após a
+  // 1ª liberar. O manifest termina com os arquivos da última execução completa.
+  const ws = tmpDir("graph-lock-two-");
+  const lockPath = join(ws, "graph.lock");
+  const saved: string[][] = [];
+  let inCritical = 0;
+  let maxConcurrent = 0;
+  const mk = (name: string): CollectRuntime =>
+    runtime({
+      repoRoot: ws,
+      lockPath,
+      state: {
+        load: () => ({ files: [], last_git_head: null }),
+        save: (files) => void saved.push(files),
+      },
+      run: async () => {
+        inCritical += 1;
+        maxConcurrent = Math.max(maxConcurrent, inCritical);
+        await new Promise((r) => setTimeout(r, 60));
+        inCritical -= 1;
+        return { events: [chunkEvent(name, "s")], skipped: false };
+      },
+      git: fakeGit(),
+    });
+  await Promise.all([collectCode(mk("src/a.rs")), collectCode(mk("src/b.rs"))]);
+  assert.equal(maxConcurrent, 1, "nunca dois na seção crítica");
+  assert.equal(saved.length, 2, "ambas gravaram (serializadas)");
+});
+
 test("cli_forceMode_incremental_non_ancestor_full: incremental forçado sem range válido ⇒ full", async () => {
   let mode = "";
   const rt = runtime({

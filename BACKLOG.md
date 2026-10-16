@@ -76,7 +76,10 @@ Convenções válidas para todas as epics:
         ancestralidade + removidos no incremental + config persistida (§7);
         boot **invoca o CLI em `auto`** (híbrido) e instala hooks — **não** coleta
         direto. Revisão adversarial (3 lentes) aplicada ao mesmo base.
-      - [ ] **E3a-S6b** — endurecer instalação/robustez (worktree, degradações)
+      - [x] **E3a-S6b** — endurecer instalação/robustez: `--workspace` resolvido
+        em runtime (`--show-toplevel`) para worktrees; degradações (não-git,
+        indexer vazio, manifest corrompido→full, working tree fora, trava
+        CLI×CLI)
       - [ ] **E3a-S6c** — observabilidade do delta (base do E7)
       - [ ] **E3a-S6d** — fechamento (E2E gated, docs, zero marcadores)
 

@@ -283,3 +283,11 @@ distinguível do boot; marca o delta como `incremental`/`full` e o gatilho.
   (7) hook próprio é **regenerado** quando os caminhos embutidos mudam;
   (8) troca de identidade de workspace força full. `spawnCollectCli` ganhou
   listener de `error`; `parseArgs` recusa flag como valor.
+- **2026-10-16 (e) — S6b (endurecimento).** `install-hooks.ts`: o `--workspace`
+  do script é resolvido em **runtime** por `git rev-parse --show-toplevel` (com
+  fallback embutido) — em repo com **worktrees** o `git rev-parse --git-path
+  hooks` devolve o hooks dir **comum** (compartilhado), e um caminho estático
+  indexaria o worktree errado (medido: o hook roda com cwd = raiz do worktree).
+  Degradações cobertas por teste: repo não-git (no-op), `indexer_bin` vazio
+  (skipped, sem sync), manifest corrompido ⇒ full, working tree sujo fica fora
+  (FR-507), e trava por workspace (`CLI × CLI`). Preservado o tmp por processo.

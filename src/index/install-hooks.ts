@@ -99,6 +99,14 @@ export function shellQuote(value: string): string {
  * **O `--workspace` é obrigatório**: o CLI exige o repo root explícito (§2) e o
  * argv do git (um hook roda sem argumentos úteis para nós) nunca o fornece —
  * omiti-lo fazia todo hook sair com exit 2 e não sincronizar nada.
+ *
+ * **Worktree (S6b):** o `--workspace` é resolvido em RUNTIME por
+ * `git rev-parse --show-toplevel` (o hook roda com cwd = raiz do worktree atual),
+ * com o `workspace` embutido como **fallback** (quando o git não está no PATH do
+ * hook). Isso é essencial: um repo com worktrees tem os hooks no diretório
+ * **comum** (`.git/hooks`, compartilhado por todos os worktrees —
+ * `git rev-parse --git-path hooks` o devolve em qualquer worktree), então um
+ * caminho estático indexaria o worktree errado.
  */
 export function hookScript(
   nodeBin: string,
@@ -111,8 +119,11 @@ export function hookScript(
     `${HOOK_MARKER}\n` +
     `# Instalado pelo kilocode-graph-plugin (E3a-S6). Não edite: regenerado no boot.\n` +
     `# Fire-and-forget: destacado para o git NÃO esperar a indexação.\n` +
-    `${shellQuote(nodeBin)} ${shellQuote(cliPath)} --workspace ` +
-    `${shellQuote(workspace)} --mode auto --source ${source} ` +
+    `# Workspace = raiz do worktree ATUAL (fallback: o embutido no install).\n` +
+    `root=$(git rev-parse --show-toplevel 2>/dev/null)\n` +
+    `[ -n "$root" ] || root=${shellQuote(workspace)}\n` +
+    `${shellQuote(nodeBin)} ${shellQuote(cliPath)} --workspace "$root" ` +
+    `--mode auto --source ${source} ` +
     `</dev/null >/dev/null 2>&1 &\n` +
     `disown 2>/dev/null || true\n` +
     `exit 0\n`

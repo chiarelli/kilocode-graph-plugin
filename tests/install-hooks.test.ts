@@ -76,9 +76,12 @@ test("install_hooks_creates_when_absent: dir vazio ⇒ 4 scripts com marcador", 
   // O caminho do node é ABSOLUTO e embutido (não confia no PATH do git).
   const postCommit = mem.files.get("/repo/.git/hooks/post-commit")!;
   assert.match(postCommit, /'\/usr\/bin\/node' '\/plugin\/src\/cli\.ts'/);
-  // CRÍTICO: o `--workspace` é embutido (o CLI o exige; o argv do git não o traz).
-  // Sem ele todo hook sairia com exit 2 e não sincronizaria nada.
-  assert.match(postCommit, /--workspace '\/repo'/);
+  // CRÍTICO: o `--workspace` é passado (o CLI o exige; o argv do git não o traz).
+  // O valor é resolvido em runtime por `git rev-parse --show-toplevel` (worktree,
+  // S6b), com o repoRoot embutido como fallback. Sem qualquer um dos dois, todo
+  // hook sairia com exit 2 e não sincronizaria nada.
+  assert.match(postCommit, /--workspace "\$root"/);
+  assert.match(postCommit, /root='\/repo'/, "fallback embutido = repoRoot do install");
   assert.match(postCommit, /--mode auto --source post-commit/);
   // Destacado: o git NÃO espera a indexação.
   assert.match(postCommit, /&$/m);
@@ -86,7 +89,7 @@ test("install_hooks_creates_when_absent: dir vazio ⇒ 4 scripts com marcador", 
   assert.ok(mem.chmods.every(([, m]) => m === 0o755));
 });
 
-test("install_hooks_workspace_embedded: o --workspace casa o repoRoot do install", () => {
+test("install_hooks_workspace_embedded: o fallback do --workspace casa o repoRoot", () => {
   const mem = memIo();
   installHooks({
     repoRoot: "/some/workspace",
@@ -96,7 +99,7 @@ test("install_hooks_workspace_embedded: o --workspace casa o repoRoot do install
   });
   assert.match(
     mem.files.get("/some/workspace/.git/hooks/post-merge")!,
-    /--workspace '\/some\/workspace'/,
+    /root='\/some\/workspace'/,
   );
 });
 
@@ -188,36 +191,41 @@ test("hookScript_never_sets_hooksPath: o script não toca core.hooksPath", () =>
   const script = hookScript("/usr/bin/node", "/p/src/cli.ts", "/ws", "post-merge");
   assert.ok(!script.includes("hooksPath"), "não altera core.hooksPath");
   assert.ok(script.includes(HOOK_MARKER));
-  assert.ok(script.includes("--workspace '/ws'"));
+  assert.ok(script.includes("--workspace"));
+  assert.ok(script.includes("root='/ws'"), "fallback embutido presente");
 });
 
 test("hookScript_runs_end_to_end: o script REAL invoca o CLI com --workspace", () => {
-  // Prova a correção CRÍTICA no caminho REAL: gera o script e o EXECUTA com um
-  // CLI stub que registra seus argumentos. Sem `--workspace` o CLI real sairia
-  // com exit 2 e nada sincronizaria — este teste falha se o flag sumir de novo.
+  // Prova a correção CRÍTICA no caminho REAL: gera o script e o EXECUTA (dentro
+  // de um repo git) com um CLI stub que registra seus argumentos. Sem
+  // `--workspace` o CLI real sairia com exit 2 e nada sincronizaria.
   const dir = mkdtempSync(join(tmpdir(), "graph-hook-e2e-"));
   try {
+    // Repo git real: `git rev-parse --show-toplevel` deve devolver `dir`.
+    execFileSync("git", ["init", "-q", dir]);
     const argsFile = join(dir, "args.txt");
     const stubCli = join(dir, "stub-cli.mjs");
-    // Stub: grava process.argv num arquivo e sai 0. Roda em replaced/background,
-    // então o hook retorna antes; damos um instante e lemos.
+    // Stub: grava process.argv num arquivo e sai 0. Roda destacado (`&`), então o
+    // hook retorna antes; o teste espera o arquivo aparecer.
     writeFileSync(
       stubCli,
       `import { writeFileSync } from "node:fs";\n` +
         `writeFileSync(${JSON.stringify(argsFile)}, process.argv.slice(2).join(" "));\n`,
     );
-    const script = hookScript(process.execPath, stubCli, "/the/ws", "post-commit");
+    const script = hookScript(process.execPath, stubCli, "/fallback/ws", "post-commit");
     const scriptPath = join(dir, "post-commit");
     writeFileSync(scriptPath, script, { mode: 0o755 });
 
-    execFileSync("/bin/sh", [scriptPath], { stdio: "ignore" });
-    // O processo é destacado (`&` + disown): espera o arquivo aparecer.
+    // cwd = repo: o hook resolve `--workspace` pelo toplevel real.
+    execFileSync("/bin/sh", [scriptPath], { cwd: dir, stdio: "ignore" });
     const deadline = Date.now() + 5000;
     while (!existsSync(argsFile) && Date.now() < deadline) {
       execFileSync(process.execPath, ["-e", "setTimeout(()=>{},30)"]);
     }
     const got = readFileSync(argsFile, "utf-8");
-    assert.match(got, /--workspace \/the\/ws/);
+    // `--workspace` = toplevel REAL do repo (não o fallback embutido).
+    assert.ok(!got.includes("/fallback/ws"), "não usou o fallback dentro do repo");
+    assert.match(got, /--workspace .*graph-hook-e2e-/);
     assert.match(got, /--mode auto/);
     assert.match(got, /--source post-commit/);
   } finally {

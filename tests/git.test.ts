@@ -5,9 +5,18 @@
  */
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
-import { createGitPort, type GitExec, type GitResult } from "../src/index/git.ts";
+import {
+  createGitPort,
+  spawnGit,
+  type GitExec,
+  type GitResult,
+} from "../src/index/git.ts";
 
 /** Executor fake: casa por prefixo de args e devolve o resultado. */
 function fakeExec(
@@ -105,4 +114,49 @@ test("git_hooksDir_none: sem repo ⇒ null", () => {
     fakeExec([{ match: ["rev-parse", "--git-path", "hooks"], result: { status: 128 } }]),
   );
   assert.equal(git.hooksDir("/repo"), null);
+});
+
+// --- S6b: worktree (git REAL) ----------------------------------------------
+
+test("git_worktree_hooksDir_shared: linked worktree resolve o hooks do repo COMUM", () => {
+  // Fatos medidos (git 2.34.1): `--git-path hooks` num worktree encadeado devolve
+  // o diretório COMUM (`.git/hooks` do repo principal) — os hooks são
+  // compartilhados. A porta deve devolvê-lo resolvido contra o repo passado.
+  const root = mkdtempSync(join(tmpdir(), "graph-wt-"));
+  try {
+    const main = join(root, "main");
+    execFileSync("git", ["init", "-q", main]);
+    execFileSync("git", ["-C", main, "config", "user.email", "t@t"]);
+    execFileSync("git", ["-C", main, "config", "user.name", "t"]);
+    execFileSync("git", ["-C", main, "commit", "-q", "--allow-empty", "-m", "init"]);
+    const linked = join(root, "linked");
+    execFileSync("git", ["-C", main, "worktree", "add", "-q", linked]);
+
+    const git = createGitPort(spawnGit);
+    const fromMain = git.hooksDir(main);
+    const fromLinked = git.hooksDir(linked);
+    assert.ok(fromMain && fromLinked);
+    // Ambos apontam para o MESMO hooks dir (do repo comum).
+    assert.equal(fromLinked, fromMain);
+    assert.match(fromMain!, /main\/\.git\/hooks$/);
+    // `--show-toplevel` do worktree encadeado é a própria raiz do worktree.
+    assert.equal(
+      spawnGit(linked, ["rev-parse", "--show-toplevel"]).stdout.trim(),
+      linked,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("git_non_repo_noop: diretório sem git ⇒ isRepo false, hooksDir null", () => {
+  const dir = mkdtempSync(join(tmpdir(), "graph-nogit-"));
+  try {
+    const git = createGitPort(spawnGit);
+    assert.equal(git.isRepo(dir), false);
+    assert.equal(git.hooksDir(dir), null);
+    assert.equal(git.head(dir), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
