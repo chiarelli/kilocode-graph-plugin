@@ -80,7 +80,9 @@ Convenções válidas para todas as epics:
         em runtime (`--show-toplevel`) para worktrees; degradações (não-git,
         indexer vazio, manifest corrompido→full, working tree fora, trava
         CLI×CLI)
-      - [ ] **E3a-S6c** — observabilidade do delta (base do E7)
+      - [x] **E3a-S6c** — observabilidade do delta: `formatCollectLine` com
+        `source`/`mode`/`trigger`/`indexer_ms`/`files`/`edges`/`removed`/`sync`
+        (base do E7)
       - [ ] **E3a-S6d** — fechamento (E2E gated, docs, zero marcadores)
 
 ### E3b — Registro do MCP do memtier

@@ -291,3 +291,8 @@ distinguível do boot; marca o delta como `incremental`/`full` e o gatilho.
   Degradações cobertas por teste: repo não-git (no-op), `indexer_bin` vazio
   (skipped, sem sync), manifest corrompido ⇒ full, working tree sujo fica fora
   (FR-507), e trava por workspace (`CLI × CLI`). Preservado o tmp por processo.
+- **2026-10-16 (f) — S6c (observabilidade).** `formatCollectLine` (pura): uma
+  linha por execução do coletor com `source` (distinguindo `boot` de
+  `post-commit`/…), `mode`, `trigger`, `indexer_ms`, `files`, `edges`, `removed`
+  e o bloco `sync={…}` (ou `sync=skipped reason=…`). O CLI injeta o `source` no
+  runtime; base do E7.

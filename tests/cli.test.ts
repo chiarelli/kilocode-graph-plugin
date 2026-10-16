@@ -522,6 +522,27 @@ test("cli_config_parity: config persistida (§7) vence o default do CLI", async 
   assert.equal(seen, true, "o CLI usa a MESMA config persistida pelo boot");
 });
 
+test("cli_source_threaded: --source chega ao runtime do coletor (S6c)", async () => {
+  const ws = tmpDir();
+  mkdirSync(join(ws, ".kilo"), { recursive: true });
+  writeFileSync(
+    join(ws, CONFIG_STATE_REL_PATH),
+    JSON.stringify({ code_index: { enabled: true } }),
+  );
+  let seenSource: string | undefined;
+  await runCli(
+    { workspace: ws, mode: "auto", source: "post-commit" },
+    {
+      git: fakeGit(),
+      collectCode: async (rt) => {
+        seenSource = rt.source;
+        return null;
+      },
+    },
+  );
+  assert.equal(seenSource, "post-commit");
+});
+
 test("cli_disabled_is_noop: code_index.enabled=false ⇒ exit 0, sem erro", async () => {
   const ws = tmpDir();
   mkdirSync(join(ws, ".kilo"), { recursive: true });

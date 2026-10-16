@@ -165,13 +165,10 @@ export async function runCli(args: CliArgs, deps: CliDeps = {}): Promise<number>
       ready: () => exists(readyPath),
       onFullComplete: () => writeReady(readyPath, `${new Date().toISOString()}\n`),
       forceMode: args.mode,
+      // S6c: a linha de observabilidade do coletor carrega a origem do disparo
+      // (`boot`/`post-commit`/…), distinguindo o delta de runtime do boot.
+      source: args.source ?? "cli",
     };
-
-    // S6c: linha de observabilidade por execução (distinguível do boot).
-    log(
-      `collect cli source=${args.source ?? "cli"} mode=${args.mode} ` +
-        `workspace=${workspace}`,
-    );
 
     // `null` cobre: desligado, sentinela ausente (aguardando full inicial),
     // indexer fora, erro fatal do job, trava ocupada. Não é erro do CLI — a

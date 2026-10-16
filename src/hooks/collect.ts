@@ -87,6 +87,12 @@ export interface CollectRuntime {
    * ancestralidade: sem range válido, cai em `full` (nunca incremental inválido).
    */
   forceMode?: IndexMode | "auto";
+  /**
+   * Origem do disparo (observabilidade S6c): `boot` | `post-commit` |
+   * `post-checkout` | `post-merge` | `post-rewrite`. Vai na linha de log por
+   * execução para distinguir o delta de runtime da coleta de boot.
+   */
+  source?: string;
 }
 
 /** Porta de estado do coletor (manifest) — implementada por `index/manifest.ts`. */
@@ -118,22 +124,58 @@ function logSyncFailure(err: unknown): void {
   logFatal("collect sync", err);
 }
 
+/**
+ * Campos da linha de observabilidade por execução do coletor (S6c, base do E7).
+ * Uma linha por execução, distinguível do boot pelo `source`.
+ */
+export interface CollectLogFields {
+  /** Origem do disparo (`boot`/`post-commit`/…). Default `boot`. */
+  source?: string;
+  /** Modo efetivo (após trigger + guarda). */
+  mode: IndexMode;
+  /** Gatilho que decidiu o modo (`auto`/`full`/`incremental` pedido). */
+  trigger?: string;
+  /** Duração do job do indexer (ms). */
+  indexerMs: number;
+  /** Arquivos enviados no body. */
+  files: number;
+  /** Arestas enviadas. */
+  edges: number;
+  /** Removidos (`chunks: []`). */
+  removed: number;
+  /** Resultado do sync (ausente ⇒ não houve sync). */
+  sync?: SyncResult | null;
+  /** Motivo quando não houve sync (sentinela, binário, erro fatal, trava). */
+  skip?: string;
+}
+
+/**
+ * Monta a linha de log estruturada do coletor. **Pura e testável** (o E7 consome
+ * estes campos). Formato estável `collect source=… mode=… trigger=… …` com o
+ * bloco `sync={…}` quando houve sync.
+ */
+export function formatCollectLine(f: CollectLogFields): string {
+  const source = f.source ?? "boot";
+  const stats = f.sync
+    ? ` sync={upserted:${f.sync.upserted},deleted:${f.sync.deleted},` +
+      `changed:${f.sync.changed},skipped:${f.sync.skipped}}`
+    : f.skip
+      ? ` sync=skipped reason=${f.skip}`
+      : " sync=skipped";
+  const trigger = f.trigger ? ` trigger=${f.trigger}` : "";
+  return (
+    `collect source=${source} mode=${f.mode}${trigger} ` +
+    `indexer_ms=${f.indexerMs} files=${f.files} edges=${f.edges} ` +
+    `removed=${f.removed}${stats}`
+  );
+}
+
 /** Log de observabilidade da coleta (base do E7). */
 function logCollection(
-  indexerMs: number,
-  files: number,
-  edges: number,
-  removed: number,
-  sync?: SyncResult,
+  rt: Pick<CollectRuntime, "source">,
+  fields: Omit<CollectLogFields, "source">,
 ): void {
-  const stats = sync
-    ? ` sync={upserted:${sync.upserted},deleted:${sync.deleted},` +
-      `changed:${sync.changed},skipped:${sync.skipped}}`
-    : " sync=skipped";
-  log(
-    `collect indexer_ms=${indexerMs} files=${files} edges=${edges} ` +
-      `removed=${removed}${stats}`,
-  );
+  log(formatCollectLine({ source: rt.source, ...fields }));
 }
 
 /** Estado real do coletor: manifest em `<repo>/.kilo/graph-manifest.json`. */
@@ -190,7 +232,12 @@ export async function collectCode(rt: CollectRuntime): Promise<SyncResult | null
     ? await acquireLock({ path: rt.lockPath })
     : { release: () => {} };
   if (rt.lockPath && lock === null) {
-    log("collect: trava ocupada por outro processo; abortado");
+    // O modo ainda não foi decidido (a trava vem antes do manifest), então a
+    // linha não finge um modo: só a origem + o motivo (coalescing/espera).
+    log(
+      `collect source=${rt.source ?? "boot"} trigger=${rt.forceMode ?? "auto"} ` +
+        `sync=skipped reason=trava ocupada por outro processo`,
+    );
     return null;
   }
   try {
@@ -259,7 +306,18 @@ async function collectUnderLock(
   // commit durante o full inicial não pode disparar um segundo full
   // concorrente — o sentinela fecha essa corrida.
   if (mode === "incremental" && rt.ready && !rt.ready()) {
-    log("collect: aguardando sync inicial (graph-ready ausente)");
+    log(
+      formatCollectLine({
+        source: rt.source,
+        mode,
+        trigger: rt.forceMode,
+        indexerMs: 0,
+        files: 0,
+        edges: 0,
+        removed: 0,
+        skip: "aguardando sync inicial",
+      }),
+    );
     return null;
   }
 
@@ -279,7 +337,15 @@ async function collectUnderLock(
   const indexerMs = Date.now() - start;
 
   if (result.skipped) {
-    logCollection(indexerMs, 0, 0, 0);
+    logCollection(rt, {
+      mode,
+      trigger: rt.forceMode,
+      indexerMs,
+      files: 0,
+      edges: 0,
+      removed: 0,
+      skip: result.reason ?? "indexer indisponível",
+    });
     return null;
   }
 
@@ -292,7 +358,15 @@ async function collectUnderLock(
       `collect: indexer abortou (${result.error.code}: ${result.error.message}); ` +
         `sync cancelado (grafo preservado)`,
     );
-    logCollection(indexerMs, 0, 0, 0);
+    logCollection(rt, {
+      mode,
+      trigger: rt.forceMode,
+      indexerMs,
+      files: 0,
+      edges: 0,
+      removed: 0,
+      skip: `indexer abortou: ${result.error.code}`,
+    });
     return null;
   }
 
@@ -351,7 +425,15 @@ async function collectUnderLock(
   );
   if (body.files.length === 0 && removed.length === 0) {
     debug("collect: nenhum chunk emitido; nada a sincronizar");
-    logCollection(indexerMs, 0, 0, 0);
+    logCollection(rt, {
+      mode,
+      trigger: rt.forceMode,
+      indexerMs,
+      files: 0,
+      edges: 0,
+      removed: 0,
+      skip: "sem chunks no range",
+    });
     // M3: um full "vazio" (repo vazio/só-ignorados, ou commit só de docs) AINDA
     // precisa gravar o HEAD e (no full) armar o sentinela — senão o sentinela
     // nunca nasce e todo boot/hook refaz full para sempre. Sem isto o gate do
@@ -365,7 +447,15 @@ async function collectUnderLock(
 
   try {
     const sync = await rt.client.syncCode(body.files, body.edges);
-    logCollection(indexerMs, body.files.length, body.edges.length, removed.length, sync);
+    logCollection(rt, {
+      mode,
+      trigger: rt.forceMode,
+      indexerMs,
+      files: body.files.length,
+      edges: body.edges.length,
+      removed: removed.length,
+      sync,
+    });
     // Estado pós-sync: arquivos ATUAIS (sem removidos) + HEAD atual. No
     // incremental, `present` só traz os alterados; mescla com os que já
     // estavam no manifest para não perder os inalterados. `removed` é subtraído
