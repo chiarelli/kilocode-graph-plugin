@@ -61,6 +61,13 @@ Convenções válidas para todas as epics:
 - [x] **E3a-S3** — Ciclo de vida: manifest por workspace → removidos com `chunks: []`; idempotência por `chunk_md5`
 - [x] **E3a-S4** — Trigger híbrido + backpressure (`pause`/`resume`) + paginação do sync
 - [x] **E3a-S5** — Fechamento: E2E do ciclo de vida real, docs, zero marcadores
+- [ ] **E3a-S6** — **Sync de delta em runtime** (ticket aberto por [RFC-002](docs/rfc/002-sync-de-delta-em-runtime.md)):
+      hoje `collectCode` só roda **no boot** (`src/index.ts:143`); commit com o Kilo
+      aberto só entra no grafo após reiniciar. Adicionar gatilho em sessão
+      (`session.idle` / pós-tool git / watch do HEAD) com **debounce por HEAD**,
+      **fora do turno** (FR-510), sem bloquear a UI; decidir mudanças
+      não-commitadas (working tree) e removidos no incremental. **Gate:** escolha
+      de escopo A/B em `RFC-002 §5`.
 
 ### E3b — Registro do MCP do memtier
 - [x] **E3b-S1** — Tracer bullet: registrar o MCP remoto no boot (`status`→`add`→`connect`)
@@ -282,9 +289,14 @@ redescobertas no meio do loop.
    vida (`tests/e2e/test_e2e_lifecycle.test.ts`, caso F3).
 
    **Aberto (não é ação do plugin):** o `rust-ast-indexer` **não emite** evento de
-   remoção, e `incremental_index` **aliasa para `index_path`** (recebe lista
-   explícita — não roda `git diff`), então o indexer nunca saberá os removidos.
-   Alternativas com tradeoffs → **RFC no memtier** (`docs/rfc/`).
+   remoção (segue válido). **CORRIGIDO 2026-10-16 (RFC-002):** a alegação anterior
+   de que `incremental_index` **aliasa para `index_path`** (sem rodar `git diff`)
+   é **falsa** na versão atual — ele **roda `git diff --name-only <from> <to>`**
+   (`cli/mod.rs:384` → `infra/git.rs:66`), e o `explicit_files` resultante é
+   honrado por `index_path_parallel` (`application/indexer.rs:128`). Provado com o
+   binário real: commit alterando 1 de 2 arquivos → `file_listed`/`chunk_emitted`
+   só do arquivo alterado. O delta incremental **existe e funciona**; o que falta
+   é **dispará-lo em runtime** (ver `E3a-S6` / [RFC-002](docs/rfc/002-sync-de-delta-em-runtime.md)).
 2. **Arestas sem teto de paginação.** A E3a-S4 fatia em lotes de ≤100 arquivos
    (`MAX_FILES_PER_REQUEST`, `code.py:112`), mas
    `MAX_EDGES_PER_REQUEST = 5_000` (`code.py:99`). 100 arquivos produzem
