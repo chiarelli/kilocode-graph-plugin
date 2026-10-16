@@ -183,10 +183,16 @@ export async function collectCode(rt: CollectRuntime): Promise<SyncResult | null
         )
       : [];
 
+  const buildStart = Date.now();
   const body = buildSyncBody(result.events, rt.identity, {
     repoRoot: rt.repoRoot,
     removed,
   });
+  const buildMs = Date.now() - buildStart;
+  debug(
+    `collect: build files=${body.files.length} edges=${body.edges.length} ` +
+      `build_ms=${buildMs} events=${result.events.length}`,
+  );
   if (body.files.length === 0 && removed.length === 0) {
     debug("collect: nenhum chunk emitido; nada a sincronizar");
     logCollection(indexerMs, 0, 0, 0);

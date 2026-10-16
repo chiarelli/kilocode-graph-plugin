@@ -170,10 +170,20 @@ function md5Hex(text: string): string {
 }
 
 /**
+ * Teto do texto do `FullFile` sintético (chars). O memtier rejeita chunk com
+ * `text` acima de 100000 chars (422 `string_too_long`); o `FullFile` carrega o
+ * arquivo inteiro e estourava em arquivos grandes (ex.: 178070 chars). Trunca
+ * com margem para nunca gerar 422 por tamanho — o conteúdo parcial ainda ancora
+ * as arestas de import em nível de arquivo (ADR-012 D3).
+ */
+export const MAX_FULLFILE_CHARS = 90_000;
+
+/**
  * Insere o `FullFile` sintético quando o indexer não o emitiu (o probe o
  * materializa — `probe_e2e_lifecycle.py:205`). Necessário porque `import_edge`
  * em nível de arquivo resolve para `{file}:FullFile` (ADR-012 D3). Se o arquivo
  * não puder ser lido, usa texto vazio (o `FullFile` ainda existe como nó).
+ * Texto acima de `MAX_FULLFILE_CHARS` é truncado (evita 422 + reduz o body).
  */
 function ensureFullFile(
   entry: CodeFile,
@@ -187,6 +197,9 @@ function ensureFullFile(
     text = read(abs);
   } catch {
     text = "";
+  }
+  if (text.length > MAX_FULLFILE_CHARS) {
+    text = text.slice(0, MAX_FULLFILE_CHARS);
   }
   const full: CodeChunk = {
     chunk_id: `full-${entry.file_path}`,
