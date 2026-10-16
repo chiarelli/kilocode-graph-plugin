@@ -286,6 +286,13 @@ default. Em `options`, o placeholder `{env:VAR}` resolve a env var citada
 | `mcp.timeout_ms` | `KILOCODE_GRAPH_MCP_TIMEOUT_MS` | `15000` |
 | `debug` | `KILOCODE_GRAPH_DEBUG` | `false` |
 
+> **Com `debug=true`, o plugin espelha o contexto injetado.**
+> `/tmp/kilocode-graph-plugin.log` é append-only (histórico); já
+> `/tmp/kilocode-graph-plugin-inject.log` é **truncado a cada escrita** e mostra,
+> em tempo real e em formato legível, o **raw** do que foi injetado no último
+> turno (blocos de memória `graph-memory` e de código `graph-code`, com contagem
+> de fatos/chunks e chars). Sem `debug`, o arquivo não é escrito.
+
 Env vars fora do prefixo:
 
 | Env var | Uso | Default |

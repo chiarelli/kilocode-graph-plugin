@@ -21,7 +21,7 @@
  */
 
 import { AuthError, InfraError } from "../client.ts";
-import { debug, log, logFatal } from "../logger.ts";
+import { debug, log, logFatal, writeInjectRaw } from "../logger.ts";
 import { applyJointBudget, type JointBudget } from "../inject/budget.ts";
 import {
   MemoryInjector,
@@ -162,6 +162,8 @@ export async function injectMemoryIntoMessages(
 
   debug("messages.transform: injetando contexto de memória");
   appendContextPart(parts, injection.block);
+  // Dump do raw injetado (só com debug). Sobrescreve a cada turno.
+  writeInjectRaw([{ title: "MEMÓRIA", block: injection.block, count: injection.facts }]);
 }
 
 /** Classifica a falha da busca de código para o log correto (nunca propaga). */
@@ -269,6 +271,15 @@ export async function injectContextIntoMessages(
   if (code) {
     debug("messages.transform: injetando contexto de código");
     appendContextPart(parts, code.block);
+  }
+  // Dump do raw injetado (só com debug). Sobrescreve a cada turno; só grava
+  // quando algo foi injetado — assim o arquivo reflete a ÚLTIMA injeção (um
+  // turno sem bloco, por dedup, não apaga o espelho do turno anterior).
+  if (memory || code) {
+    writeInjectRaw([
+      { title: "MEMÓRIA", block: memory?.block ?? null, count: memory?.facts },
+      { title: "CÓDIGO", block: code?.block ?? null, count: code?.chunks },
+    ]);
   }
 }
 
