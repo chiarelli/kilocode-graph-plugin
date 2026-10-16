@@ -10,11 +10,18 @@
  * o `dispose`.
  */
 
-import { isAbsolute, join, relative } from "node:path";
+import { join } from "node:path";
 
 import { MemtierClient } from "./client.ts";
-import { DEFAULTS, loadConfig, type PluginOptions } from "./config.ts";
-import { collectHook } from "./hooks/collect.ts";
+import {
+  loadConfig,
+  persistConfigState,
+  type PluginOptions,
+} from "./config.ts";
+import { createGitPort } from "./index/git.ts";
+import { installHooks } from "./index/install-hooks.ts";
+import { cliPath, spawnCollectCli } from "./cli-spawn.ts";
+import { resolveTokenFile } from "./token-file.ts";
 import { ingestHook } from "./hooks/ingest.ts";
 import { messagesHook } from "./hooks/messages.ts";
 import {
@@ -28,34 +35,10 @@ import { ensureWorkspaceKey } from "./provision.ts";
 import type { PluginCtx } from "./types.ts";
 import { resolveWorkspaceDir, workspaceName } from "./workspace.ts";
 
-/**
- * `token_file` é resolvido **dentro** do workspace (`daemon.token_file` default
- * `.kilo/graph-key.json`). Um caminho absoluto só é honrado se estiver contido no
- * `dir`; qualquer caminho que escape (absoluto fora do workspace, ou `../..`) é
- * **recusado** e cai no default do workspace. Sem esse confinamento o
- * provisionamento escreveria (destrutivamente) onde o caminho apontasse — ex.:
- * `/home/u/.ssh/authorized_keys` — contradizendo o escopo por workspace.
- * `token_file` vazio também cai no default: o plugin sempre tem um arquivo de
- * chave dentro do workspace (nunca um `""` que quebraria a escrita).
- */
-export function resolveTokenFile(dir: string, tokenFile: string): string {
-  const fallback = join(dir, DEFAULTS.daemon.token_file);
-  if (!tokenFile) return fallback;
-  const resolved = isAbsolute(tokenFile) ? tokenFile : join(dir, tokenFile);
-  if (!isInsideDir(dir, resolved)) {
-    log(
-      `token_file fora do workspace (${tokenFile}); usando ${DEFAULTS.daemon.token_file}`,
-    );
-    return fallback;
-  }
-  return resolved;
-}
-
-/** `true` quando `child` está contido em `parent` (ou é o próprio). */
-function isInsideDir(parent: string, child: string): boolean {
-  const rel = relative(parent, child);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
-}
+// `resolveTokenFile` mudou para `token-file.ts` (E3a-S6a) para o CLI standalone
+// reutilizar a MESMA regra de confinamento. Reexportado daqui para compatibilidade
+// (o boot e os testes o importam de `./index.ts`).
+export { resolveTokenFile } from "./token-file.ts";
 
 const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
   // O diretório do workspace vem do runtime do Kilo (`ctx.worktree` >
@@ -137,15 +120,28 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
     debug(`workspace dir=${dir}`);
   }
 
-  // Coleta de código (E3a): dispara no boot, **fora do turno** (FR-510). O
-  // `collectCode` nunca lança e roda em background; não é drenado no shutdown
-  // (o job do indexer pode ser longo — o processo o encerra se sair).
-  void collectHook({
-    cfg: config.code_index,
-    repoRoot: dir,
-    identity: { workspace, program: config.daemon.program },
-    client,
-  });
+  // Coleta de código (E3a-S6 §1b): o CLI é o **único escritor** do grafo — o
+  // plugin NÃO coleta. O boot:
+  //   1. persiste a `Config` efetiva (§7) para o CLI resolver a MESMA config
+  //      (o CLI standalone não vê o `options` inline do `kilo.jsonc`);
+  //   2. spawna o CLI em `auto` (híbrido: full no 1º uso, incremental depois —
+  //      NÃO full fixo: reindexar tudo a cada boot regrediria o custo/contradiria
+  //      a E3a-S4), em background (FR-510, nunca `await`);
+  //   3. instala os hooks git (§1) — idempotente, sem `core.hooksPath`.
+  // Tudo fora do caminho crítico e à prova de falha (nunca derruba o boot).
+  if (config.code_index.enabled) {
+    persistConfigState(dir, config);
+    spawnCollectCli({ workspace: dir, mode: "auto", source: "boot" });
+    try {
+      installHooks({
+        repoRoot: dir,
+        cliPath: cliPath(),
+        git: createGitPort(),
+      });
+    } catch (err) {
+      logFatal("install-hooks", err);
+    }
+  }
 
   // Registro do MCP remoto do memtier (E3b): implícito no boot, em background
   // (`void ... .catch()`), nunca bloqueia o carregamento nem derruba o plugin

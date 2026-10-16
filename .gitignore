@@ -18,3 +18,7 @@ dist/
 # estado do coletor de código (E3a) — por workspace, local
 graph-manifest.json
 .kilo/graph-manifest.json
+# E3a-S6: sentinela, trava cross-process e config persistida (estado local)
+.kilo/graph-ready
+.kilo/graph.lock
+.kilo/graph-config.json

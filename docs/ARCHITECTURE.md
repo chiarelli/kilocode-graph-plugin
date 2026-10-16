@@ -257,6 +257,12 @@ para mandar `chunks: []` aos que sumiram (FR-504) e para saber se é o 1º sync.
 > detecção de mudança é do plugin, e o modo incremental só cobre o que o **git**
 > vê — **mudanças não-commitadas não entram** no MVP.
 
+> ⏳ **Gatilho em runtime (decidido, não implementado).** Hoje a coleta roda **só
+> no boot** (único call site; sem watcher/timer). O delta em runtime — **hook git
+> pós-commit → CLI standalone** — está decidido em
+> [ADR-011](adr/011-gatilho-do-delta-em-runtime.md) e especificado em
+> [`specs/e3a-s6-stories.md`](../specs/e3a-s6-stories.md) (ticket `E3a-S6`).
+
 Referência validada (probe-grade, portar): `~/spikes/010-navegabilidade-codigo/probe_e2e_lifecycle.py`
 (`montar_body`, resolução de módulo Rust, materialização de `FullFile`).
 

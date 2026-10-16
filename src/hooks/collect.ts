@@ -15,6 +15,8 @@ import {
 } from "../client.ts";
 import { debug, log, logFatal } from "../logger.ts";
 import { buildSyncBody } from "../index/collector.ts";
+import type { GitPort } from "../index/git.ts";
+import { acquireLock } from "../index/lock.ts";
 import {
   emptyManifest,
   loadManifest,
@@ -24,7 +26,7 @@ import {
   saveManifest,
 } from "../index/manifest.ts";
 import { runIndexer, type IndexMode } from "../index/runner.ts";
-import { decideTrigger } from "../index/trigger.ts";
+import { decideTrigger, type TriggerDecision } from "../index/trigger.ts";
 import { join } from "node:path";
 import type { SyncResult } from "../types.ts";
 
@@ -53,12 +55,48 @@ export interface CollectRuntime {
    * real em `<repo>/.kilo/graph-manifest.json`.
    */
   state?: CollectState;
+  /**
+   * Porta de git (E3a-S6a). Presente ⇒ habilita a **guarda de ancestralidade**
+   * (§4) e a detecção de **removidos no incremental** (`--diff-filter=D`, §5).
+   * Ausente ⇒ comportamento S4 (decide só pela presença de `last_git_head`, sem
+   * removidos no incremental) — é o que os testes unitários da S4 esperam.
+   */
+  git?: GitPort;
+  /**
+   * Caminho do lockfile cross-process (`<ws>/.kilo/graph.lock`). Presente ⇒ a
+   * coleta serializa *load manifest → index → sync → save* (§3b). Ausente ⇒ sem
+   * trava (testes unitários; o CLI de produção sempre passa o caminho).
+   */
+  lockPath?: string;
+  /**
+   * Chamado **após um sync bem-sucedido em modo full** (o full inicial é quem
+   * arma o incremento): o CLI usa isto para escrever o sentinela `graph-ready`
+   * (§3). Recebe o HEAD corrente. Default: no-op.
+   */
+  onFullComplete?: () => void;
+  /**
+   * Estado do sentinela `graph-ready` (§3). Presente ⇒ um **incremental** só roda
+   * se `ready()` for `true`; caso contrário a coleta é abortada com log (o full
+   * inicial ainda não concluiu). O `full` do 1º uso **não** é gated — é quem cria
+   * o sentinela. Ausente ⇒ sem gate (testes unitários, boot legado).
+   */
+  ready?: () => boolean;
+  /**
+   * Modo forçado (`--mode full|incremental` no CLI). Ausente/`auto` ⇒ decide pelo
+   * manifest + ancestralidade. `incremental` forçado ainda passa pela guarda de
+   * ancestralidade: sem range válido, cai em `full` (nunca incremental inválido).
+   */
+  forceMode?: IndexMode | "auto";
 }
 
 /** Porta de estado do coletor (manifest) — implementada por `index/manifest.ts`. */
 export interface CollectState {
-  /** Estado atual (arquivos sincronizados + head). */
-  load(): { files: string[]; last_git_head?: string | null };
+  /**
+   * Estado atual (arquivos sincronizados + head). `workspace` é a identidade
+   * gravada na última execução — se divergir da atual, o estado é de OUTRO
+   * workspace e o incremental reusaria um manifest alheio (grafo incompleto).
+   */
+  load(): { files: string[]; last_git_head?: string | null; workspace?: string };
   /** Persiste o estado pós-sync (arquivos atuais + head). */
   save(files: string[], head: string | null): void;
 }
@@ -104,7 +142,11 @@ function fileState(repoRoot: string, workspace: string): CollectState {
   return {
     load: () => {
       const manifest = loadManifest(path, workspace);
-      return { files: manifest.files, last_git_head: manifest.last_git_head };
+      return {
+        files: manifest.files,
+        last_git_head: manifest.last_git_head,
+        workspace: manifest.workspace,
+      };
     },
     save: (files, head) => {
       try {
@@ -140,16 +182,86 @@ export async function collectCode(rt: CollectRuntime): Promise<SyncResult | null
     debug("collect: desligado (code_index.enabled=false)");
     return null;
   }
+  // Trava cross-process (§3b): boot e post-commit são processos SO distintos. A
+  // trava em memória do repo NÃO cobre dois processos; sem o lockfile, dois CLIs
+  // concorrentes corrompem o manifest. Sem `lockPath` (teste unitário), segue sem
+  // trava — só o CLI de produção o passa.
+  const lock = rt.lockPath
+    ? await acquireLock({ path: rt.lockPath })
+    : { release: () => {} };
+  if (rt.lockPath && lock === null) {
+    log("collect: trava ocupada por outro processo; abortado");
+    return null;
+  }
+  try {
+    return await collectUnderLock(rt);
+  } finally {
+    lock?.release();
+  }
+}
+
+/** Corpo de `collectCode` sob a trava cross-process. */
+async function collectUnderLock(
+  rt: CollectRuntime,
+): Promise<SyncResult | null> {
   const run = rt.run ?? runIndexer;
   const state = rt.state ?? fileState(rt.repoRoot, rt.identity.workspace);
+  const git = rt.git;
   const start = Date.now();
 
   const manifest = state.load();
-  const trigger = decideTrigger({
-    files: manifest.files,
-    last_git_head: manifest.last_git_head ?? null,
-  });
+  // Troca de identidade do workspace: um manifest de OUTRO workspace (o usuário
+  // mudou `daemon.workspace`) não pode alimentar um incremental — o grafo novo
+  // receberia só o delta e ficaria incompleto. Trata como 1º uso ⇒ full.
+  const identityChanged =
+    typeof manifest.workspace === "string" &&
+    manifest.workspace !== "" &&
+    manifest.workspace !== rt.identity.workspace;
+  if (identityChanged) {
+    log(
+      `collect: workspace mudou (${manifest.workspace} → ${rt.identity.workspace}); ` +
+        `forçando full`,
+    );
+  }
+  // H2 (TOCTOU de HEAD): resolve o HEAD UMA vez, para o SHA concreto, e usa-o em
+  // TODAS as consultas (ancestralidade, `git_range.to`, `diff`, `save`). Resolver
+  // o literal `"HEAD"` em instantes distintos permitia um commit entre a
+  // ancestralidade e o diff (ou entre o diff e o save) → delta perdido em
+  // silêncio (o range indexado não casa o HEAD gravado).
+  const headSha = git ? git.head(rt.repoRoot) : null;
+  // `--mode full` explícito ignora o manifest. `auto`/`incremental` decidem por
+  // manifest + guarda de ancestralidade (§4): sem range válido, cai em full.
+  const trigger: TriggerDecision =
+    rt.forceMode === "full" || identityChanged
+      ? { mode: "full" }
+      : decideTrigger(
+          {
+            files: manifest.files,
+            last_git_head: manifest.last_git_head ?? null,
+          },
+          // Guarda de ancestralidade (§4): só incremental se `last_git_head` é
+          // ancestral do HEAD resolvido. Sem HEAD (repo vazio) ⇒ não-ancestral ⇒
+          // full. Sem porta de git, mantém o comportamento S4.
+          git
+            ? {
+                isAncestor: (from) =>
+                  headSha !== null && git.isAncestor(rt.repoRoot, from, headSha),
+              }
+            : {},
+        );
+  // Pina o `to` do range no SHA resolvido (nunca o literal "HEAD").
+  if (trigger.mode === "incremental" && trigger.gitRange && headSha) {
+    trigger.gitRange = { from: trigger.gitRange.from, to: headSha };
+  }
   const mode: IndexMode = trigger.mode;
+
+  // Gate do sentinela (§3): só arma o incremental DEPOIS do full inicial. Um
+  // commit durante o full inicial não pode disparar um segundo full
+  // concorrente — o sentinela fecha essa corrida.
+  if (mode === "incremental" && rt.ready && !rt.ready()) {
+    log("collect: aguardando sync inicial (graph-ready ausente)");
+    return null;
+  }
 
   let result;
   try {
@@ -184,20 +296,51 @@ export async function collectCode(rt: CollectRuntime): Promise<SyncResult | null
     return null;
   }
 
-  const present = collectPresent(result.events);
-  // Removidos só se detectam no FULL: no incremental o stream traz apenas os
-  // arquivos alterados no range — tratá-los como "estado completo" marcaria
-  // todo inalterado como removido e apagaria o grafo (defeito medido).
-  const removed =
-    mode === "full"
-      ? removedFiles(
-          { ...emptyManifest(rt.identity.workspace), files: manifest.files },
-          present,
-        )
-      : [];
+  // Removidos:
+  //   - FULL: o stream é o estado COMPLETO do repo ⇒ removido = manifest − present.
+  //   - INCREMENTAL: o stream traz só os alterados no range; tratar os ausentes
+  //     como removidos apagaria o grafo (defeito medido). A fonte de verdade das
+  //     deleções é o próprio git (`--diff-filter=D` no range — §5), não o stream.
+  //     Sem isso o indexer emite chunk vazio para o arquivo deletado e o grafo
+  //     cria um nó fantasma.
+  // `present` (full) = arquivos com chunk no stream COMPLETO.
+  const presentFull = collectPresent(result.events);
+  let removed: string[];
+  if (mode === "full") {
+    // Troca de identidade: o manifest antigo é de OUTRO workspace — seus arquivos
+    // nunca estiveram no grafo novo, então NÃO entram como removidos.
+    const priorFiles = identityChanged ? [] : manifest.files;
+    removed = removedFiles(
+      { ...emptyManifest(rt.identity.workspace), files: priorFiles },
+      presentFull,
+    );
+  } else if (git && trigger.gitRange) {
+    removed = git.deletedFiles(
+      rt.repoRoot,
+      trigger.gitRange.from,
+      trigger.gitRange.to,
+    );
+  } else {
+    removed = [];
+  }
+
+  // M2 (git é a verdade no incremental): se o indexer emitir um chunk para um
+  // arquivo que o git reporta deletado (nó fantasma "medido"), o `buildSyncBody`
+  // o descartaria do tombstone (`removed.filter(p => !present.has(p))`). Remove os
+  // eventos desses caminhos ANTES de montar o body, para a deleção vencer sempre.
+  const removedSet = new Set(removed);
+  const events =
+    mode === "incremental" && removedSet.size > 0
+      ? result.events.filter((ev) => {
+          if (ev.event !== "chunk_emitted") return true;
+          const p = ev.payload as { file?: unknown } | null;
+          return !(p && typeof p.file === "string" && removedSet.has(p.file));
+        })
+      : result.events;
+  const present = collectPresent(events);
 
   const buildStart = Date.now();
-  const body = buildSyncBody(result.events, rt.identity, {
+  const body = buildSyncBody(events, rt.identity, {
     repoRoot: rt.repoRoot,
     removed,
   });
@@ -209,6 +352,14 @@ export async function collectCode(rt: CollectRuntime): Promise<SyncResult | null
   if (body.files.length === 0 && removed.length === 0) {
     debug("collect: nenhum chunk emitido; nada a sincronizar");
     logCollection(indexerMs, 0, 0, 0);
+    // M3: um full "vazio" (repo vazio/só-ignorados, ou commit só de docs) AINDA
+    // precisa gravar o HEAD e (no full) armar o sentinela — senão o sentinela
+    // nunca nasce e todo boot/hook refaz full para sempre. Sem isto o gate do
+    // incremental nunca abre.
+    if (mode === "full") {
+      state.save(manifest.files, headSha ?? (git ? null : await currentHead(rt.repoRoot)));
+      rt.onFullComplete?.();
+    }
     return null;
   }
 
@@ -217,11 +368,27 @@ export async function collectCode(rt: CollectRuntime): Promise<SyncResult | null
     logCollection(indexerMs, body.files.length, body.edges.length, removed.length, sync);
     // Estado pós-sync: arquivos ATUAIS (sem removidos) + HEAD atual. No
     // incremental, `present` só traz os alterados; mescla com os que já
-    // estavam no manifest para não perder os inalterados.
-    const merged = mode === "incremental"
-      ? [...new Set([...manifest.files.filter((f) => !removed.includes(f)), ...present])]
-      : present;
-    state.save(merged, await currentHead(rt.repoRoot));
+    // estavam no manifest para não perder os inalterados. `removed` é subtraído
+    // DEPOIS da união (M2): um arquivo deletado não pode ressuscitar no manifest
+    // por ter vindo em `present` — o git é a verdade.
+    const merged =
+      mode === "incremental" && !identityChanged
+        ? [
+            ...new Set([
+              ...manifest.files.filter((f) => !removedSet.has(f)),
+              ...present,
+            ]),
+          ].filter((f) => !removedSet.has(f))
+        : present;
+    // Grava o HEAD RESOLVIDO no início (H2): o range indexado e o head gravado
+    // descrevem o MESMO ponto — sem isso um commit concorrente deixaria um vão
+    // de delta nunca revisitado. Sem porta de git, o caminho S4 legado.
+    const newHead = git ? headSha : await currentHead(rt.repoRoot);
+    state.save(merged, newHead);
+    // Full concluído ⇒ arma o incremental: o CLI escreve o sentinela
+    // `graph-ready` (§3). É o full inicial quem o cria; o incremental só roda
+    // com ele presente.
+    if (mode === "full") rt.onFullComplete?.();
     return sync;
   } catch (err) {
     logSyncFailure(err);

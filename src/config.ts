@@ -19,11 +19,17 @@
  * recebe esse diretório como segundo argumento.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
-import { log } from "./logger.ts";
+import { debug, log } from "./logger.ts";
 import type { Config } from "./types.ts";
 
 /**
@@ -491,4 +497,95 @@ export function loadConfig(
       DEFAULTS.debug,
     ),
   };
+}
+
+// --- E3a-S6 §7: paridade de config boot × CLI --------------------------------
+
+/** Arquivo de config persistida (estado local, não versionado). */
+export const CONFIG_STATE_REL_PATH = ".kilo/graph-config.json";
+
+/** Sentinela que arma o incremental (criado ao concluir o full inicial). */
+export const READY_REL_PATH = ".kilo/graph-ready";
+
+/**
+ * Config efetiva → objeto no formato de `options` (o 2º elemento da tupla do
+ * plugin). **Segredos são removidos**: `daemon.token`/`daemon.manager_token` são
+ * credenciais vivas (env) e **nunca** vão para o arquivo persistido — só a chave
+ * do workspace (`graph-key.json`, `0600`) carrega token. As demais chaves são
+ * valores resolvidos (config, não segredo), então reproduzem a config do boot.
+ */
+export function configStateFrom(config: Config): PluginOptions {
+  return {
+    daemon: {
+      url: config.daemon.url,
+      token_file: config.daemon.token_file,
+      program: config.daemon.program,
+      workspace: config.daemon.workspace,
+      health_timeout_ms: config.daemon.health_timeout_ms,
+    },
+    inject: {
+      enabled: config.inject.enabled,
+      max_memories: config.inject.max_memories,
+      memory_max_tokens: config.inject.memory_max_tokens,
+      code_max_tokens: config.inject.code_max_tokens,
+      timeout_ms: config.inject.timeout_ms,
+      code_enabled: config.inject.code_enabled,
+      max_code_chunks: config.inject.max_code_chunks,
+    },
+    code_index: {
+      enabled: config.code_index.enabled,
+      indexer_bin: config.code_index.indexer_bin,
+      sync_timeout_ms: config.code_index.sync_timeout_ms,
+      load_ignores: config.code_index.load_ignores,
+    },
+    ingest: {
+      enabled: config.ingest.enabled,
+      batch_size: config.ingest.batch_size,
+      max_hashes: config.ingest.max_hashes,
+      timeout_ms: config.ingest.timeout_ms,
+    },
+    mcp: {
+      enabled: config.mcp.enabled,
+      name: config.mcp.name,
+      timeout_ms: config.mcp.timeout_ms,
+    },
+    debug: config.debug,
+  };
+}
+
+/**
+ * Lê a config persistida do workspace (estado local). Ausente/corrompido ⇒
+ * `undefined` (o CLI cai no path de config normal: env > arquivo > default).
+ * **Nunca lança.**
+ */
+export function loadConfigState(dir: string): PluginOptions | undefined {
+  const path = join(dir, CONFIG_STATE_REL_PATH);
+  if (!existsSync(path)) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf-8")) as unknown;
+    return isPlainObject(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Grava a config efetiva do boot em `<dir>/.kilo/graph-config.json` (escrita
+ * atômica tmp+rename; segredos removidos por `configStateFrom`). É a **fonte
+ * única** de config para o CLI standalone (§7): sem isso, config só-no-inline do
+ * `kilo.jsonc` divergiria entre boot e CLI. **Nunca lança** — falha é debug.
+ */
+export function persistConfigState(dir: string, config: Config): void {
+  const path = join(dir, CONFIG_STATE_REL_PATH);
+  try {
+    const parent = dirname(path);
+    if (parent && parent !== ".") mkdirSync(parent, { recursive: true });
+    const tmp = `${path}.tmp.${process.pid}`;
+    writeFileSync(tmp, `${JSON.stringify(configStateFrom(config), null, 2)}\n`, "utf-8");
+    renameSync(tmp, path);
+  } catch (err) {
+    debug(
+      `config: estado não persistido (${err instanceof Error ? err.message : err})`,
+    );
+  }
 }

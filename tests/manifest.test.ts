@@ -71,8 +71,13 @@ test("manifest_atomic_write: grava em tmp e renomeia; JSON válido", () => {
     mkdir: () => {},
   });
   assert.equal(calls.length, 1);
-  assert.match(calls[0]![0], /\.tmp$/);
-  assert.deepEqual(renamed, ["/ws/.kilo/graph-manifest.json.tmp", "/ws/.kilo/graph-manifest.json"]);
+  // E3a-S6a §3b: o tmp é ÚNICO por processo (`.tmp.${pid}`) — antes era fixo
+  // (`.tmp`), o que fazia o `rename` do perdedor falhar (ENOENT) sob concorrência.
+  assert.match(calls[0]![0], /\.tmp\.\d+$/);
+  assert.deepEqual(renamed, [
+    calls[0]![0],
+    "/ws/.kilo/graph-manifest.json",
+  ]);
   const parsed = JSON.parse(calls[0]![1]) as { files: string[]; last_git_head: string };
   assert.deepEqual(parsed.files, ["a.rs"]);
   assert.equal(parsed.last_git_head, "sha");

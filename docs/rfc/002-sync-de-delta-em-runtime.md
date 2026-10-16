@@ -1,6 +1,9 @@
 # RFC-002 — O delta de código é coletado só no boot (não há sync incremental em runtime)
 
-**Status:** aberto · **Data:** 2026-10-16
+**Status:** **decidido** (Opção A — sync de delta em runtime) · **Data:** 2026-10-16
+**Decisão:** [ADR-011](../adr/011-gatilho-do-delta-em-runtime.md) (hook git
+pós-commit + CLI standalone) · **Spec:** [`specs/e3a-s6-stories.md`](../../specs/e3a-s6-stories.md)
+· **Ticket:** `E3a-S6` (implementação pendente)
 **Autor:** verificação empírica (workspace `workspace-8af22c44`, programa `graphplugin`)
 **Componentes afetados:** este plugin (`src/hooks/collect.ts`, `src/index.ts`, `src/index/trigger.ts`)
 **Relacionados:** [ADR-005](../adr/005-plugin-e-o-coletor.md) (o plugin é o coletor), [ADR-007](../adr/007-gatilho-da-ingestao.md) (gatilho da **ingestão** de memória — não do código), [RFC-001](001-navegacao-e-integridade-do-grafo-de-codigo.md)
@@ -160,6 +163,13 @@ existe** (git range). O que falta para "sync do delta em runtime" é apenas o
 
 ## 5. Propostas
 
+> **Decidido (2026-10-16):** **Opção A** — sync de delta em runtime, via **hook
+> git pós-commit** (não `session.idle`) + **CLI standalone** + **sentinela
+> `.kilo/graph-ready`** + **guarda de ancestralidade** + **removidos no
+> incremental**. Ver [ADR-011](../adr/011-gatilho-do-delta-em-runtime.md) e a spec
+> [`specs/e3a-s6-stories.md`](../../specs/e3a-s6-stories.md). As opções abaixo
+> ficam registradas como histórico.
+
 ### Opção A — escopo: sync de delta em runtime (recomendada, se o dono quer)
 
 Adicionar um gatilho que reexecute `collectCode` durante a sessão, com
@@ -219,7 +229,7 @@ provavelmente acidental, não uma decisão desenhada.
 
 | Item | Dono | Ação |
 |---|---|---|
-| 1. Definir: runtime delta ou boot-only | dono | escolher A ou B |
-| 2. Se A: **ticket de sync de delta em runtime** | este plugin | criar epic (E8/E3a-S6) com os critérios acima |
-| 3. Corrigir o BACKLOG | este plugin | o item afirma que `incremental_index` não roda `git diff` — é falso na versão atual |
-| 4. Deleção no incremental | este plugin | decidir (removidos no incremental ou full periódico) |
+| 1. Definir: runtime delta ou boot-only | dono | ✅ **decidido: Opção A** (runtime), via hook git — [ADR-011](../adr/011-gatilho-do-delta-em-runtime.md) |
+| 2. Se A: **ticket de sync de delta em runtime** | este plugin | ✅ **criado**: `E3a-S6`, especificado em [`specs/e3a-s6-stories.md`](../../specs/e3a-s6-stories.md) (S6a–S6d); **implementação pendente** |
+| 3. Corrigir o BACKLOG | este plugin | ✅ feito (o item afirma que `incremental_index` não roda `git diff` — falsificado) |
+| 4. Deleção no incremental | este plugin | ✅ **decidido**: tratar removidos no incremental (`--diff-filter=D`), na S6a |

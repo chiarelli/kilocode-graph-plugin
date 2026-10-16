@@ -76,6 +76,8 @@ export function saveManifest(
     rename?: (from: string, to: string) => void;
     exists?: (p: string) => boolean;
     mkdir?: (p: string) => void;
+    /** Sufixo de unicidade do tmp (default `process.pid`; injetável em teste). */
+    tmpSuffix?: string;
   } = {},
 ): void {
   if (!path) return;
@@ -86,7 +88,12 @@ export function saveManifest(
   // falha silenciosamente e o manifest nunca persiste (o full refaz sempre).
   const dir = dirname(path);
   if (dir && dir !== ".") mkdir(dir);
-  const tmp = `${path}.tmp`;
+  // `.tmp` ÚNICO por processo: boot e post-commit são processos distintos (§3b).
+  // Um tmp FIXO faz o `rename` do perdedor falhar com `ENOENT` (o vencedor já o
+  // consumiu) e o erro é engolido (só `debug`), perdendo estado em silêncio. O
+  // `provision.ts` já usa `.tmp.${pid}` (mesmo padrão).
+  const suffix = io.tmpSuffix ?? String(process.pid);
+  const tmp = `${path}.tmp.${suffix}`;
   const data = `${JSON.stringify(manifest, null, 2)}\n`;
   write(tmp, data);
   rename(tmp, path);
