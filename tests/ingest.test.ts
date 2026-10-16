@@ -1237,6 +1237,25 @@ test("s2_backend_provider_close_never_throws: erro do close não derruba o shutd
   assert.doesNotThrow(() => provider.close());
 });
 
+test("s2_backend_provider_lazy_path: resolvedor de caminho não roda até a 1ª abertura", async () => {
+  // Regressão do deadlock de boot: quando o caminho do `kilo.db` vem do runtime
+  // (`client.path.get`, chamada HTTP ao próprio servidor), ele NÃO pode ser
+  // resolvido no boot do plugin — o `server()` travaria. Aqui o resolvedor
+  // (assíncrono, como o `path.get`) só pode ser chamado na 1ª `get()`.
+  let resolves = 0;
+  const fake: SqliteBackend = { query: () => [], close: () => {} };
+  const provider = createBackendProvider(
+    async () => {
+      resolves++;
+      return "/runtime/kilo.db";
+    },
+    { open: async (p) => { assert.equal(p, "/runtime/kilo.db"); return fake; } },
+  );
+  assert.equal(resolves, 0, "resolvedor não roda ao construir o provider");
+  assert.equal(await provider.get(), fake);
+  assert.equal(resolves, 1, "resolvedor roda exatamente uma vez, na abertura");
+});
+
 test("s2_hook_dispose_closes_backend: o hook expõe `dispose` que fecha o provedor", async () => {
   const { statePath, cleanup } = tmpState();
   try {

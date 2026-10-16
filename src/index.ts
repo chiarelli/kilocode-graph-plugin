@@ -19,6 +19,7 @@ import { ingestHook } from "./hooks/ingest.ts";
 import { messagesHook } from "./hooks/messages.ts";
 import {
   resolveRuntimeDbPath,
+  type DbPathSource,
   type RuntimePathClient,
 } from "./ingest/db.ts";
 import { INGEST_STATE_REL_PATH } from "./ingest/state.ts";
@@ -161,11 +162,15 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
 
   // E4: o `kilo.db` é lido do **runtime do Kilo** (`client.path.get().state` →
   // `<state>/kilo.db`), nunca de `process.cwd()` nem de env var: o runtime já
-  // determinou, no boot, onde está o banco configurado. Resolve uma vez (o
-  // caminho é estável na sessão) e só quando a ingestão está ligada; nunca lança
-  // — degrada para o db default. Desligada, o provider nem é aberto.
-  const dbPath = config.ingest.enabled
-    ? await resolveRuntimeDbPath(ctx.client as RuntimePathClient | undefined, dir)
+  // determinou, no boot, onde está o banco configurado. A resolução é **lazy**
+  // (um resolver, não `await` aqui): `client.path.get` é uma chamada HTTP ao
+  // próprio servidor Kilo, e aguardá-la dentro do `server()` **trava** — o
+  // servidor só atende requisições depois que `server()` retorna (deadlock
+  // medido: `/session` e `/path` ficam pendurados e a UI não abre sessão). O
+  // resolver roda na primeira abertura do backend (disparada por evento), já
+  // com o servidor no ar. Desligada a ingestão, o provider nem é aberto.
+  const dbPath: DbPathSource = config.ingest.enabled
+    ? () => resolveRuntimeDbPath(ctx.client as RuntimePathClient | undefined, dir)
     : "";
 
   // E4: ingestion hooks. Construído fora do objeto de retorno para que o

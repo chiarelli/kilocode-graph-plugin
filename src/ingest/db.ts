@@ -186,9 +186,21 @@ export interface BackendProvider {
   close(): void;
 }
 
+/**
+ * Fonte do caminho do `kilo.db`: uma string fixa **ou** um resolvedor lazy.
+ * O resolvedor existe para **não bloquear o boot** do plugin: quando o caminho
+ * vem do próprio runtime (`client.path.get`, uma chamada HTTP ao servidor Kilo),
+ * aguardá-lo dentro do `server()` **trava** — o servidor ainda não atende
+ * requisições enquanto roda o `server()` do plugin (deadlock medido: `server()`
+ * nunca retorna, `/session` e `/path` ficam pendurados e a UI não abre sessão).
+ * Com o resolvedor, a resolução acontece na **primeira abertura do backend**
+ * (já no ar, disparada por evento), fora do caminho crítico do boot.
+ */
+export type DbPathSource = string | (() => Promise<string>);
+
 /** Provedor real (abre `dbPath` sob demanda); `open`/`onError` injetáveis. */
 export function createBackendProvider(
-  dbPath: string,
+  dbPath: DbPathSource,
   opts: {
     open?: (p: string) => Promise<SqliteBackend>;
     onError?: (err: unknown) => void;
@@ -201,7 +213,9 @@ export function createBackendProvider(
     get: async () => {
       if (current) return current;
       if (!inflight) {
-        inflight = open(dbPath)
+        inflight = Promise.resolve()
+          .then(() => (typeof dbPath === "function" ? dbPath() : dbPath))
+          .then((resolved) => open(resolved))
           .then((b) => {
             current = b;
             return b;
