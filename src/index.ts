@@ -131,11 +131,17 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
   // Tudo fora do caminho crítico e à prova de falha (nunca derruba o boot).
   if (config.code_index.enabled) {
     persistConfigState(dir, config);
-    spawnCollectCli({ workspace: dir, mode: "auto", source: "boot" });
+    spawnCollectCli({
+      workspace: dir,
+      mode: "auto",
+      source: "boot",
+      nodeBin: config.daemon.node_bin,
+    });
     try {
       installHooks({
         repoRoot: dir,
         cliPath: cliPath(),
+        nodeBin: config.daemon.node_bin,
         git: createGitPort(),
       });
     } catch (err) {

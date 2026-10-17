@@ -53,6 +53,10 @@ export const DEFAULTS = {
     // precisa pinar o nome. NÃO recebe o sufixo de hash.
     workspace: "",
     health_timeout_ms: 2000,
+    // Interpretador JS do CLI standalone (boot + hook). Vazio ⇒ `process.execPath`
+    // (num host Bun, o binário do extension host do Kilo — ver `runtime.ts`).
+    // Setado ⇒ pinar um `node`/`bun` explícito (útil em CI ou host sem Bun).
+    node_bin: "",
     // Provisionamento: bearer do gestor. Vazio ⇒ provisionamento desligado
     // (a chave do workspace é pré-requisito manual, como antes).
     manager_token: "",
@@ -349,6 +353,11 @@ export function loadConfig(
         ),
         DEFAULTS.daemon.health_timeout_ms,
       ),
+      node_bin: resolve(
+        "daemon.node_bin",
+        "KILOCODE_GRAPH_NODE_BIN",
+        DEFAULTS.daemon.node_bin,
+      ),
     },
     inject: {
       enabled: resolveBool(
@@ -522,6 +531,7 @@ export function configStateFrom(config: Config): PluginOptions {
       program: config.daemon.program,
       workspace: config.daemon.workspace,
       health_timeout_ms: config.daemon.health_timeout_ms,
+      node_bin: config.daemon.node_bin,
     },
     inject: {
       enabled: config.inject.enabled,

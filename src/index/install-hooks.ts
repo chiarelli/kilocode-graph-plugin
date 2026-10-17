@@ -32,6 +32,7 @@ import {
 import { join } from "node:path";
 
 import { debug, log } from "../logger.ts";
+import { resolveNodeRuntime } from "../runtime.ts";
 import type { GitPort } from "./git.ts";
 
 /** Linha-marcadora que identifica um hook escrito por este plugin. */
@@ -53,6 +54,8 @@ export interface InstallHooksOptions {
   repoRoot: string;
   /** Caminho absoluto do `node` a embutir no script (default `process.execPath`). */
   nodeBin?: string;
+  /** `true` força o host como Bun (teste); default detecta em runtime. */
+  hostIsBun?: boolean;
   /** Caminho absoluto do CLI (`src/cli.ts`) a embutir. */
   cliPath: string;
   /** Porta de git (default `createGitPort()`); injetável em teste. */
@@ -113,6 +116,7 @@ export function hookScript(
   cliPath: string,
   workspace: string,
   source: HookName,
+  envPrefix = "",
 ): string {
   return (
     `#!/bin/sh\n` +
@@ -122,7 +126,7 @@ export function hookScript(
     `# Workspace = raiz do worktree ATUAL (fallback: o embutido no install).\n` +
     `root=$(git rev-parse --show-toplevel 2>/dev/null)\n` +
     `[ -n "$root" ] || root=${shellQuote(workspace)}\n` +
-    `${shellQuote(nodeBin)} ${shellQuote(cliPath)} --workspace "$root" ` +
+    `${envPrefix}${shellQuote(nodeBin)} ${shellQuote(cliPath)} --workspace "$root" ` +
     `--mode auto --source ${source} ` +
     `</dev/null >/dev/null 2>&1 &\n` +
     `disown 2>/dev/null || true\n` +
@@ -169,7 +173,10 @@ export function installHooks(opts: InstallHooksOptions): InstallHooksResult {
   }
   result.hooksDir = hooksDir;
 
-  const nodeBin = opts.nodeBin ?? process.execPath;
+  const runtime = resolveNodeRuntime(
+    opts.nodeBin,
+    opts.hostIsBun ?? undefined,
+  );
   try {
     mkdir(hooksDir);
   } catch {
@@ -178,7 +185,13 @@ export function installHooks(opts: InstallHooksOptions): InstallHooksResult {
 
   for (const name of HOOK_NAMES) {
     const path = join(hooksDir, name);
-    const desired = hookScript(nodeBin, opts.cliPath, opts.repoRoot, name);
+    const desired = hookScript(
+      runtime.bin,
+      opts.cliPath,
+      opts.repoRoot,
+      name,
+      runtime.shellEnvPrefix,
+    );
     if (exists(path)) {
       let current = "";
       try {

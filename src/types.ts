@@ -114,6 +114,13 @@ export interface Config {
      */
     workspace: string;
     health_timeout_ms: number;
+    /**
+     * Interpretador JS do CLI standalone (boot + hook). Vazio ⇒
+     * `process.execPath`; num host Bun (extension host do Kilo) o helper
+     * `resolveNodeRuntime` propaga `BUN_BE_BUN=1`. Setado ⇒ pinar um
+     * `node`/`bun` explícito (CI/host sem Bun).
+     */
+    node_bin: string;
   };
   inject: {
     enabled: boolean;

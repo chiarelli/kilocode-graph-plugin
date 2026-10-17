@@ -17,6 +17,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { debug, log } from "./logger.ts";
+import { isBunHost, resolveNodeRuntime } from "./runtime.ts";
 
 /** Caminho absoluto do `src/cli.ts` do plugin (vizinho deste módulo). */
 export function cliPath(): string {
@@ -34,6 +35,8 @@ export interface SpawnCliOptions {
   cliPath?: string;
   /** Caminho do `node` (default `process.execPath`); injetável em teste. */
   nodeBin?: string;
+  /** `true` força o host como Bun (teste); default detecta em runtime. */
+  hostIsBun?: boolean;
   /** `spawn` injetável (teste sem processo real). */
   spawnFn?: typeof spawn;
 }
@@ -43,16 +46,30 @@ export interface SpawnCliOptions {
  * criado. **Nunca lança**.
  */
 export function spawnCollectCli(opts: SpawnCliOptions): boolean {
-  const node = opts.nodeBin ?? process.execPath;
+  // `resolveNodeRuntime` decide o interpretador: um override explícito vence
+  // `process.execPath` e, num host Bun (o extension host do Kilo), propaga
+  // `BUN_BE_BUN=1` — sem isso o binário trata o `.ts` como diretório e nada roda.
+  const runtime = resolveNodeRuntime(
+    opts.nodeBin,
+    opts.hostIsBun ?? undefined,
+  );
+  // Observabilidade da detecção (sugestão de revisão): se `isBunHost()` for
+  // `false` num host que na verdade é Bun, o fix vira no-op silencioso — este
+  // log permite confirmar em produção que o `BUN_BE_BUN` está sendo aplicado.
+  debug(
+    `collect: runtime host bun=${isBunHost()} bin=${runtime.bin} ` +
+      `bun_be_bun=${runtime.env.BUN_BE_BUN ?? "-"}`,
+  );
   const cli = opts.cliPath ?? cliPath();
   const mode = opts.mode ?? "auto";
   const args = [cli, "--workspace", opts.workspace, "--mode", mode];
   if (opts.source) args.push("--source", opts.source);
   const spawnFn = opts.spawnFn ?? spawn;
   try {
-    const child = spawnFn(node, args, {
+    const child = spawnFn(runtime.bin, args, {
       detached: true,
       stdio: "ignore",
+      env: runtime.env,
     });
     // `spawn` reporta falha assíncrona (ENOENT do `node`, etc.) por evento
     // `'error'`, não por throw — sem um listener, o Node lança `uncaughtException`

@@ -195,6 +195,49 @@ test("hookScript_never_sets_hooksPath: o script não toca core.hooksPath", () =>
   assert.ok(script.includes("root='/ws'"), "fallback embutido presente");
 });
 
+test("hookScript_bun_host_prefixes_BUN_BE_BUN: host Bun injeta o env", () => {
+  // Defeito raiz: process.execPath de um extension host Bun não é Node. O script
+  // precisa prefixar `BUN_BE_BUN=1` para o binário agir como o CLI do bun.
+  const script = hookScript(
+    "/opt/kilo",
+    "/p/src/cli.ts",
+    "/ws",
+    "post-commit",
+    "BUN_BE_BUN=1 ",
+  );
+  assert.match(script, /^BUN_BE_BUN=1 '\/opt\/kilo' '\/p\/src\/cli\.ts'/m);
+});
+
+test("install_hooks_node_host_no_env_prefix: host Node não prefixa", () => {
+  const mem = memIo();
+  installHooks({
+    repoRoot: "/repo",
+    cliPath: "/plugin/src/cli.ts",
+    nodeBin: "/usr/bin/node",
+    hostIsBun: false,
+    git: fakeGit(),
+    io: mem.io,
+  });
+  const content = mem.files.get("/repo/.git/hooks/post-commit")!;
+  assert.ok(!content.includes("BUN_BE_BUN"), "host Node não injeta BUN_BE_BUN");
+});
+
+test("install_hooks_bun_host_prefixes_env: host Bun injeta o prefixo", () => {
+  const mem = memIo();
+  installHooks({
+    repoRoot: "/repo",
+    cliPath: "/plugin/src/cli.ts",
+    nodeBin: "/opt/kilo",
+    hostIsBun: true,
+    git: fakeGit(),
+    io: mem.io,
+  });
+  assert.match(
+    mem.files.get("/repo/.git/hooks/post-commit")!,
+    /BUN_BE_BUN=1 '\/opt\/kilo'/,
+  );
+});
+
 test("hookScript_runs_end_to_end: o script REAL invoca o CLI com --workspace", () => {
   // Prova a correção CRÍTICA no caminho REAL: gera o script e o EXECUTA (dentro
   // de um repo git) com um CLI stub que registra seus argumentos. Sem
