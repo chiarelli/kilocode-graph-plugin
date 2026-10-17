@@ -38,7 +38,7 @@ src/
 │   ├── manifest.ts       # estado por workspace → detecta removidos (chunks: []); tmp por processo
 │   ├── trigger.ts        # híbrido: full no 1º uso; incremental depois + guarda de ancestralidade + sentinela
 │   ├── git.ts            # ⬅ NOVO (E3a-S6) — porta de git (HEAD, ancestry, removidos, hooks dir)
-│   ├── lock.ts           # ⬅ NOVO (E3a-S6) — trava cross-process (O_EXCL) + reclaim de órfão
+│   ├── lock.ts           # ⬅ NOVO (E3a-S6) — trava cross-process: flock(2) sob Bun (kernel libera na morte) + fallback O_EXCL sob Node
 │   └── install-hooks.ts  # ⬅ NOVO (E3a-S6) — instala os hooks git (idempotente, sem core.hooksPath)
 ├── mcp/                  # (E3b) — registro do MCP do memtier
 │   ├── register.ts       # client.mcp.add(type:remote) + connect; implícito
@@ -76,7 +76,7 @@ loadManifest/saveManifest/removedFiles/mergeManifest      // estado por workspac
 decideTrigger(manifest, { isAncestor? }): { mode, gitRange? }  // full no 1º uso; incremental só se ancestral (§4)
 shouldWaitForReady(decision, ready): boolean              // gate do sentinela `graph-ready` (§3)
 createGitPort(exec?): GitPort   // HEAD/isAncestor/deletedFiles/hooksDir (injetável)
-acquireLock({ path, … }): Promise<LockHandle|null>  // trava cross-process O_EXCL + reclaim de órfão
+acquireLock({ path, … }): Promise<LockHandle|null>  // flock(2) sob Bun (kernel libera na morte; sem lock órfão) + fallback O_EXCL sob Node
 installHooks({ repoRoot, cliPath, git, io? }): InstallHooksResult  // idempotente, sem core.hooksPath
 // FullFile sintético quando o indexer só emitiu Symbol (habilita import_edge).
 // Removidos: no FULL = manifest−present; no INCREMENTAL = git diff --no-renames --diff-filter=D.

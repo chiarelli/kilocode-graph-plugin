@@ -85,12 +85,24 @@ sai com 0. Isso evita spawnar o indexer enquanto o full inicial ainda corre.
 Mas o sentinela **não basta**: boot e post-commit são **processos SO distintos**
 (o plugin spawna o CLI; o git spawna o CLI). Duas invocações concorrentes escrevem
 o mesmo manifest sem coordenação. A serialização é uma **trava cross-process**
-(lockfile com criação exclusiva `O_EXCL` + retry/espera) em torno da seção crítica
-**load manifest → index → sync → save**.
+em torno da seção crítica **load manifest → index → sync → save**.
 
 > **A trava em memória do repo NÃO serve aqui.** (`withWorkspaceLock`,
 > `src/ingest/routine.ts:81` é um `Map<string, Promise>` — serializa chamadas no
 > **mesmo processo**, não dois processos Node.)
+
+**Mecanismo (atualizado).** O CLI de produção roda no extension host do Kilo, que
+é um executável **Bun**; ali a trava primária é **`flock(2)`** (via `bun:ffi`,
+`src/index/lock.ts`), com a propriedade decisiva de que **o kernel libera a trava
+quando o processo morre** — inclusive em `SIGKILL`, que pula todo `finally`. Um
+crash **não deixa lock órfão** (o defeito medido com o lockfile-`O_EXCL`: um CLI
+morto segurava `.kilo/graph.lock` e bloqueava toda coleta seguinte). Sob `flock`
+o arquivo **nunca é removido**: `unlink` + `flock` é uma corrida clássica (dois
+processos travam inodes distintos e a exclusão mútua cai); o arquivo é um token de
+mutex persistente e a exclusão é do kernel. Sob **Node** (a suíte `node --test`,
+que não tem `bun:ffi`), mantém-se o **fallback lockfile `O_EXCL` + `pid`** com
+reclaim de órfão por liveness/`mtime`. Ambos têm **timeout finito** (30s; ao
+estourar, desiste com log).
 
 O sentinela é por workspace, em `.kilo/` (estado local, como o manifest e a chave).
 Com a trava, o coalescing é natural: um 2º incremental espera o 1º (que já avançou
@@ -144,8 +156,9 @@ gatilho é o commit). É a limitação já documentada (FR-507) — mantida.
 
 **Negativas / limites**
 
-- **Precisa de trava cross-process** (lockfile `O_EXCL`): a serialização em memória
-  não serve para dois processos; sem ela, boot e commit se sobrescrevem.
+- **Precisa de trava cross-process** (`flock(2)` sob Bun; `O_EXCL` sob Node): a
+  serialização em memória não serve para dois processos; sem ela, boot e commit se
+  sobrescrevem. `flock` evita o lock órfão que o `O_EXCL` deixava após um crash.
 - **Mutação do repo do usuário** (`.git/hooks/`): não versionada, some em
   re-clone — daí a reinstalação idempotente no boot. Repos com hook próprio do
   mesmo nome **não** são encadeados nesta versão (documentado; encadeamento é

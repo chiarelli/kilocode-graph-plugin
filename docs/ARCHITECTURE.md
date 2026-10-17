@@ -227,7 +227,7 @@ src/
 │   ├── manifest.ts       # estado por workspace → detecta removidos (chunks: []); tmp por PID
 │   ├── trigger.ts        # híbrido + guarda de ancestralidade + gate do sentinela
 │   ├── git.ts            # ⬅ NOVO (E3a-S6) — porta de git (HEAD/ancestry/removidos/hooks dir)
-│   ├── lock.ts           # ⬅ NOVO (E3a-S6) — trava cross-process (O_EXCL)
+│   ├── lock.ts           # ⬅ NOVO (E3a-S6) — trava cross-process: flock(2) sob Bun + fallback O_EXCL sob Node
 │   └── install-hooks.ts  # ⬅ NOVO (E3a-S6) — instala hooks git (idempotente, sem core.hooksPath)
 ├── mcp/                  # (E3b) — registro do MCP do memtier
 │   └── register.ts       # client.mcp.add(type:remote) + connect; implícito
@@ -286,8 +286,9 @@ fire-and-forget) → incremental → `/v1/code/sync`:
   ancestral (checkout para trás/rebase) ⇒ `full`.
 - **Removidos no incremental**: `git diff --no-renames --diff-filter=D` =
   `chunks: []`.
-- **Trava cross-process** (`O_EXCL`, `.kilo/graph.lock`) + **tmp por processo** no
-  manifest: boot e commit são **processos SO distintos**.
+- **Trava cross-process** em `.kilo/graph.lock` (`flock(2)` sob Bun — o kernel
+  libera na morte do processo, sem lock órfão; fallback `O_EXCL` sob Node) +
+  **tmp por processo** no manifest: boot e commit são **processos SO distintos**.
 - **Paridade de config (§7)**: no boot o plugin grava a `Config` efetiva (sem
   segredos) em `.kilo/graph-config.json`; o CLI a lê — o CLI standalone não vê o
   `options` inline do `kilo.jsonc` (o plugin é carregado pelo **runtime Kilo**,
