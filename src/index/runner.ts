@@ -26,7 +26,7 @@ import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 
 import { debug, log } from "../logger.ts";
-import type { IndexerEvent } from "../types.ts";
+import type { ChunkingOptions, IndexerEvent } from "../types.ts";
 
 /** Modo de indexação: full (`index_path`) ou incremental (`incremental_index`). */
 export type IndexMode = "full" | "incremental";
@@ -42,6 +42,20 @@ export interface RunIndexerOptions {
   /** Extrai imports/calls (arestas). Default `true`. */
   extractImports?: boolean;
   extractCalls?: boolean;
+  /**
+   * Opções de chunking do `rust-ast-indexer` (`options.chunking`), repassadas
+   * CRUAS ao payload. Chave ausente ⇒ o indexer usa o default dele (`Semantic`,
+   * 200 linhas). A forma do objeto é o contrato do indexer
+   * (`doc/indexer_spec.md`): `{strategy, max_lines, overlap_lines,
+   * include_context, token_counting}`, com `strategy ∈ {symbol_boundary,
+   * semantic, line_limited}`.
+   *
+   * Version skew: `symbol_boundary` (snake_case) exige um binário ATUALIZADO
+   * (com `rename_all="snake_case"` no enum). Com um binário antigo, o serde
+   * falha e o indexer cai em `Semantic` em silêncio — mantenha `indexer_bin`
+   * alinhado ao plugin.
+   */
+  chunking?: ChunkingOptions;
   /**
    * Fonte de arquivos via git (`git ls-files --exclude-standard`), honrando o
    * ignore-stack completo. Default `false` (varre tudo). Quando `true` e o git
@@ -119,6 +133,11 @@ export function buildCommand(
     extract_calls: opts.extractCalls ?? true,
     load_ignores: opts.loadIgnores ?? false,
   };
+  // Chunking é repassado CRU (contrato do indexer); ausente ⇒ a chave não vai,
+  // e o indexer aplica o default dele (não impomos valores que ele desconheça).
+  if (opts.chunking) {
+    (payload.options as Record<string, unknown>).chunking = opts.chunking;
+  }
   const jobId = `graph-${mode}-${Date.now()}`;
   const line = JSON.stringify({
     protocol_version: "1.0.0",

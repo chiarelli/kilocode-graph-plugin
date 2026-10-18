@@ -28,7 +28,7 @@ import {
 import { runIndexer, type IndexMode } from "../index/runner.ts";
 import { decideTrigger, type TriggerDecision } from "../index/trigger.ts";
 import { join } from "node:path";
-import type { SyncResult } from "../types.ts";
+import { chunkingFingerprint, type ChunkingOptions, type SyncResult } from "../types.ts";
 
 /** Config do coletor (subconjunto de `code_index.*`). */
 export interface CollectConfig {
@@ -39,6 +39,11 @@ export interface CollectConfig {
    * Quando `true`, o indexer exige git + repositório (senão `GIT_UNAVAILABLE`).
    */
   load_ignores?: boolean;
+  /**
+   * Estratégia de chunking do indexer (`options.chunking`), repassada crua.
+   * Ausente ⇒ o indexer aplica o default dele. Ver `ChunkingOptions`.
+   */
+  chunking?: ChunkingOptions;
 }
 
 /** Dependências do hook (injetáveis para teste, sem spawn real). */
@@ -101,10 +106,16 @@ export interface CollectState {
    * Estado atual (arquivos sincronizados + head). `workspace` é a identidade
    * gravada na última execução — se divergir da atual, o estado é de OUTRO
    * workspace e o incremental reusaria um manifest alheio (grafo incompleto).
+   * `chunking_fingerprint` detecta mudança de config de chunking (força full).
    */
-  load(): { files: string[]; last_git_head?: string | null; workspace?: string };
-  /** Persiste o estado pós-sync (arquivos atuais + head). */
-  save(files: string[], head: string | null): void;
+  load(): {
+    files: string[];
+    last_git_head?: string | null;
+    workspace?: string;
+    chunking_fingerprint?: string;
+  };
+  /** Persiste o estado pós-sync (arquivos atuais + head + fingerprint). */
+  save(files: string[], head: string | null, chunkingFingerprint?: string): void;
 }
 
 /** Classifica a falha do sync para o log correto (nunca propaga). */
@@ -188,11 +199,15 @@ function fileState(repoRoot: string, workspace: string): CollectState {
         files: manifest.files,
         last_git_head: manifest.last_git_head,
         workspace: manifest.workspace,
+        chunking_fingerprint: manifest.chunking_fingerprint,
       };
     },
-    save: (files, head) => {
+    save: (files, head, chunkingFingerprint) => {
       try {
-        saveManifest(path, mergeManifest(workspace, files, head));
+        saveManifest(
+          path,
+          mergeManifest(workspace, files, head, chunkingFingerprint),
+        );
       } catch (err) {
         // Manifest é otimização/estado local: falha de escrita não é fatal (o
         // próximo sync reindexa tudo por falta do estado).
@@ -276,10 +291,26 @@ async function collectUnderLock(
   // ancestralidade e o diff (ou entre o diff e o save) → delta perdido em
   // silêncio (o range indexado não casa o HEAD gravado).
   const headSha = git ? git.head(rt.repoRoot) : null;
+  // Fingerprint da config de chunking atual. Uma mudança (ex.: passo a usar
+  // `symbol_boundary`) muda COMO cada arquivo vira chunk, mas o incremental só
+  // re-chunka o que o git alterou — sem forçar full, o corpus antigo manteria o
+  // chunking velho em silêncio. Manifest legado (campo ausente) também difere
+  // (`undefined` vs a string atual) ⇒ primeiro run após o upgrade reindexa tudo.
+  const currentFingerprint = chunkingFingerprint(rt.cfg.chunking);
+  const chunkingChanged =
+    manifest.files.length > 0 &&
+    (manifest.chunking_fingerprint ?? "") !== currentFingerprint;
+  if (chunkingChanged) {
+    log(
+      `collect: config de chunking mudou ` +
+        `(${manifest.chunking_fingerprint ?? "<legado>"} → ${currentFingerprint}); ` +
+        `forçando full`,
+    );
+  }
   // `--mode full` explícito ignora o manifest. `auto`/`incremental` decidem por
   // manifest + guarda de ancestralidade (§4): sem range válido, cai em full.
   const trigger: TriggerDecision =
-    rt.forceMode === "full" || identityChanged
+    rt.forceMode === "full" || identityChanged || chunkingChanged
       ? { mode: "full" }
       : decideTrigger(
           {
@@ -329,6 +360,7 @@ async function collectUnderLock(
       mode,
       gitRange: trigger.gitRange,
       loadIgnores: rt.cfg.load_ignores ?? false,
+      chunking: rt.cfg.chunking,
     });
   } catch (err) {
     logFatal("collect indexer", err);
@@ -439,7 +471,11 @@ async function collectUnderLock(
     // nunca nasce e todo boot/hook refaz full para sempre. Sem isto o gate do
     // incremental nunca abre.
     if (mode === "full") {
-      state.save(manifest.files, headSha ?? (git ? null : await currentHead(rt.repoRoot)));
+      state.save(
+        manifest.files,
+        headSha ?? (git ? null : await currentHead(rt.repoRoot)),
+        currentFingerprint,
+      );
       rt.onFullComplete?.();
     }
     return null;
@@ -474,7 +510,7 @@ async function collectUnderLock(
     // descrevem o MESMO ponto — sem isso um commit concorrente deixaria um vão
     // de delta nunca revisitado. Sem porta de git, o caminho S4 legado.
     const newHead = git ? headSha : await currentHead(rt.repoRoot);
-    state.save(merged, newHead);
+    state.save(merged, newHead, currentFingerprint);
     // Full concluído ⇒ arma o incremental: o CLI escreve o sentinela
     // `graph-ready` (§3). É o full inicial quem o cria; o incremental só roda
     // com ele presente.

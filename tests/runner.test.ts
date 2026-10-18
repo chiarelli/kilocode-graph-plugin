@@ -75,6 +75,32 @@ test("build_command_load_ignores: true propaga em options", () => {
   assert.equal(cmd.payload.options.load_ignores, true);
 });
 
+test("build_command_chunking: ausente ⇒ não vai no payload (indexer usa seu default)", () => {
+  const cmd = JSON.parse(
+    buildCommand("full", "/repo", { bin: "x", repoRoot: "/repo", mode: "full" }).line,
+  ) as { payload: { options: Record<string, unknown> } };
+  assert.equal("chunking" in cmd.payload.options, false);
+});
+
+test("build_command_chunking: presente ⇒ encaminhado CRU em options.chunking", () => {
+  const chunking = {
+    strategy: "symbol_boundary",
+    max_lines: 0,
+    overlap_lines: 0,
+    include_context: true,
+    token_counting: false,
+  } as const;
+  const cmd = JSON.parse(
+    buildCommand("full", "/repo", {
+      bin: "x",
+      repoRoot: "/repo",
+      mode: "full",
+      chunking,
+    }).line,
+  ) as { payload: { options: Record<string, unknown> } };
+  assert.deepEqual(cmd.payload.options.chunking, chunking);
+});
+
 test("parse_line_junk: linha não-JSON ⇒ null (ignorada)", () => {
   assert.equal(parseLine("not json {"), null);
   assert.equal(parseLine(""), null);

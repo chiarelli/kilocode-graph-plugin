@@ -88,6 +88,39 @@ test("manifest_merge_dedups: arquivos duplicados ⇒ um só", () => {
   assert.deepEqual(m.files, ["a.rs", "b.rs"]);
 });
 
+test("manifest_chunking_fingerprint_roundtrip: fingerprint persiste e relê", () => {
+  const calls: [string, string][] = [];
+  saveManifest(
+    "/ws/.kilo/graph-manifest.json",
+    mergeManifest("ws", ["a.rs"], "sha", "fp-123"),
+    { writeFile: (p, d) => calls.push([p, d]), rename: () => {}, mkdir: () => {} },
+  );
+  const parsed = JSON.parse(calls[0]![1]) as { chunking_fingerprint?: string };
+  assert.equal(parsed.chunking_fingerprint, "fp-123");
+});
+
+test("manifest_chunking_fingerprint_absent_omitted: sem fingerprint ⇒ chave não vai", () => {
+  const calls: [string, string][] = [];
+  saveManifest("/ws/.kilo/graph-manifest.json", mergeManifest("ws", ["a.rs"], "sha"), {
+    writeFile: (p, d) => calls.push([p, d]),
+    rename: () => {},
+    mkdir: () => {},
+  });
+  const parsed = JSON.parse(calls[0]![1]) as Record<string, unknown>;
+  assert.equal("chunking_fingerprint" in parsed, false);
+});
+
+test("manifest_chunking_fingerprint_legacy: manifest sem o campo ⇒ undefined (força full)", () => {
+  const legacy = JSON.stringify({
+    workspace: "ws",
+    last_git_head: "sha",
+    files: ["a.rs"],
+    updated_at: "2026-01-01T00:00:00Z",
+  });
+  const m = loadManifest("/ws/.kilo/graph-manifest.json", "ws", () => legacy);
+  assert.equal(m.chunking_fingerprint, undefined);
+});
+
 test("manifest_no_path: caminho vazio ⇒ save é no-op (não lança)", () => {
   assert.doesNotThrow(() => saveManifest("", emptyManifest("ws")));
 });

@@ -7,6 +7,54 @@
  * servidor não chega a responder.
  */
 
+/**
+ * Estratégias de chunking aceitas pelo `rust-ast-indexer`, em snake_case
+ * (`doc/indexer_spec.md`). Fonte única: o tipo `ChunkingOptions["strategy"]`
+ * deriva daqui e o validador de config (`config.ts`) usa `.includes` — adicionar
+ * uma estratégia em um lugar só não pode fazer a outra ponta rejeitá-la em
+ * silêncio.
+ */
+export const CHUNKING_STRATEGIES = [
+  "symbol_boundary",
+  "semantic",
+  "line_limited",
+] as const;
+
+/**
+ * Opções de chunking repassadas ao `rust-ast-indexer` (`options.chunking`).
+ * Espelha `ChunkingOptions` do indexer (`doc/indexer_spec.md`); todos os campos
+ * têm default no indexer, então um objeto PARCIAL é válido. `strategy` usa
+ * snake_case (`symbol_boundary` | `semantic` | `line_limited`).
+ */
+export interface ChunkingOptions {
+  strategy?: (typeof CHUNKING_STRATEGIES)[number];
+  /** Máx. de linhas por chunk; `0` = sem limite (obrigatório p/ symbol_boundary). */
+  max_lines?: number;
+  /** Linhas de sobreposição entre chunks; `0` = sem overlap. */
+  overlap_lines?: number;
+  /** Injeta imports/escopo como prefixo do chunk. */
+  include_context?: boolean;
+  /** Conta tokens no metadata interno (requer feature `token_counting`). */
+  token_counting?: boolean;
+}
+
+/**
+ * Impressão ESTÁVEL da config de chunking (ordem fixa das chaves). Persistida no
+ * manifest: mudá-la dispara um full de reindexação (o incremental não re-chunka
+ * arquivos inalterados). `undefined` (chunking não configurado) ⇒ string vazia.
+ * Pura e sem dependências — usável no manifest e no coletor.
+ */
+export function chunkingFingerprint(opts?: ChunkingOptions): string {
+  if (!opts) return "";
+  return JSON.stringify([
+    opts.strategy ?? "",
+    opts.max_lines ?? "",
+    opts.overlap_lines ?? "",
+    opts.include_context ?? "",
+    opts.token_counting ?? "",
+  ]);
+}
+
 /** Relatório de saúde do memtier — sempre retornado, ok ou degradado. */
 export interface HealthReport {
   /** `status === "ok"`. Nunca lança: degradação é um valor, não uma exceção. */
@@ -155,6 +203,21 @@ export interface Config {
      * `GIT_UNAVAILABLE` e aborta o job (sem degradar para um scan completo).
      */
     load_ignores: boolean;
+    /**
+     * Estratégia de chunking do `rust-ast-indexer` (`options.chunking`),
+     * repassada crua. `undefined` ⇒ a chave não vai no payload e o indexer
+     * aplica o default dele (`Semantic`, 200 linhas). Contrato do indexer
+     * (`doc/indexer_spec.md`): `strategy ∈ {symbol_boundary, semantic,
+     * line_limited}`; com `symbol_boundary`, use `max_lines: 0` e
+     * `overlap_lines: 0` (senão o chunker descarta/mistura chunks).
+     *
+     * ATENÇÃO (version skew): o `strategy` snake_case e o `#[serde(default)]`
+     * exigem um binário do indexer ATUALIZADO. Com um binário ANTIGO, o payload
+     * snake_case falha no serde e o indexer cai em `Semantic` em SILÊNCIO (o
+     * operador acha que `symbol_boundary` está ativo). Atualize `indexer_bin`
+     * junto com o plugin.
+     */
+    chunking?: ChunkingOptions;
   };
   ingest: {
     /** Liga a ingestão assíncrona (default `false`). */

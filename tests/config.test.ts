@@ -27,6 +27,8 @@ const ENV_KEYS = [
   "KILOCODE_GRAPH_INJECT_MAX_CHARS",
   "KILOCODE_GRAPH_INJECT_MAX_TOKENS",
   "KILOCODE_GRAPH_INDEX_SYNC_TIMEOUT_MS",
+  "KILOCODE_GRAPH_INDEX_LOAD_IGNORES",
+  "KILOCODE_GRAPH_INDEX_CHUNKING",
 ] as const;
 
 function clearEnv(): void {
@@ -200,6 +202,76 @@ test("config_code_load_ignores: default false e env honrada", () => {
   assert.equal(loadConfig().code_index.load_ignores, true);
   process.env.KILOCODE_GRAPH_INDEX_LOAD_IGNORES = "false";
   assert.equal(loadConfig().code_index.load_ignores, false);
+});
+
+test("config_code_chunking: default = symbol_boundary com max_lines 0", () => {
+  clearEnv();
+  const chunking = loadConfig().code_index.chunking;
+  assert.equal(chunking?.strategy, "symbol_boundary");
+  assert.equal(chunking?.max_lines, 0);
+  assert.equal(chunking?.overlap_lines, 0);
+  assert.equal(chunking?.include_context, true);
+  assert.equal(chunking?.token_counting, false);
+});
+
+test("config_code_chunking: options (objeto) tem precedência", () => {
+  clearEnv();
+  const cfg = loadConfig({
+    code_index: { chunking: { strategy: "semantic", max_lines: 120 } },
+  });
+  assert.equal(cfg.code_index.chunking?.strategy, "semantic");
+  assert.equal(cfg.code_index.chunking?.max_lines, 120);
+});
+
+test("config_code_chunking: env (string JSON) é honrada", () => {
+  clearEnv();
+  process.env.KILOCODE_GRAPH_INDEX_CHUNKING =
+    '{"strategy":"line_limited","max_lines":40}';
+  const chunking = loadConfig().code_index.chunking;
+  assert.equal(chunking?.strategy, "line_limited");
+  assert.equal(chunking?.max_lines, 40);
+});
+
+test("config_code_chunking: valor inválido cai no default (não vira INVALID_PAYLOAD)", () => {
+  clearEnv();
+  // strategy desconhecida no objeto.
+  assert.equal(
+    loadConfig({ code_index: { chunking: { strategy: "bogus" } as never } }).code_index
+      .chunking?.strategy,
+    "symbol_boundary",
+  );
+  // env não-JSON.
+  process.env.KILOCODE_GRAPH_INDEX_CHUNKING = "not json";
+  assert.equal(loadConfig().code_index.chunking?.strategy, "symbol_boundary");
+});
+
+test("config_code_chunking_symbol_boundary_forces_max_lines_0: fecha o footgun do drop", () => {
+  clearEnv();
+  // Um objeto parcial/errado (symbol_boundary com max_lines>0 ou ausente) é
+  // normalizado para max_lines:0 — sem isso o indexer (versão antiga) descarta
+  // símbolos grandes e o coletor apaga os chunks do arquivo no full.
+  const withLines = loadConfig({
+    code_index: { chunking: { strategy: "symbol_boundary", max_lines: 50 } },
+  });
+  assert.equal(withLines.code_index.chunking?.max_lines, 0);
+
+  const partial = loadConfig({
+    code_index: { chunking: { strategy: "symbol_boundary" } },
+  });
+  assert.equal(partial.code_index.chunking?.max_lines, 0);
+
+  // Outras estratégias NÃO são forçadas.
+  const semantic = loadConfig({
+    code_index: { chunking: { strategy: "semantic", max_lines: 50 } },
+  });
+  assert.equal(semantic.code_index.chunking?.max_lines, 50);
+});
+
+test("config_code_chunking: env com symbol_boundary também é normalizada", () => {
+  clearEnv();
+  process.env.KILOCODE_GRAPH_INDEX_CHUNKING =
+    '{"strategy":"symbol_boundary","max_lines":10}';
+  assert.equal(loadConfig().code_index.chunking?.max_lines, 0);
 });
 
 test("config_ingest_defaults: as chaves de `ingest.*` (E4) têm os defaults declarados", () => {

@@ -24,6 +24,14 @@ export interface Manifest {
   last_git_head: string | null;
   /** Arquivos sincronizados na última execução (para detectar removidos). */
   files: string[];
+  /**
+   * Impressão da config de chunking vigente no último full (E3a). Uma mudança
+   * (ex.: default Semantic → symbol_boundary) altera COMO cada arquivo vira
+   * chunk, mas o incremental só re-chunka o que o git mudou — sem este campo o
+   * corpus antigo ficaria com o chunking velho para sempre, em silêncio. Ausente
+   * (manifest legado) ⇒ tratado como divergente ⇒ força um full de reindexação.
+   */
+  chunking_fingerprint?: string;
   /** ISO-8601 da última escrita. */
   updated_at: string;
 }
@@ -56,6 +64,10 @@ export function loadManifest(
       files: Array.isArray(parsed.files)
         ? parsed.files.filter((f): f is string => typeof f === "string")
         : [],
+      chunking_fingerprint:
+        typeof parsed.chunking_fingerprint === "string"
+          ? parsed.chunking_fingerprint
+          : undefined,
       updated_at: typeof parsed.updated_at === "string" ? parsed.updated_at : "",
     };
   } catch {
@@ -110,11 +122,15 @@ export function mergeManifest(
   workspace: string,
   current: string[],
   head: string | null,
+  chunkingFingerprint?: string,
 ): Manifest {
   return {
     workspace,
     last_git_head: head,
     files: [...new Set(current)],
+    ...(chunkingFingerprint !== undefined
+      ? { chunking_fingerprint: chunkingFingerprint }
+      : {}),
     updated_at: new Date().toISOString(),
   };
 }

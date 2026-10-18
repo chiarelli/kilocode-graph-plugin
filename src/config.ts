@@ -30,7 +30,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { debug, log } from "./logger.ts";
-import type { Config } from "./types.ts";
+import { CHUNKING_STRATEGIES, type ChunkingOptions, type Config } from "./types.ts";
 
 /**
  * Teto interno de `max_tokens` no servidor (memtier `budget.py:61`,
@@ -84,6 +84,19 @@ export const DEFAULTS = {
     // ignore-stack completo. Default `false` (varre tudo). `true` exige git +
     // repositório: ausente ⇒ o indexer falha com `GIT_UNAVAILABLE` (sem fallback).
     load_ignores: false,
+    // Estratégia de chunking (`options.chunking` do indexer). Default =
+    // `symbol_boundary` (um chunk por símbolo): o chunk agrupado do
+    // `SemanticChunker` (default do indexer) fazia 1 def de teste cair DENTRO de
+    // um blob de ~200 linhas, quebrando busca por identificador. `max_lines: 0`
+    // é OBRIGATÓRIO com `symbol_boundary` (valor >0 DESCARTA chunks grandes);
+    // `overlap_lines: 0` evita misturar métodos vizinhos.
+    chunking: {
+      strategy: "symbol_boundary",
+      max_lines: 0,
+      overlap_lines: 0,
+      include_context: true,
+      token_counting: false,
+    } as ChunkingOptions,
   },
   ingest: {
     // Defaults desligados (preferência do dono, coerente com index/inject).
@@ -191,6 +204,69 @@ function resolveTokenCap(raw: string | undefined, fallback: number): number {
 function resolvePositiveInt(raw: string | undefined, fallback: number): number {
   const n = resolveInt(raw, fallback);
   return n > 0 ? n : fallback;
+}
+
+/** Objeto de chunking válido? (as chaves são o contrato do indexer) */
+function isChunkingOptions(v: unknown): v is ChunkingOptions {
+  if (!isPlainObject(v)) return false;
+  const strategy = v.strategy;
+  if (strategy !== undefined) {
+    if (!(CHUNKING_STRATEGIES as readonly unknown[]).includes(strategy)) return false;
+  }
+  for (const k of ["max_lines", "overlap_lines"]) {
+    const n = v[k];
+    if (n !== undefined && (!Number.isInteger(n) || (n as number) < 0)) return false;
+  }
+  for (const k of ["include_context", "token_counting"]) {
+    const b = v[k];
+    if (b !== undefined && typeof b !== "boolean") return false;
+  }
+  return true;
+}
+
+/**
+ * Normaliza um objeto de chunking VÁLIDO para uma forma segura antes de
+ * repassá-lo ao indexer.
+ *
+ * Regra crítica: `symbol_boundary` com `max_lines > 0` (ou ausente, que o indexer
+ * defaulta para 200) DESCARTA símbolos maiores que o limite — o arquivo pode
+ * emitir ZERO chunks e o coletor, no full, o trata como removido e APAGA seus
+ * chunks do grafo. Aqui forçamos `max_lines: 0` nessa estratégia. Defesa em
+ * profundidade: o indexer também foi corrigido para nunca descartar, mas impor
+ * o valor certo aqui evita depender do binário.
+ */
+function normalizeChunking(v: ChunkingOptions): ChunkingOptions {
+  if (v.strategy === "symbol_boundary") {
+    return { ...v, max_lines: 0 };
+  }
+  return v;
+}
+
+/**
+ * Resolve `code_index.chunking` por precedência `options` > env > arquivo >
+ * default. Aceita um OBJETO (de `options`/do arquivo) ou uma STRING JSON (de
+ * env). Valor inválido cai no default — nunca lança nem produz um objeto
+ * malformado (que faria o indexer responder `INVALID_PAYLOAD` e abortar o job).
+ * Um objeto válido passa por `normalizeChunking` (fecha o footgun do
+ * `symbol_boundary` sem `max_lines`).
+ */
+function resolveChunking(
+  val: unknown,
+  envValue: string | undefined,
+  fileValue: string | undefined,
+  fallback: ChunkingOptions,
+): ChunkingOptions {
+  if (isChunkingOptions(val)) return normalizeChunking(val);
+  const raw = envValue ?? fileValue;
+  if (raw !== undefined && raw.trim() !== "" && raw.trim() !== "undefined") {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (isChunkingOptions(parsed)) return normalizeChunking(parsed);
+    } catch {
+      // String não-JSON ⇒ default (modo degenerado não passa em silêncio).
+    }
+  }
+  return fallback;
 }
 
 function globalConfigDir(): string {
@@ -447,6 +523,12 @@ export function loadConfig(
         ),
         DEFAULTS.code_index.load_ignores,
       ),
+      chunking: resolveChunking(
+        pick(options, "code_index.chunking"),
+        env.KILOCODE_GRAPH_INDEX_CHUNKING,
+        filePick(file, "code_index.chunking"),
+        DEFAULTS.code_index.chunking,
+      ),
     },
     ingest: {
       enabled: resolveBool(
@@ -547,6 +629,7 @@ export function configStateFrom(config: Config): PluginOptions {
       indexer_bin: config.code_index.indexer_bin,
       sync_timeout_ms: config.code_index.sync_timeout_ms,
       load_ignores: config.code_index.load_ignores,
+      chunking: config.code_index.chunking,
     },
     ingest: {
       enabled: config.ingest.enabled,

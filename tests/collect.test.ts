@@ -8,7 +8,7 @@ import { test } from "node:test";
 
 import { MemtierClient, type FetchLike } from "../src/client.ts";
 import { collectCode, collectHook, type CollectRuntime } from "../src/hooks/collect.ts";
-import type { IndexerEvent, SyncResult } from "../src/types.ts";
+import { chunkingFingerprint, type IndexerEvent, type SyncResult } from "../src/types.ts";
 
 const IDENTITY = { workspace: "waweb", program: "default" };
 
@@ -252,6 +252,120 @@ test("collect_load_ignores_off: default false quando cfg não define", async () 
   });
   await collectCode(rt);
   assert.equal(seen?.loadIgnores, false);
+});
+
+test("collect_chunking: repassa code_index.chunking do cfg ao runner", async () => {
+  const chunking = {
+    strategy: "symbol_boundary",
+    max_lines: 0,
+    overlap_lines: 0,
+    include_context: true,
+    token_counting: false,
+  } as const;
+  let seen: { chunking?: unknown } | undefined;
+  const rt = runtime({
+    cfg: { enabled: true, indexer_bin: "/fake/indexer", chunking },
+    run: async (opts) => {
+      seen = opts;
+      return { events: [chunkEvent("src/a.rs", "a1")], skipped: false };
+    },
+  });
+  await collectCode(rt);
+  assert.deepEqual(seen?.chunking, chunking);
+});
+
+test("collect_chunking_absent: sem chunking no cfg ⇒ undefined ao runner", async () => {
+  let seen: { chunking?: unknown } | undefined;
+  const rt = runtime({
+    run: async (opts) => {
+      seen = opts;
+      return { events: [chunkEvent("src/a.rs", "a1")], skipped: false };
+    },
+  });
+  await collectCode(rt);
+  assert.equal(seen?.chunking, undefined);
+});
+
+// --- fingerprint de chunking força full quando muda (achado da revisão) ------
+
+/** Estado com manifest completo (last_git_head + files) ⇒ incremental por padrão. */
+function fullState(fingerprint?: string) {
+  return {
+    load: () => ({
+      files: ["src/a.rs"],
+      last_git_head: "abc",
+      chunking_fingerprint: fingerprint,
+    }),
+    save: (_files: string[], _head: string | null, _fp?: string) => {},
+  };
+}
+
+const SYMBOL_BOUNDARY = {
+  strategy: "symbol_boundary",
+  max_lines: 0,
+  overlap_lines: 0,
+  include_context: true,
+  token_counting: false,
+} as const;
+
+test("collect_fingerprint_change_forces_full: config de chunking mudou ⇒ mode=full", async () => {
+  let seenMode: string | undefined;
+  const rt = runtime({
+    cfg: { enabled: true, indexer_bin: "/fake/indexer", chunking: SYMBOL_BOUNDARY },
+    // manifest com fingerprint LEGADO (ausente) ⇒ difere ⇒ full.
+    state: fullState(undefined),
+    run: async (opts) => {
+      seenMode = opts.mode;
+      return { events: [chunkEvent("src/a.rs", "a1")], skipped: false };
+    },
+  });
+  await collectCode(rt);
+  assert.equal(seenMode, "full");
+});
+
+test("collect_fingerprint_match_keeps_incremental: mesma config ⇒ mode=incremental", async () => {
+  let seenMode: string | undefined;
+  const rt = runtime({
+    cfg: { enabled: true, indexer_bin: "/fake/indexer", chunking: SYMBOL_BOUNDARY },
+    // fingerprint IGUAL ao atual ⇒ não força full.
+    state: fullState(chunkingFingerprint(SYMBOL_BOUNDARY)),
+    run: async (opts) => {
+      seenMode = opts.mode;
+      return { events: [chunkEvent("src/a.rs", "a1")], skipped: false };
+    },
+  });
+  await collectCode(rt);
+  assert.equal(seenMode, "incremental");
+});
+
+test("collect_fingerprint_no_chunking_keeps_incremental: sem chunking ⇒ não força full", async () => {
+  let seenMode: string | undefined;
+  const rt = runtime({
+    // sem `chunking` no cfg ⇒ fingerprint "" ⇒ casa o manifest legado "".
+    state: fullState(undefined),
+    run: async (opts) => {
+      seenMode = opts.mode;
+      return { events: [chunkEvent("src/a.rs", "a1")], skipped: false };
+    },
+  });
+  await collectCode(rt);
+  assert.equal(seenMode, "incremental");
+});
+
+test("collect_fingerprint_persisted: o save grava o fingerprint vigente", async () => {
+  let savedFp: string | undefined;
+  const rt = runtime({
+    cfg: { enabled: true, indexer_bin: "/fake/indexer", chunking: SYMBOL_BOUNDARY },
+    state: {
+      load: () => ({ files: ["src/a.rs"], last_git_head: "abc" }),
+      save: (_files, _head, fp) => {
+        savedFp = fp;
+      },
+    },
+    run: async () => ({ events: [chunkEvent("src/a.rs", "a1")], skipped: false }),
+  });
+  await collectCode(rt);
+  assert.equal(savedFp, chunkingFingerprint(SYMBOL_BOUNDARY));
 });
 
 test("collect_incremental_merges_manifest: estado pós-incremental preserva inalterados", async () => {
