@@ -1,3 +1,20 @@
+## 2026-10-20 — query longa derrubava a injeção de código (422)
+
+Validado ao vivo contra a stack (`memtier.tail7d66cf.ts.net:8400`): o turno em
+que o texto do usuário passou de 512 chars devolveu
+`422 {"type":"string_too_long","loc":["body","query"]}` e o hook caiu em
+`FATAL code_search`, sem bloco de código.
+
+Causa: `MAX_QUERY_LENGTH = 512` é validado com `max_length` no body de
+`/v1/code/search` (→ 422), enquanto `POST /v1/recall` **trunca** no servidor
+(D2). O plugin mandava o texto do usuário inteiro nas duas rotas; o texto do
+host (mensagem + `<system-reminder>`) sozinho já passa de 512.
+
+Correção (commit `a6f9831`): `searchCode` trunca em 512, mesmo padrão do clamp
+de `limit`, com `code_search_query_clamped` e
+`code_search_query_short_untouched`. Verificado contra a stack real: 1080
+chars → 200 com 30 chunks; texto só de stopwords → 0 chunks (sem injeção).
+
 # BACKLOG — kilocode-graph-plugin
 
 > Priorização: o que desbloqueia valor primeiro. Base: `docs/PRD.md §5–§7`,
