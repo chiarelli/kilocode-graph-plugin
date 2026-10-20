@@ -17,22 +17,18 @@ import { after, afterEach, before, test } from "node:test";
 import { DEFAULTS, loadConfig } from "../src/config.ts";
 import { __setLogSink } from "../src/logger.ts";
 
-const ENV_KEYS = [
-  "KILOCODE_GRAPH_URL",
-  "KILOCODE_GRAPH_PROGRAM",
-  "KILOCODE_GRAPH_TOKEN",
-  "KILOCODE_GRAPH_INJECT_ENABLED",
-  "KILOCODE_GRAPH_INJECT_MEMORY_MAX_TOKENS",
-  "KILOCODE_GRAPH_INJECT_CODE_MAX_TOKENS",
-  "KILOCODE_GRAPH_INJECT_MAX_CHARS",
-  "KILOCODE_GRAPH_INJECT_MAX_TOKENS",
-  "KILOCODE_GRAPH_INDEX_SYNC_TIMEOUT_MS",
-  "KILOCODE_GRAPH_INDEX_LOAD_IGNORES",
-  "KILOCODE_GRAPH_INDEX_CHUNKING",
-] as const;
+/**
+ * Prefixo de TODA env do plugin. A limpeza é por PREFIXO, não por lista fixa:
+ * com lista, qualquer chave nova (ou já setada no `.bashrc` do operador —
+ * `MANAGER_TOKEN`, `DEBUG`, `INJECT_*`) vazava para os testes e fazia
+ * `config_defaults`/`config_manager_token` falharem sem defeito de runtime.
+ */
+const ENV_PREFIX = "KILOCODE_GRAPH_";
 
 function clearEnv(): void {
-  for (const k of ENV_KEYS) delete process.env[k];
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith(ENV_PREFIX)) delete process.env[key];
+  }
 }
 
 const originalCwd = process.cwd();
@@ -155,16 +151,36 @@ test("config_no_legacy_no_warning: sem envs legadas ⇒ nenhum aviso de deprecia
   assert.equal(lines.filter((l) => l.toLowerCase().includes("depreciada")).length, 0);
 });
 
-test("config_token_cap_clamped: <=0 ou >16000 (422 no servidor) cai no default", () => {
+test("config_token_cap_clamped: >16000 CLAMPA em 16000 (com log); inválido cai no default", () => {
   clearEnv();
-  // `<=0` é 422 (`ge=1`); `>16000` é 422 (`MAX_RESPONSE_TOKENS`). O cliente nunca
-  // manda acima do teto interno (ADR-009, decisão 1) ⇒ fora de [1,16000] = default.
-  for (const bad of ["0", "-5", "16001", "50000", "abc", "2.5"]) {
+  // D8: `16384` é o valor do `.bashrc` do operador — antes caía no default 2000
+  // EM SILÊNCIO. Agora clampa no teto interno, com log.
+  process.env.KILOCODE_GRAPH_INJECT_CODE_MAX_TOKENS = "16384";
+  let clamped = 0;
+  const clampLines = captureLogs(() => {
+    clamped = loadConfig().inject.code_max_tokens;
+  });
+  assert.equal(clamped, 16000);
+  assert.equal(
+    clampLines.filter((l) => l.includes("CLAMPADO")).length,
+    1,
+    clampLines.join("\n"),
+  );
+
+  // Abaixo de 1 / não-inteiro / não-numérico: default, também com log.
+  for (const bad of ["0", "-5", "abc", "2.5"]) {
     process.env.KILOCODE_GRAPH_INJECT_MEMORY_MAX_TOKENS = bad;
     process.env.KILOCODE_GRAPH_INJECT_CODE_MAX_TOKENS = bad;
-    const cfg = loadConfig();
+    let cfg!: ReturnType<typeof loadConfig>;
+    const lines = captureLogs(() => {
+      cfg = loadConfig();
+    });
     assert.equal(cfg.inject.memory_max_tokens, 2000, `memória: ${bad} ⇒ default`);
     assert.equal(cfg.inject.code_max_tokens, 2000, `código: ${bad} ⇒ default`);
+    assert.ok(
+      lines.filter((l) => l.includes("inválido")).length >= 1,
+      `sem log do valor inválido ${bad}: ${lines}`,
+    );
   }
   // Os limites válidos das pontas passam intactos.
   process.env.KILOCODE_GRAPH_INJECT_MEMORY_MAX_TOKENS = "1";
@@ -448,4 +464,74 @@ test("config_workspace_override: default vazio e env/options honradas", () => {
   assert.equal(loadConfig().daemon.workspace, "alfa");
   const cfg = loadConfig({ daemon: { workspace: "pinned-ws" } });
   assert.equal(cfg.daemon.workspace, "pinned-ws", "options vence o env");
+});
+
+test("config_code_labels: default, CSV, JSON e inválidos", () => {
+  clearEnv();
+  assert.deepEqual(loadConfig().inject.code_labels, ["CodeSymbol"]);
+  assert.deepEqual(loadConfig().inject.code_labels, DEFAULTS.inject.code_labels);
+
+  process.env.KILOCODE_GRAPH_INJECT_CODE_LABELS = "CodeSymbol,CodeChunk";
+  assert.deepEqual(loadConfig().inject.code_labels, ["CodeSymbol", "CodeChunk"]);
+
+  process.env.KILOCODE_GRAPH_INJECT_CODE_LABELS = '["CodeChunk"]';
+  assert.deepEqual(loadConfig().inject.code_labels, ["CodeChunk"]);
+
+  // Lista vazia / JSON inválido / item não-string ⇒ default (nunca `[]`, que o
+  // servidor recusa com 422).
+  for (const bad of ["", "[]", "[", "[1]", "CodeSymbol,,CodeChunk"]) {
+    process.env.KILOCODE_GRAPH_INJECT_CODE_LABELS = bad;
+    assert.deepEqual(
+      loadConfig().inject.code_labels,
+      ["CodeSymbol"],
+      `labels inválidas: ${bad}`,
+    );
+  }
+});
+
+test("config_code_min_score: default desligado, env e inválidos", () => {
+  clearEnv();
+  // D7: desligado por default ⇒ o campo NÃO vai no body.
+  assert.equal(loadConfig().inject.code_min_score, undefined);
+  assert.equal(loadConfig().inject.code_min_score, DEFAULTS.inject.code_min_score);
+
+  process.env.KILOCODE_GRAPH_INJECT_CODE_MIN_SCORE = "0.65";
+  assert.equal(loadConfig().inject.code_min_score, 0.65);
+
+  for (const bad of ["1.5", "-0.1", "abc", ""]) {
+    process.env.KILOCODE_GRAPH_INJECT_CODE_MIN_SCORE = bad;
+    assert.equal(
+      loadConfig().inject.code_min_score,
+      undefined,
+      `min_score inválido: ${bad}`,
+    );
+  }
+  // Pontas válidas.
+  process.env.KILOCODE_GRAPH_INJECT_CODE_MIN_SCORE = "0";
+  assert.equal(loadConfig().inject.code_min_score, 0);
+  process.env.KILOCODE_GRAPH_INJECT_CODE_MIN_SCORE = "1";
+  assert.equal(loadConfig().inject.code_min_score, 1);
+});
+
+test("config_code_labels_returns_copy: mutar o resultado não corrompe DEFAULTS", () => {
+  clearEnv();
+  const cfg = loadConfig();
+  cfg.inject.code_labels.push("Intruso");
+  assert.deepEqual(DEFAULTS.inject.code_labels, ["CodeSymbol"]);
+  assert.deepEqual(loadConfig().inject.code_labels, ["CodeSymbol"]);
+});
+
+test("config_token_cap_empty_string: vazio = não configurado, sem ruído de log", () => {
+  clearEnv();
+  process.env.KILOCODE_GRAPH_INJECT_CODE_MAX_TOKENS = "";
+  let cfg!: ReturnType<typeof loadConfig>;
+  const lines = captureLogs(() => {
+    cfg = loadConfig();
+  });
+  assert.equal(cfg.inject.code_max_tokens, 2000);
+  assert.equal(
+    lines.filter((l) => l.includes("inválido")).length,
+    0,
+    lines.join("\n"),
+  );
 });

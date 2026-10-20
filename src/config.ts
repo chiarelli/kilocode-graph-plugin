@@ -75,6 +75,18 @@ export const DEFAULTS = {
     // E1 fechou antes da E3c ser especada — ver histórico do BACKLOG).
     code_enabled: false,
     max_code_chunks: 3,
+    // D5: labels enviados SÓ pelo plugin (o default do servidor continua
+    // `("CodeChunk",)`). `CodeSymbol` restringe a busca a símbolos — o que a
+    // injeção quer — sem mudar o contrato da rota nem da tool MCP.
+    code_labels: ["CodeSymbol"] as string[],
+    // D7: piso de relevância DESLIGADO por default (`undefined` ⇒ o campo não
+    // vai no body). Só vale com servidor que honra `min_score`; a calibração
+    // no corpus real fica para uma entrega seguinte.
+    //
+    // ATENÇÃO ao calibrar: o servidor já corta a perna VETORIAL com
+    // `VEC_MIN_SCORE = 0.65`, então um piso abaixo disso só afeta chunks
+    // fulltext-only — não espere que ele descarte vetor fraco.
+    code_min_score: undefined as number | undefined,
   },
   code_index: {
     enabled: false,
@@ -184,15 +196,82 @@ function resolveInt(raw: string | undefined, fallback: number): number {
 
 /**
  * Teto de tokens de um endpoint. O servidor devolve **422** para
- * `max_tokens > MAX_RESPONSE_TOKENS` (16000, memtier `main.py:888`) ou `<= 0`
- * (`ge=1`). O cliente **nunca** envia acima do teto interno (ADR-009, decisão 1):
- * um valor fora de `[1, 16000]` cai no default, em vez de virar um 422 no
- * caminho do turno. Mesma filosofia do `resolvePositiveInt` (modo degenerado não
- * passa em silêncio).
+ * `max_tokens > MAX_RESPONSE_TOKENS` (16000) ou `<= 0`.
+ *
+ * D8: acima do teto o valor é **CLAMPADO** para 16000 (com log), não
+ * descartado. Medido: `16384` configurado caía no default 2000 em silêncio —
+ * o operador pedia 8× mais orçamento e recebia menos que o default, sem sinal.
+ * Abaixo de 1 (ou inválido) continua caindo no default, agora também com log.
+ * O teto em si existe por causa do `MAX_RESPONSE_TOKENS` do servidor (ADR-009,
+ * decisão 1): acima dele o memtier responde 422.
  */
 function resolveTokenCap(raw: string | undefined, fallback: number): number {
-  const n = resolveInt(raw, fallback);
-  return n >= 1 && n <= MAX_RESPONSE_TOKENS ? n : fallback;
+  if (raw === undefined) return fallback;
+  // String vazia = "não configurado" (artefato comum de `KEY=` no ambiente):
+  // cai no default SEM log — não é um valor inválido digitado pelo operador.
+  if (raw.trim() === "") return fallback;
+  const n = Number(raw);
+  const valid = Number.isFinite(n) && Number.isInteger(n);
+  if (valid && n > MAX_RESPONSE_TOKENS) {
+    log(
+      `config: max_tokens ${n} acima do teto interno (${MAX_RESPONSE_TOKENS}); ` +
+        `CLAMPADO para ${MAX_RESPONSE_TOKENS} (valores maiores dão 422 no servidor)`,
+    );
+    return MAX_RESPONSE_TOKENS;
+  }
+  if (valid && n >= 1) return n;
+  log(
+    `config: max_tokens inválido (${String(raw)}); usando o default ${fallback} ` +
+      `(o servidor aceita só inteiros em [1, ${MAX_RESPONSE_TOKENS}])`,
+  );
+  return fallback;
+}
+
+/**
+ * Lista de labels da busca de código (D5). Aceita JSON array ou CSV. Lista
+ * vazia, item não-string/vazio ou JSON inválido caem no default — o servidor
+ * responde **422** para `labels: []` explícito, então enviar lixo seria pior
+ * que usar o default.
+ */
+function resolveCodeLabels(raw: string | undefined, fallback: string[]): string[] {
+  // Sempre uma CÓPIA: `DEFAULTS.inject.code_labels` é compartilhado e um
+  // consumidor que mutasse o array corromperia o default do processo.
+  if (raw === undefined) return [...fallback];
+  const text = raw.trim();
+  if (text === "") return [...fallback];
+  let parsed: unknown;
+  if (text.startsWith("[")) {
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return [...fallback];
+    }
+  } else {
+    parsed = text.split(",").map((part) => part.trim());
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) return [...fallback];
+  if (!parsed.every((v) => typeof v === "string" && v.trim() !== "")) {
+    return [...fallback];
+  }
+  // Não muta o array do JSON/CSV de origem e normaliza o trim uma vez.
+  return parsed.map((v) => (v as string).trim());
+}
+
+/**
+ * Piso de relevância da memória/código (D7). `undefined` = desligado: o campo
+ * NÃO vai no body. Fora de `[0,1]` ou não-numérico também cai em `undefined`
+ * (nunca um 422 no caminho do turno).
+ */
+function resolveOptionalScore(
+  raw: string | undefined,
+  fallback: number | undefined = undefined,
+): number | undefined {
+  if (raw === undefined) return fallback;
+  const text = raw.trim();
+  if (text === "" || text === "undefined") return fallback;
+  const n = Number(text);
+  if (!Number.isFinite(n) || n < 0 || n > 1) return fallback;
+  return n;
 }
 
 /**
@@ -320,6 +399,28 @@ function loadConfigFile(dir: string): Record<string, unknown> {
     }
   }
   return result;
+}
+
+/**
+ * Como `resolveOverride`, mas SEM fallback: devolve `undefined` quando nada foi
+ * configurado (necessário para chaves cujo default é "desligado", D7).
+ */
+function resolveOptional(
+  val: unknown,
+  envValue: string | undefined,
+  fileValue: string | undefined,
+): string | undefined {
+  if (val !== undefined && val !== null) {
+    if (typeof val === "string") {
+      const m = /^\{env:(.+)\}$/.exec(val);
+      if (m) return process.env[m[1] as string] ?? fileValue ?? undefined;
+    }
+    return String(val).trim();
+  }
+  const raw = envValue ?? fileValue;
+  if (raw === undefined) return undefined;
+  const trimmed = raw.trim();
+  return trimmed === "" ? undefined : trimmed;
 }
 
 /** Lê um valor aninhado do arquivo de config (ex.: `inject.memory_max_tokens`). */
@@ -491,6 +592,22 @@ export function loadConfig(
           String(DEFAULTS.inject.max_code_chunks),
         ),
         DEFAULTS.inject.max_code_chunks,
+      ),
+      code_labels: resolveCodeLabels(
+        resolveOptional(
+          pick(options, "inject.code_labels"),
+          env.KILOCODE_GRAPH_INJECT_CODE_LABELS,
+          filePick(file, "inject.code_labels"),
+        ),
+        DEFAULTS.inject.code_labels,
+      ),
+      code_min_score: resolveOptionalScore(
+        resolveOptional(
+          pick(options, "inject.code_min_score"),
+          env.KILOCODE_GRAPH_INJECT_CODE_MIN_SCORE,
+          filePick(file, "inject.code_min_score"),
+        ),
+        DEFAULTS.inject.code_min_score,
       ),
     },
     code_index: {

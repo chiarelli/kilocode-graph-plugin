@@ -231,14 +231,27 @@ export interface CodeChunkHit {
   start_line: number;
   end_line: number;
   code: string;
+  /** Ordem (RRF normalizado pelo top-1): sempre `[0,1]`, top-1 = 1.0. */
   score: number;
+  /**
+   * Magnitude (`max(cosine, bm25/bm25_top)`) — é sobre ela que o `min_score`
+   * do servidor age. No componente fulltext é relativa ao topo da MESMA
+   * query (não comparável entre queries). Opcional: servidor antigo não manda.
+   */
+  raw_score?: number;
   match: string;
 }
 
-/** Opções da busca de código (E3c). `maxTokens` liga o orçamento A1 no servidor. */
+/**
+ * Opções da busca de código (E3c). `maxTokens` liga o orçamento A1 no servidor.
+ * `labels` restringe os labels do Cypher (D5); `minScore` liga o piso de
+ * relevância do servidor (D6/D7) — nunca re-filtrado no cliente.
+ */
 export interface SearchCodeOpts {
   limit?: number;
   maxTokens?: number;
+  labels?: string[];
+  minScore?: number;
   signal?: AbortSignal;
 }
 
@@ -249,13 +262,19 @@ export interface SearchCodeResult {
   truncated?: boolean;
 }
 
-/** Corpo de `POST /v1/code/search` (aditivo E11: `program`). Nunca `labels: []`. */
+/**
+ * Corpo de `POST /v1/code/search` (aditivo E11: `program`). `labels` só entra
+ * com ≥1 item (lista vazia explícita é 422 no servidor) e `min_score` só
+ * quando configurado.
+ */
 interface CodeSearchBody {
   workspace: string;
   program: string;
   query: string;
   limit?: number;
   max_tokens?: number;
+  labels?: string[];
+  min_score?: number;
 }
 
 /** Resposta crua de `POST /v1/code/search` (snake_case do memtier). */
@@ -506,6 +525,25 @@ export class MemtierClient {
       body.limit = Math.min(opts.limit, MAX_SEARCH_LIMIT);
     }
     if (opts.maxTokens !== undefined) body.max_tokens = opts.maxTokens;
+    // D5: `labels` AGORA é enviado (antes era sempre omitido). Só com ≥1 item
+    // ÚTIL: `labels: []` e itens vazios são 422 no servidor, e o caminho da
+    // busca não pode falhar por um array malformado vindo de config.
+    if (opts.labels !== undefined) {
+      const labels = opts.labels.filter((label) => label.trim() !== "");
+      if (labels.length > 0) body.labels = labels;
+    }
+    // D6/D7: o piso vai para o SERVIDOR (ele vê a escala crua); o cliente não
+    // filtra por score em nenhum momento. Valor fora de [0,1] é OMITIDO em vez
+    // de virar 422 no caminho do turno (o resolver de config já garante isso;
+    // esta guarda protege chamadores diretos do client).
+    if (
+      opts.minScore !== undefined &&
+      Number.isFinite(opts.minScore) &&
+      opts.minScore >= 0 &&
+      opts.minScore <= 1
+    ) {
+      body.min_score = opts.minScore;
+    }
 
     const res = await this.sendJson<CodeSearchResponse>(
       "POST",

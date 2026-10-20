@@ -190,6 +190,24 @@ export interface Config {
     code_enabled: boolean;
     /** E3c — nº máx. de chunks de código injetados (default 3). */
     max_code_chunks: number;
+    /**
+     * D5 — labels enviados na busca de código. Default `["CodeSymbol"]` (só o
+     * plugin; o default do servidor continua `("CodeChunk",)`). Configurável
+     * por env CSV/JSON; lista vazia/inválida ⇒ default (o servidor responde
+     * 422 para `labels: []` explícito).
+     */
+    code_labels: string[];
+    /**
+     * D7 — piso de relevância do código (`min_score` no body). `undefined` =
+     * desligado (o campo não é enviado). Só tem efeito com servidor que honra
+     * o campo; com um servidor antigo o piso é IGNORADO em silêncio por ele
+     * (pydantic extra) e a injeção registra a degradação uma vez por turno.
+     * Default `undefined` — a calibração no corpus real fica para depois.
+     *
+     * Calibração: o servidor já corta a perna vetorial (`VEC_MIN_SCORE =
+     * 0.65`), então um piso abaixo disso só afeta chunks fulltext-only.
+     */
+    code_min_score?: number;
   };
   code_index: {
     enabled: boolean;

@@ -101,7 +101,7 @@ test("code_block_keeps_newlines: quebras e indentação preservadas", () => {
   assert.match(block, /fn a\(\) \{\n/);
 });
 
-test("code_search_body_shape: body tem workspace/program/query/limit; sem labels", async () => {
+test("code_search_body_shape: body tem workspace/program/query/limit e labels explícitos", async () => {
   let body: Record<string, unknown> = {};
   const client = new MemtierClient({
     url: "http://memtier:8400",
@@ -111,21 +111,158 @@ test("code_search_body_shape: body tem workspace/program/query/limit; sem labels
       body = b;
     }),
   });
-  await client.searchCode("onde fica o billing", { limit: 3, maxTokens: 2000 });
+  const labels = ["CodeSymbol"];
+  await client.searchCode("onde fica o billing", {
+    limit: 3,
+    maxTokens: 2000,
+    labels,
+  });
   assert.equal(body.workspace, "waweb");
   assert.equal(body.program, "default");
   assert.equal(body.query, "onde fica o billing");
   assert.equal(body.limit, 3);
   assert.equal(body.max_tokens, 2000);
-  // `labels` nunca é enviado (lista vazia explícita é 422 no servidor).
-  assert.equal("labels" in body, false);
+  // D5: `labels` é enviado quando fornecido (o default vem do `CodeConfig`).
+  assert.deepEqual(body.labels, ["CodeSymbol"]);
   assert.deepEqual(Object.keys(body).sort(), [
+    "labels",
     "limit",
     "max_tokens",
     "program",
     "query",
     "workspace",
   ]);
+});
+
+test("code_search_labels_empty_is_omitted: lista vazia NÃO vai no body", async () => {
+  let body: Record<string, unknown> = {};
+  const client = new MemtierClient({
+    url: "http://memtier:8400",
+    workspace: "waweb",
+    program: "default",
+    fetch: searchFetch([], (b) => {
+      body = b;
+    }),
+  });
+  // `labels: []` explícito é 422 no servidor: omitir é a única forma segura.
+  await client.searchCode("q", { labels: [] });
+  assert.equal("labels" in body, false);
+});
+
+test("code_search_min_score_conditional: só vai quando definido (D7)", async () => {
+  let body: Record<string, unknown> = {};
+  const client = new MemtierClient({
+    url: "http://memtier:8400",
+    workspace: "waweb",
+    program: "default",
+    fetch: searchFetch([], (b) => {
+      body = b;
+    }),
+  });
+  await client.searchCode("q", { minScore: 0.65 });
+  assert.equal(body.min_score, 0.65);
+
+  await client.searchCode("q");
+  assert.equal("min_score" in body, false);
+});
+
+test("code_search_labels_with_empty_items_are_filtered", async () => {
+  let body: Record<string, unknown> = {};
+  const client = new MemtierClient({
+    url: "http://memtier:8400",
+    workspace: "waweb",
+    program: "default",
+    fetch: searchFetch([], (b) => {
+      body = b;
+    }),
+  });
+  // Item vazio/whitespace é 422 no servidor SE for enviado: some do body.
+  await client.searchCode("q", { labels: ["", "  ", "CodeSymbol"] });
+  assert.deepEqual(body.labels, ["CodeSymbol"]);
+
+  await client.searchCode("q", { labels: ["", " "] });
+  assert.equal("labels" in body, false);
+});
+
+test("code_search_min_score_out_of_range_is_omitted", async () => {
+  let body: Record<string, unknown> = {};
+  const client = new MemtierClient({
+    url: "http://memtier:8400",
+    workspace: "waweb",
+    program: "default",
+    fetch: searchFetch([], (b) => {
+      body = b;
+    }),
+  });
+  // Chamador direto pode passar lixo; o corpo não pode virar 422 no turno.
+  for (const bad of [Number.NaN, -0.1, 1.1, Number.POSITIVE_INFINITY]) {
+    await client.searchCode("q", { minScore: bad });
+    assert.equal("min_score" in body, false, `minScore inválido: ${bad}`);
+  }
+});
+
+test("code_search_default_call_omits_labels_and_min_score", async () => {
+  let body: Record<string, unknown> = {};
+  const client = new MemtierClient({
+    url: "http://memtier:8400",
+    workspace: "waweb",
+    program: "default",
+    fetch: searchFetch([], (b) => {
+      body = b;
+    }),
+  });
+  await client.searchCode("q");
+  assert.equal("labels" in body, false);
+  assert.equal("min_score" in body, false);
+  assert.deepEqual(Object.keys(body).sort(), ["program", "query", "workspace"]);
+});
+
+test("code_search_parses_raw_score: campo opcional (servidor antigo não manda)", async () => {
+  let response: unknown = {
+    chunks: [
+      {
+        path: "a.go",
+        symbol: "A",
+        start_line: 1,
+        end_line: 2,
+        code: "x",
+        score: 1,
+        raw_score: 0.42,
+        match: "hybrid",
+      },
+    ],
+  };
+  const client = new MemtierClient({
+    url: "http://memtier:8400",
+    workspace: "waweb",
+    program: "default",
+    fetch: async () =>
+      new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+  });
+
+  const withRaw = await client.searchCode("q");
+  assert.equal(withRaw.chunks[0]?.raw_score, 0.42);
+  // D1: `score` NÃO muda com o campo aditivo (continua a ordem/RRF).
+  assert.equal(withRaw.chunks[0]?.score, 1);
+
+  response = {
+    chunks: [
+      {
+        path: "a.go",
+        symbol: "A",
+        start_line: 1,
+        end_line: 2,
+        code: "x",
+        score: 1,
+        match: "vector",
+      },
+    ],
+  };
+  const legacy = await client.searchCode("q");
+  assert.equal(legacy.chunks[0]?.raw_score, undefined);
 });
 
 test("code_search_limit_capped: limit acima de 50 é fatiado para 50", async () => {
