@@ -64,9 +64,11 @@ class MemtierClient {
 // orçamento A1 no servidor. Erros HTTP viram tipos (AuthError 401/403,
 // InfraError 503) — o hook degrada, não propaga. `syncCode` faz fallback 422
 // (reenvia sem arestas) e usa `sync_timeout_ms` (default 120000). `searchCode`
-// fatia `limit` em 50 (MAX_SEARCH_LIMIT) e TRUNCA `query` em 512 chars
+// fatia `limit` em 50 (MAX_SEARCH_LIMIT) e CORTA `query` em 512 chars
 // (MAX_QUERY_LENGTH — acima disso a rota de código responde 422 e o turno
-// perderia a injeção; o `recall` trunca no servidor, o código não); envia
+// perderia a injeção; o `recall` trunca no servidor, o código não). O corte é
+// `clampQuery`: 25% cabeça + 75% cauda, com a cauda ancorada no último `?`;
+// envia
 // `labels` quando há ao menos um item útil (`labels: []` é 422 — lista
 // vazia/itens vazios são omitidos) e `min_score` só quando definido e em
 // [0,1]. `CodeChunkHit.raw_score` é opcional: servidor antigo não manda e o
@@ -382,6 +384,7 @@ Env vars fora do prefixo:
 | Envs de limite legadas ⇒ **um** aviso de depreciação (nunca silêncio) | `tests/config.test.ts` — casos `config_legacy_*_warns` e `config_no_legacy_no_warning` |
 | Teto acima de 16000 (422 no servidor) é **clampado** com log; inválido cai no default | `tests/config.test.ts` — `config_token_cap_clamped`, `config_token_cap_empty_string` |
 | `labels`/`min_score` do `CodeConfig` chegam ao body; piso desligado é omitido | `tests/code_s2.test.ts` — `code_search_body_passes_labels_and_min_score_from_code_config`, `code_search_body_omits_min_score_when_unset`; `tests/code.test.ts` — `code_search_*labels*`, `code_search_min_score_*` |
+| Corte da query preserva a pergunta (25/75 ancorado no `?`) e nunca passa de 512 | `tests/query_clamp.test.ts` — `clamp_query_*` |
 | Servidor sem `raw_score` ⇒ **um** log por turno no hook (uma por chamada no caminho avulso) | `tests/code_s2.test.ts` — `floor_not_honored_logs_once_per_turn`, `floor_honored_does_not_log`; `tests/inject.test.ts` — `code_floor_*` |
 | Erro HTTP com body de MB não vira `message` gigante (UI) | `tests/client.test.ts` — `httpError_caps_detail`, `extractHttpDetail_never_exceeds_cap`; `tests/provision.test.ts` — `provision_error_body_bounded` |
 | Linha de log nunca excede o teto (nem `log`/`debug`, nem o `console.error` do fatal) | `tests/logger.test.ts` — `logFatal_respects_cap_exactly`, `logFatal_console_leg_bounded`, `log_caps_direct_giant` |

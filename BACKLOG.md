@@ -1,3 +1,30 @@
+## 2026-10-20 — corte da query: 25/75 ancorado na pergunta
+
+O `slice(0, 512)` do fix anterior parava o 422, mas descartava a pergunta: no
+`kilo.db` real (779 mensagens >512 chars, 281 com `?`), a `?` sobrevivia em
+apenas **31,7%** dos casos — ela está no último terço em 65% das mensagens
+(mediana da posição relativa: 0,84).
+
+`clampQuery` agora corta em 25% cabeça + 75% cauda e, quando o último `?`
+cairia fora da janela final, recua a cauda até incluí-lo. Resultado medido no
+mesmo corpus: **281/281 (100%)** das perguntas preservadas; identificadores
+retidos 26,1% (vs. 26,5% do `head`), ou seja, sem custo relevante de recall
+léxico.
+
+Holdout honesto (40 mensagens longas reais, sem `<system-reminder>`, âncoras =
+identificadores do próprio texto): **1 ganho, 2 perdas, 37 empates** no top-10.
+As perdas são mensagens cujo assunto existe só nos primeiros 128 chars (ex.:
+dump de log com pergunta genérica no fim: "O que é um SaaS?"). O ganho é o
+caso-alvo: pergunta no fim com o texto dominado por ruído anterior.
+
+Também verificado em cenário sintético controlado (intenção no início/meio/fim
+de 1400 chars): `head` achava 5/9, `clampQuery` achou 9/9. O sintético
+superestima porque usa ruído repetitivo; os números que valem para decisão são
+os do holdout real.
+
+Desvio consciente: não é "25/75 puro" quando há pergunta fora da janela — a
+âncora move a cauda. Sem `?`, é 25/75 puro.
+
 ## 2026-10-20 — query longa derrubava a injeção de código (422)
 
 Validado ao vivo contra a stack (`memtier.tail7d66cf.ts.net:8400`): o turno em

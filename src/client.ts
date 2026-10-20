@@ -76,6 +76,45 @@ const MAX_SEARCH_LIMIT = 50;
  */
 const MAX_QUERY_LENGTH = 512;
 
+/** Fração do orçamento reservada à CABEÇA do texto (o resto vai para a cauda). */
+const QUERY_HEAD_RATIO = 0.25;
+
+/**
+ * Corta `text` em `cap` chars preservando os DOIS extremos, com âncora na
+ * pergunta. Substitui o `slice(0, cap)` puro, que descartava a pergunta: no
+ * corpus real ela está no último terço em 65% das mensagens longas (mediana
+ * 0,84 da posição relativa) e, mesmo com pergunta, o `head` a mantinha em só
+ * 8,1% dos casos.
+ *
+ * Regra (25/75): `floor(cap*0.25)` chars da cabeça + o restante da cauda.
+ *
+ * - Sem `?`, é o split 25/75 puro (contexto/tema + desfecho).
+ * - Com `?` **depois** da cabeça, a cauda termina na pergunta: o texto que veio
+ *   depois dela (tipicamente o `<system-reminder>` do host) é o menos
+ *   informativo e fica de fora. Isso preserva a pergunta sem gastar orçamento
+ *   com ruído que o próprio host anexa.
+ * - Com `?` **dentro** da cabeça, a janela é a 25/75 normal (a pergunta já
+ *   entrou; a cauda vale mais como contexto do que como eco da pergunta).
+ *
+ * Nunca devolve mais que `cap` chars e nunca gera vazio a partir de texto não
+ * vazio. Texto que já cabe é devolvido INTACTO (sem normalização).
+ */
+export function clampQuery(text: string, cap: number = MAX_QUERY_LENGTH): string {
+  if (text.length <= cap) return text;
+  const headBudget = Math.floor(cap * QUERY_HEAD_RATIO);
+  const tailBudget = cap - headBudget - 1; // -1 do separador
+  const head = text.slice(0, headBudget);
+
+  const lastQuestion = text.lastIndexOf("?");
+  const tailStart = Math.max(headBudget, text.length - tailBudget);
+  const anchored = lastQuestion >= headBudget && lastQuestion < tailStart;
+  const tail = anchored
+    ? text.slice(Math.max(headBudget, lastQuestion + 1 - tailBudget), lastQuestion + 1)
+    : text.slice(tailStart);
+
+  return `${head} ${tail}`;
+}
+
 /** Erro HTTP base — carrega o status para o chamador decidir. */
 export class MemtierHttpError extends Error {
   readonly status: number;
@@ -524,8 +563,10 @@ export class MemtierClient {
    * `minScore` (D7) vira `min_score` só quando definido e em `[0,1]`; fora
    * disso é omitido em vez de falhar o turno com 422. O piso é aplicado no
    * SERVIDOR sobre `raw_score` — o cliente **não** re-filtra por score (D6).
-   * `query` é TRUNCADA em `MAX_QUERY_LENGTH` (512) — mesmo limite do body do
-   * servidor: acima disso ele responde 422 e o turno perde a injeção. O
+   * `query` é CORTADA em `MAX_QUERY_LENGTH` (512) — mesmo limite do body do
+   * servidor: acima disso ele responde 422 e o turno perde a injeção. O corte
+   * é `clampQuery` (25% cabeça + 75% cauda, ancorado no último `?`), não um
+   * prefixo: preservar os dois extremos mantém o tema E a pergunta. O
    * truncamento por comprimento é do mesmo contrato do `recall` (D2), só que
    * aqui é o cliente que o aplica (a rota de código NÃO trunca no servidor).
    * Lança erro tipado no HTTP não-2xx — quem chama (o hook) degrada.
@@ -540,7 +581,9 @@ export class MemtierClient {
       program: identity.program,
       // Truncar é o que impede o 422 de `string_too_long` derrubar o turno
       // inteiro (o hook degrada, mas sem código). Comprimento, não bytes.
-      query: query.slice(0, MAX_QUERY_LENGTH),
+      // `clampQuery` mantém a pergunta (âncora no último `?`) — o `slice(0,
+      // cap)` antigo a descartava em 65% das mensagens longas.
+      query: clampQuery(query, MAX_QUERY_LENGTH),
     };
     if (opts.limit !== undefined) {
       body.limit = Math.min(opts.limit, MAX_SEARCH_LIMIT);

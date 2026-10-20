@@ -118,9 +118,17 @@ E11) além de `workspace`.
 `["CodeSymbol"]`). `match ∈ vector|fulltext|hybrid`. `score` é a ORDEM (RRF
 normalizado, top-1 = 1.0) e `raw_score` é a MAGNITUDE — é sobre ela que o
 `min_score` (opcional, `[0,1]`) filtra, no servidor e antes do `limit`.
-`query` é truncada pelo plugin em 512 chars (`MAX_QUERY_LENGTH`): a rota de
+`query` é cortada pelo plugin em 512 chars (`MAX_QUERY_LENGTH`): a rota de
 código responde **422** acima disso (só o `recall` trunca no servidor), e sem
 o clamp um turno com texto longo perderia a injeção inteira.
+
+O corte é `clampQuery` (25% cabeça + 75% cauda), com a cauda **ancorada na
+pergunta**: se o último `?` ficaria fora da janela final, a cauda recua até
+incluí-lo (o texto depois dele — tipicamente o `<system-reminder>` do host —
+fica de fora). Motivo medido no `kilo.db` real: das 281 mensagens longas com
+pergunta, o `slice(0,512)` preservava a `?` em 31,7%; o `clampQuery` preserva
+em 100%, e o holdout de 40 mensagens reais mostrou 1 ganho, 2 perdas e 37
+empates no top-10 (as perdas são mensagens cujo assunto está só na cabeça).
 Escrita só existe via `/v1/code/sync` (abaixo) — a busca é read-only.
 
 ### `POST /v1/code/sync` — **o destino do coletor**

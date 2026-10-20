@@ -134,10 +134,11 @@ test("code_search_body_shape: body tem workspace/program/query/limit e labels ex
   ]);
 });
 
-test("code_search_query_clamped: query > 512 chars é truncada, nunca 422", async () => {
+test("code_search_query_clamped: query > 512 chars é cortada, nunca 422", async () => {
   // O servidor responde 422 (`string_too_long`, `max_length=512`) e o hook
   // degradaria o turno inteiro. Como `recall` já trunca do lado do servidor
-  // (D2), o cliente trunca no mesmo limite, espelhando o clamp de `limit`.
+  // (D2), o cliente corta no mesmo limite (ver `clampQuery` em
+  // `tests/query_clamp.test.ts` para a regra 25/75 ancorada na pergunta).
   let body: Record<string, unknown> = {};
   const client = new MemtierClient({
     url: "http://memtier:8400",
@@ -150,8 +151,10 @@ test("code_search_query_clamped: query > 512 chars é truncada, nunca 422", asyn
   const longo = "cursor session headers fingerprint ".repeat(30); // 1080 chars
   await client.searchCode(longo);
   assert.equal(typeof body.query, "string");
-  assert.equal((body.query as string).length, 512);
-  assert.equal((body.query as string), longo.slice(0, 512));
+  assert.ok((body.query as string).length <= 512);
+  // O corte preserva os dois extremos (não é mais um prefixo).
+  assert.ok((body.query as string).startsWith(longo.slice(0, 32)));
+  assert.ok((body.query as string).trimEnd().endsWith(longo.trimEnd().slice(-32)));
 });
 
 test("code_search_query_short_untouched: query curta passa intacta", async () => {
