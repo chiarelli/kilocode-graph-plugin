@@ -20,6 +20,8 @@ import {
 import { applyBudget } from "../src/inject/budget.ts";
 import type { Fact } from "../src/client.ts";
 import { injectMemoryIntoMessages, type TransformMessage } from "../src/hooks/messages.ts";
+import { CodeInjector, searchAndFormat } from "../src/inject/code.ts";
+import type { CodeChunkHit, SearchCodeResult } from "../src/client.ts";
 /** Stub de `fetch` que captura o request e devolve `{ facts }` (ou o status dado). */
 function recallFetch(
   facts: Fact[],
@@ -542,4 +544,178 @@ test("debug_dump_counts_facts: nº de fatos (numérico) chega ao dump do raw", a
   assert.ok(dump, "o dump do raw foi emitido");
   // Contagem EXATA (não só "tem número"): 2 fatos injetados ⇒ "2 itens".
   assert.match(dump!, /2 itens ·/, "a contagem correta (2) aparece no dump");
+});
+
+// --- D7: degradação visível do piso (código) -------------------------------
+
+function codeChunk(over: Partial<CodeChunkHit> = {}): CodeChunkHit {
+  return {
+    path: "src/db.rs",
+    symbol: "connect",
+    start_line: 1,
+    end_line: 5,
+    code: "fn connect() {}\n",
+    score: 1,
+    match: "hybrid",
+    ...over,
+  };
+}
+
+function codeClient(
+  result: () => SearchCodeResult,
+): MemtierClient {
+  return new MemtierClient({
+    url: "http://memtier:8400",
+    workspace: "ws",
+    fetch: async () =>
+      new Response(JSON.stringify(result()), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+  });
+}
+
+test("code_floor_not_honored_calls_searchAndFormat_logs", async () => {
+  const { __setLogSink } = await import("../src/logger.ts");
+  const lines: string[] = [];
+  __setLogSink((line) => lines.push(line));
+  try {
+    // Servidor antigo: devolve chunks SEM `raw_score`.
+    await searchAndFormat(codeClient(() => ({ chunks: [codeChunk()] })), {
+      maxCodeChunks: 3,
+      minScore: 0.65,
+    }, "q");
+  } finally {
+    __setLogSink(null);
+  }
+
+  const warnings = lines.filter((l) => l.includes("NÃO honrou o piso"));
+  assert.equal(warnings.length, 1, lines.join("\n"));
+});
+
+test("code_floor_absent_does_not_log", async () => {
+  const { __setLogSink } = await import("../src/logger.ts");
+  const lines: string[] = [];
+  __setLogSink((line) => lines.push(line));
+  try {
+    await searchAndFormat(codeClient(() => ({ chunks: [codeChunk()] })), {
+      maxCodeChunks: 3,
+    }, "q");
+  } finally {
+    __setLogSink(null);
+  }
+  assert.equal(lines.filter((l) => l.includes("NÃO honrou o piso")).length, 0);
+});
+
+test("code_injector_floor_warns_once_even_with_multiple_prepares", async () => {
+  const { __setLogSink } = await import("../src/logger.ts");
+  const lines: string[] = [];
+  __setLogSink((line) => lines.push(line));
+  try {
+    const injector = new CodeInjector(
+      codeClient(() => ({ chunks: [codeChunk()] })),
+      { maxCodeChunks: 3, minScore: 0.65 },
+    );
+    const first = await injector.prepare("t1", "q");
+    assert.ok(first, "primeira passada busca");
+    // O hook pode chamar `prepare` outra vez no MESMO turno (nova mensagem do
+    // usuário): a busca acontece, mas o aviso de degradação NÃO duplica.
+    const second = await injector.prepare("t1", "q");
+    assert.ok(second, "segunda passada do mesmo turno ainda busca");
+  } finally {
+    __setLogSink(null);
+  }
+  assert.equal(lines.filter((l) => l.includes("NÃO honrou o piso")).length, 1);
+});
+
+test("code_injector_floor_honored_no_log", async () => {
+  const { __setLogSink } = await import("../src/logger.ts");
+  const lines: string[] = [];
+  __setLogSink((line) => lines.push(line));
+  try {
+    const injector = new CodeInjector(
+      codeClient(() => ({ chunks: [codeChunk({ raw_score: 0.9 })] })),
+      { maxCodeChunks: 3, minScore: 0.65 },
+    );
+    await injector.prepare("t1", "q");
+  } finally {
+    __setLogSink(null);
+  }
+  assert.equal(lines.filter((l) => l.includes("NÃO honrou o piso")).length, 0);
+});
+
+test("code_floor_partial_raw_score_still_warns", async () => {
+  const { __setLogSink } = await import("../src/logger.ts");
+  const lines: string[] = [];
+  __setLogSink((line) => lines.push(line));
+  try {
+    // Compatibilidade PARCIAL: um chunk com `raw_score`, outro sem. O que ficou
+    // sem o campo foi injetado sem filtro — não pode passar em silêncio.
+    await searchAndFormat(
+      codeClient(() => ({
+        chunks: [
+          codeChunk({ raw_score: 0.9 }),
+          codeChunk({ path: "src/other.rs", start_line: 10, end_line: 12 }),
+        ],
+      })),
+      { maxCodeChunks: 3, minScore: 0.65 },
+      "q",
+    );
+  } finally {
+    __setLogSink(null);
+  }
+  const warnings = lines.filter((l) => l.includes("NÃO honrou o piso"));
+  assert.equal(warnings.length, 1, lines.join("\n"));
+  assert.match(warnings[0]!, /1\/2 chunk/);
+});
+
+test("code_floor_out_of_range_does_not_warn", async () => {
+  const { __setLogSink } = await import("../src/logger.ts");
+  const lines: string[] = [];
+  __setLogSink((line) => lines.push(line));
+  try {
+    // Piso inválido nem vai no body (o client omite): culpar o servidor seria
+    // diagnóstico errado.
+    await searchAndFormat(codeClient(() => ({ chunks: [codeChunk()] })), {
+      maxCodeChunks: 3,
+      minScore: 1.5,
+    }, "q");
+  } finally {
+    __setLogSink(null);
+  }
+  assert.equal(lines.filter((l) => l.includes("NÃO honrou o piso")).length, 0);
+});
+
+test("code_floor_warns_again_on_a_new_turn", async () => {
+  const { __setLogSink } = await import("../src/logger.ts");
+  const lines: string[] = [];
+  __setLogSink((line) => lines.push(line));
+  try {
+    const injector = new CodeInjector(
+      codeClient(() => ({ chunks: [codeChunk()] })),
+      { maxCodeChunks: 3, minScore: 0.65 },
+    );
+    await injector.prepare("t1", "q");
+    // Turno NOVO ⇒ o aviso volta a valer (não fica silenciado para sempre).
+    await injector.prepare("t2", "q");
+  } finally {
+    __setLogSink(null);
+  }
+  assert.equal(lines.filter((l) => l.includes("NÃO honrou o piso")).length, 2);
+});
+
+test("code_floor_honored_searchAndFormat_no_log", async () => {
+  const { __setLogSink } = await import("../src/logger.ts");
+  const lines: string[] = [];
+  __setLogSink((line) => lines.push(line));
+  try {
+    await searchAndFormat(
+      codeClient(() => ({ chunks: [codeChunk({ raw_score: 0.9 })] })),
+      { maxCodeChunks: 3, minScore: 0.65 },
+      "q",
+    );
+  } finally {
+    __setLogSink(null);
+  }
+  assert.equal(lines.filter((l) => l.includes("NÃO honrou o piso")).length, 0);
 });

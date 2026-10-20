@@ -204,6 +204,9 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
         maxCodeChunks: config.inject.max_code_chunks,
         codeMaxTokens: config.inject.code_max_tokens,
         timeoutMs: config.inject.timeout_ms,
+        // D5/D7: labels e piso vêm da config (piso `undefined` = desligado).
+        labels: config.inject.code_labels,
+        minScore: config.inject.code_min_score,
       },
       client,
     }),

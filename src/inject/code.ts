@@ -35,6 +35,21 @@ export interface CodeConfig {
   codeMaxTokens?: number;
   /** Teto da chamada de busca (ms) — governa o `AbortSignal`. */
   timeoutMs?: number;
+  /**
+   * D5 — labels enviados na busca. `undefined` ⇒ o servidor usa o default dele
+   * (`CodeChunk`). O plugin passa `["CodeSymbol"]` por default (config).
+   *
+   * Efeito da troca: só chunks de SÍMBOLO são injetados; `FullFile`/
+   * `Contextual` deixam de aparecer. `[]` equivale a `undefined` (o client
+   * filtra itens vazios e omite o campo — `labels: []` é 422 no servidor).
+   */
+  labels?: string[];
+  /**
+   * D7 — piso de relevância enviado ao servidor. `undefined` ⇒ o campo NÃO vai
+   * no body (nenhum comportamento muda). Com servidor que não honra o campo, a
+   * degradação é logada uma vez por turno (ver `warnIfFloorNotHonored`).
+   */
+  minScore?: number;
 }
 
 /** O que `code.ts` precisa do client (permite stub estreito em teste). */
@@ -76,12 +91,49 @@ function timeoutSignal(cfg: CodeConfig): AbortSignal | undefined {
     : undefined;
 }
 
-/** Opções de `searchCode` derivadas da config (limit/max_tokens/signal). */
+/** Opções de `searchCode` derivadas da config (limit/max_tokens/labels/piso/signal). */
 function searchOpts(cfg: CodeConfig, signal?: AbortSignal): SearchCodeOpts {
   const opts: SearchCodeOpts = { limit: cfg.maxCodeChunks };
   if (cfg.codeMaxTokens !== undefined) opts.maxTokens = cfg.codeMaxTokens;
+  if (cfg.labels !== undefined) opts.labels = cfg.labels;
+  if (cfg.minScore !== undefined) opts.minScore = cfg.minScore;
   if (signal) opts.signal = signal;
   return opts;
+}
+
+/**
+ * Degradação VISÍVEL do piso (D7 / decisão 6 do ADR-009): um servidor antigo
+ * ignora `min_score` em silêncio (pydantic descarta campo extra) e devolve
+ * chunks sem `raw_score` — o operador acharia que o piso está valendo.
+ *
+ * Critério: precisa haver ALGUM chunk sem `raw_score` (não "nenhum com"): um
+ * servidor parcialmente compatível não pode degradar em silêncio para os
+ * chunks que ficaram sem o campo. Lista vazia não avisa — não há o que julgar.
+ *
+ * Devolve `true` quando avisou, para quem chama manter "uma vez por turno" sem
+ * reimplementar a condição (que divergiria do aviso).
+ */
+function warnIfFloorNotHonored(
+  cfg: CodeConfig,
+  chunks: CodeChunkHit[],
+  escopo: string,
+): boolean {
+  if (cfg.minScore === undefined) return false;
+  // Piso fora de [0,1] nem chega ao body (o client omite): avisar aqui
+  // culparia o servidor por uma decisão do cliente.
+  if (!Number.isFinite(cfg.minScore) || cfg.minScore < 0 || cfg.minScore > 1) {
+    return false;
+  }
+  if (chunks.length === 0) return false;
+  const semRaw = chunks.filter((chunk) => typeof chunk.raw_score !== "number");
+  if (semRaw.length === 0) return false;
+  log(
+    `code_search: min_score=${cfg.minScore} configurado mas o servidor NÃO ` +
+      `honrou o piso em ${semRaw.length}/${chunks.length} chunk(s) ` +
+      `(sem raw_score) — esses foram injetados SEM filtro de relevância ` +
+      `(${escopo})`,
+  );
+  return true;
 }
 
 /** Loga o envelope A1 quando o servidor devolve `truncated`. */
@@ -162,6 +214,8 @@ export async function searchAndFormat(
   // servidor (ge=1) e um round-trip perdido no caminho crítico do turno.
   if (cfg.maxCodeChunks <= 0) return null;
   const { chunks } = await runSearch(client, cfg, query, signal);
+  // Caminho avulso não tem estado de turno: uma chamada = um aviso.
+  warnIfFloorNotHonored(cfg, chunks, "busca avulsa");
   return formatCodeBlock(chunks);
 }
 
@@ -180,6 +234,7 @@ export class CodeInjector {
   private readonly cfg: CodeConfig;
   private turnoId: string | null = null;
   private injectedThisTurn = false;
+  private floorWarnedThisTurn = false;
   private readonly seen = new Set<string>();
 
   constructor(client: SearchClient, cfg: CodeConfig) {
@@ -193,6 +248,7 @@ export class CodeInjector {
       this.turnoId = turnoId;
       this.seen.clear();
       this.injectedThisTurn = false;
+      this.floorWarnedThisTurn = false;
     }
     return !this.injectedThisTurn;
   }
@@ -210,6 +266,17 @@ export class CodeInjector {
     const fresh = dedupeByIdentity(
       chunks.filter((c) => !this.seen.has(chunkIdentity(c))),
     );
+    // Uma vez por turno, não por passada: o hook pode chamar `prepare` mais de
+    // uma vez no mesmo turno (novas mensagens) e o aviso não pode virar spam.
+    // Marca só quando houve de fato degradação (chunks sem `raw_score`), para
+    // que um turno sem resultado ainda avise se o próximo resultado degradar.
+    if (!this.floorWarnedThisTurn) {
+      this.floorWarnedThisTurn = warnIfFloorNotHonored(
+        this.cfg,
+        fresh,
+        "injeção do turno",
+      );
+    }
     return { chunks: fresh, searchMs };
   }
 

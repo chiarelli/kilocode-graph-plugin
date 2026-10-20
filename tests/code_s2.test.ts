@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { MemtierClient, type FetchLike } from "../src/client.ts";
+import { __setLogSink } from "../src/logger.ts";
 import type { CodeChunkHit, Fact } from "../src/client.ts";
 import { applyJointBudget } from "../src/inject/budget.ts";
 import {
@@ -88,6 +89,8 @@ function hook(client: MemtierClient, over: {
   maxCodeChunks?: number;
   memoryMaxTokens?: number;
   codeMaxTokens?: number;
+  codeLabels?: string[];
+  codeMinScore?: number;
 } = {}) {
   return messagesHook({
     enabled: over.enabled ?? true,
@@ -99,6 +102,8 @@ function hook(client: MemtierClient, over: {
     codeCfg: {
       maxCodeChunks: over.maxCodeChunks ?? 3,
       ...(over.codeMaxTokens !== undefined ? { codeMaxTokens: over.codeMaxTokens } : {}),
+      ...(over.codeLabels !== undefined ? { labels: over.codeLabels } : {}),
+      ...(over.codeMinScore !== undefined ? { minScore: over.codeMinScore } : {}),
     },
     client,
   });
@@ -306,4 +311,99 @@ test("hook_joint_budget: tetos de contagem independentes por família (ADR-009)"
   // Cada família obedece só ao SEU teto de contagem.
   assert.equal(memoryPart.match(/^- /gm)?.length, 3, "3 fatos de memória");
   assert.equal(codePart.match(/\[CÓDIGO RELEVANTE/g)?.length, 2, "2 chunks de código");
+});
+
+// --- D5/D7: labels e piso na fiação real do hook ----------------------------
+
+test("code_search_body_passes_labels_and_min_score_from_code_config", async () => {
+  let searchBody: Record<string, unknown> = {};
+  const client = rtClient(
+    legFetch({
+      facts: [fact("a")],
+      chunks: [chunk()],
+      onSearchBody: (b) => {
+        searchBody = b;
+      },
+    }),
+  );
+  const messages = userTurn("q");
+  await hook(client, {
+    codeLabels: ["CodeSymbol"],
+    codeMinScore: 0.65,
+  })["experimental.chat.messages.transform"]({}, { messages });
+
+  assert.deepEqual(searchBody.labels, ["CodeSymbol"]);
+  assert.equal(searchBody.min_score, 0.65);
+});
+
+test("code_search_body_omits_min_score_when_unset", async () => {
+  let searchBody: Record<string, unknown> = {};
+  const client = rtClient(
+    legFetch({
+      facts: [fact("a")],
+      chunks: [chunk()],
+      onSearchBody: (b) => {
+        searchBody = b;
+      },
+    }),
+  );
+  const messages = userTurn("q");
+  // D7: sem piso configurado, o campo NÃO vai no body.
+  await hook(client, { codeLabels: ["CodeSymbol"] })[
+    "experimental.chat.messages.transform"
+  ]({}, { messages });
+
+  assert.equal("min_score" in searchBody, false);
+});
+
+test("floor_not_honored_logs_once_per_turn", async () => {
+  let searches = 0;
+  const base = legFetch({ facts: [fact("a")], chunks: [chunk()] });
+  const client = rtClient(async (url, init) => {
+    if (String(url).includes("/v1/code/search")) searches += 1;
+    return base(url, init);
+  });
+  const lines: string[] = [];
+  __setLogSink((line) => lines.push(line));
+  try {
+    const h = hook(client, { codeMinScore: 0.65 });
+    // Duas chamadas no MESMO turno (nova mensagem do usuário): o aviso não
+    // duplica. A 2ª nem busca — o turno já injetou.
+    const t1 = userTurn("q", "turno-X");
+    await h["experimental.chat.messages.transform"]({}, { messages: t1 });
+    const t2 = userTurn("outra pergunta", "turno-X");
+    await h["experimental.chat.messages.transform"]({}, { messages: t2 });
+  } finally {
+    __setLogSink(null);
+  }
+
+  // Não-vacuidade: a primeira passada REALMENTE buscou (senão "1 aviso" seria
+  // trivialmente verdade por ausência de busca). A segunda não busca: o turno
+  // já injetou (`beginTurn` curto-circuita) — o aviso continua sendo um só.
+  assert.equal(searches, 1, "a primeira passada do turno buscou");
+  const warnings = lines.filter((l) => l.includes("NÃO honrou o piso"));
+  assert.equal(warnings.length, 1, lines.join("\n"));
+  assert.match(warnings[0]!, /min_score=0\.65/);
+  assert.match(warnings[0]!, /raw_score/);
+});
+
+test("floor_honored_does_not_log", async () => {
+  const honored = { ...chunk(), raw_score: 0.9 };
+  const client = rtClient(legFetch({ facts: [fact("a")], chunks: [honored] }));
+  const lines: string[] = [];
+  __setLogSink((line) => lines.push(line));
+  try {
+    const messages = userTurn("q");
+    await hook(client, { codeMinScore: 0.65 })[
+      "experimental.chat.messages.transform"
+    ]({}, { messages });
+  } finally {
+    __setLogSink(null);
+  }
+
+  assert.equal(
+    lines.filter((l) => l.includes("NÃO honrou o piso")).length,
+    0,
+    lines.join("\n"),
+  );
 });
