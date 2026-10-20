@@ -67,6 +67,15 @@ const MAX_EDGES_PER_REQUEST = 5000;
 /** Limite de `limit` em `POST /v1/code/search` (memtier `code.py:131`). */
 const MAX_SEARCH_LIMIT = 50;
 
+/**
+ * Limite de `query` em `POST /v1/code/search` (memtier `code.py:133`,
+ * `MAX_QUERY_LENGTH`). Acima disso o servidor responde **422**
+ * (`string_too_long`), não trunca — ao contrário do `recall`, que trunca em
+ * `memory.recall` (D2). O cliente espelha o clamp de `limit`: trunca aqui para
+ * que um turno com texto longo não perca a injeção inteira.
+ */
+const MAX_QUERY_LENGTH = 512;
+
 /** Erro HTTP base — carrega o status para o chamador decidir. */
 export class MemtierHttpError extends Error {
   readonly status: number;
@@ -515,6 +524,10 @@ export class MemtierClient {
    * `minScore` (D7) vira `min_score` só quando definido e em `[0,1]`; fora
    * disso é omitido em vez de falhar o turno com 422. O piso é aplicado no
    * SERVIDOR sobre `raw_score` — o cliente **não** re-filtra por score (D6).
+   * `query` é TRUNCADA em `MAX_QUERY_LENGTH` (512) — mesmo limite do body do
+   * servidor: acima disso ele responde 422 e o turno perde a injeção. O
+   * truncamento por comprimento é do mesmo contrato do `recall` (D2), só que
+   * aqui é o cliente que o aplica (a rota de código NÃO trunca no servidor).
    * Lança erro tipado no HTTP não-2xx — quem chama (o hook) degrada.
    */
   async searchCode(
@@ -525,7 +538,9 @@ export class MemtierClient {
     const body: CodeSearchBody = {
       workspace: identity.workspace,
       program: identity.program,
-      query,
+      // Truncar é o que impede o 422 de `string_too_long` derrubar o turno
+      // inteiro (o hook degrada, mas sem código). Comprimento, não bytes.
+      query: query.slice(0, MAX_QUERY_LENGTH),
     };
     if (opts.limit !== undefined) {
       body.limit = Math.min(opts.limit, MAX_SEARCH_LIMIT);

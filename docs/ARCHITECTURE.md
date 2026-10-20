@@ -118,6 +118,9 @@ E11) além de `workspace`.
 `["CodeSymbol"]`). `match ∈ vector|fulltext|hybrid`. `score` é a ORDEM (RRF
 normalizado, top-1 = 1.0) e `raw_score` é a MAGNITUDE — é sobre ela que o
 `min_score` (opcional, `[0,1]`) filtra, no servidor e antes do `limit`.
+`query` é truncada pelo plugin em 512 chars (`MAX_QUERY_LENGTH`): a rota de
+código responde **422** acima disso (só o `recall` trunca no servidor), e sem
+o clamp um turno com texto longo perderia a injeção inteira.
 Escrita só existe via `/v1/code/sync` (abaixo) — a busca é read-only.
 
 ### `POST /v1/code/sync` — **o destino do coletor**

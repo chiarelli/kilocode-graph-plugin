@@ -64,10 +64,13 @@ class MemtierClient {
 // orçamento A1 no servidor. Erros HTTP viram tipos (AuthError 401/403,
 // InfraError 503) — o hook degrada, não propaga. `syncCode` faz fallback 422
 // (reenvia sem arestas) e usa `sync_timeout_ms` (default 120000). `searchCode`
-// fatia `limit` em 50 (MAX_SEARCH_LIMIT); envia `labels` quando há ao menos um
-// item útil (`labels: []` é 422 — lista vazia/itens vazios são omitidos) e
-// `min_score` só quando definido e em [0,1]. `CodeChunkHit.raw_score` é
-// opcional: servidor antigo não manda e o cliente não filtra por score.
+// fatia `limit` em 50 (MAX_SEARCH_LIMIT) e TRUNCA `query` em 512 chars
+// (MAX_QUERY_LENGTH — acima disso a rota de código responde 422 e o turno
+// perderia a injeção; o `recall` trunca no servidor, o código não); envia
+// `labels` quando há ao menos um item útil (`labels: []` é 422 — lista
+// vazia/itens vazios são omitidos) e `min_score` só quando definido e em
+// [0,1]. `CodeChunkHit.raw_score` é opcional: servidor antigo não manda e o
+// cliente não filtra por score.
 ```
 
 ### `index/` (E3a — implementado; delta em runtime na E3a-S6)

@@ -134,6 +134,40 @@ test("code_search_body_shape: body tem workspace/program/query/limit e labels ex
   ]);
 });
 
+test("code_search_query_clamped: query > 512 chars é truncada, nunca 422", async () => {
+  // O servidor responde 422 (`string_too_long`, `max_length=512`) e o hook
+  // degradaria o turno inteiro. Como `recall` já trunca do lado do servidor
+  // (D2), o cliente trunca no mesmo limite, espelhando o clamp de `limit`.
+  let body: Record<string, unknown> = {};
+  const client = new MemtierClient({
+    url: "http://memtier:8400",
+    workspace: "waweb",
+    program: "default",
+    fetch: searchFetch([], (b) => {
+      body = b;
+    }),
+  });
+  const longo = "cursor session headers fingerprint ".repeat(30); // 1080 chars
+  await client.searchCode(longo);
+  assert.equal(typeof body.query, "string");
+  assert.equal((body.query as string).length, 512);
+  assert.equal((body.query as string), longo.slice(0, 512));
+});
+
+test("code_search_query_short_untouched: query curta passa intacta", async () => {
+  let body: Record<string, unknown> = {};
+  const client = new MemtierClient({
+    url: "http://memtier:8400",
+    workspace: "waweb",
+    program: "default",
+    fetch: searchFetch([], (b) => {
+      body = b;
+    }),
+  });
+  await client.searchCode("db.Insert");
+  assert.equal(body.query, "db.Insert");
+});
+
 test("code_search_labels_empty_is_omitted: lista vazia NÃO vai no body", async () => {
   let body: Record<string, unknown> = {};
   const client = new MemtierClient({
