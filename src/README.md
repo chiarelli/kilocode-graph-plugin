@@ -55,7 +55,7 @@ src/
 ```ts
 class MemtierClient {
   recall(query: string, opts?: { limit?; maxTokens?; signal? }): Promise<RecallResult>
-  searchCode(query: string, opts?: { limit?; maxTokens?; signal? }): Promise<SearchCodeResult>  // ≤50; sem labels
+  searchCode(query: string, opts?: { limit?; maxTokens?; labels?; minScore?; signal? }): Promise<SearchCodeResult>  // ≤50
   syncCode(files, edges?, signal?): Promise<SyncResult>  // pagina ≤100 arquivos, ≤5000 arestas
   health(signal?): Promise<HealthReport>   // nunca lança (NFR-03)
   // ingest entra com E4.
@@ -64,7 +64,10 @@ class MemtierClient {
 // orçamento A1 no servidor. Erros HTTP viram tipos (AuthError 401/403,
 // InfraError 503) — o hook degrada, não propaga. `syncCode` faz fallback 422
 // (reenvia sem arestas) e usa `sync_timeout_ms` (default 120000). `searchCode`
-// fatia `limit` em 50 (MAX_SEARCH_LIMIT) e NUNCA envia `labels` (lista vazia é 422).
+// fatia `limit` em 50 (MAX_SEARCH_LIMIT); envia `labels` quando há ao menos um
+// item útil (`labels: []` é 422 — lista vazia/itens vazios são omitidos) e
+// `min_score` só quando definido e em [0,1]. `CodeChunkHit.raw_score` é
+// opcional: servidor antigo não manda e o cliente não filtra por score.
 ```
 
 ### `index/` (E3a — implementado; delta em runtime na E3a-S6)
@@ -299,6 +302,8 @@ default. Em `options`, o placeholder `{env:VAR}` resolve a env var citada
 | `inject.timeout_ms` | `KILOCODE_GRAPH_INJECT_TIMEOUT_MS` | `4000` |
 | `inject.code_enabled` | `KILOCODE_GRAPH_INJECT_CODE_ENABLED` | `false` |
 | `inject.max_code_chunks` | `KILOCODE_GRAPH_INJECT_MAX_CODE_CHUNKS` | `3` |
+| `inject.code_labels` | `KILOCODE_GRAPH_INJECT_CODE_LABELS` | `["CodeSymbol"]` (aceita CSV ou JSON array; vazio/inválido ⇒ default) |
+| `inject.code_min_score` | `KILOCODE_GRAPH_INJECT_CODE_MIN_SCORE` | ausente (piso desligado; fora de `[0,1]`, `""` ou `"undefined"` ⇒ desligado). **Calibração:** o servidor já corta a perna vetorial em `VEC_MIN_SCORE = 0.65`, logo um piso menor só afeta chunks fulltext-only |
 | `code_index.enabled` | `KILOCODE_GRAPH_INDEX_ENABLED` | `false` |
 | `code_index.indexer_bin` | `KILOCODE_GRAPH_INDEXER_BIN` | `""` (vazio — sem coletor) |
 | `code_index.sync_timeout_ms` | `KILOCODE_GRAPH_INDEX_SYNC_TIMEOUT_MS` | `120000` |
@@ -372,7 +377,9 @@ Env vars fora do prefixo:
 | `daemon.workspace` pina a identidade (override do derivado) | `tests/config.test.ts` — `config_workspace_override`; E2E que pinam `alfa`/`beta`/`kilocode-graph-plugin` |
 | **Teto de tokens por endpoint** (`memory_max_tokens`/`code_max_tokens`) corta cada bloco de forma independente | `tests/code_s2.test.ts` — `code_body_uses_code_tokens`, `endpoints_independent`; E2E `tests/e2e/test_e2e_inject_limits.test.ts` (gated `E2E=1`) |
 | Envs de limite legadas ⇒ **um** aviso de depreciação (nunca silêncio) | `tests/config.test.ts` — casos `config_legacy_*_warns` e `config_no_legacy_no_warning` |
-| Teto fora de `[1,16000]` (422 no servidor) cai no default | `tests/config.test.ts` — `config_token_cap_clamped` |
+| Teto acima de 16000 (422 no servidor) é **clampado** com log; inválido cai no default | `tests/config.test.ts` — `config_token_cap_clamped`, `config_token_cap_empty_string` |
+| `labels`/`min_score` do `CodeConfig` chegam ao body; piso desligado é omitido | `tests/code_s2.test.ts` — `code_search_body_passes_labels_and_min_score_from_code_config`, `code_search_body_omits_min_score_when_unset`; `tests/code.test.ts` — `code_search_*labels*`, `code_search_min_score_*` |
+| Servidor sem `raw_score` ⇒ **um** log por turno no hook (uma por chamada no caminho avulso) | `tests/code_s2.test.ts` — `floor_not_honored_logs_once_per_turn`, `floor_honored_does_not_log`; `tests/inject.test.ts` — `code_floor_*` |
 | Erro HTTP com body de MB não vira `message` gigante (UI) | `tests/client.test.ts` — `httpError_caps_detail`, `extractHttpDetail_never_exceeds_cap`; `tests/provision.test.ts` — `provision_error_body_bounded` |
 | Linha de log nunca excede o teto (nem `log`/`debug`, nem o `console.error` do fatal) | `tests/logger.test.ts` — `logFatal_respects_cap_exactly`, `logFatal_console_leg_bounded`, `log_caps_direct_giant` |
 | Chunk (`FullFile`/`Symbol`) acima do teto é truncado com marca | `tests/collector.test.ts` — `fullfile_truncation`, `symbol_truncation` |

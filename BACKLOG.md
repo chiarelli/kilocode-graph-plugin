@@ -938,3 +938,42 @@ redescobertas no meio do loop.
   `KILO_DB` relativo com `..` **mantido sem sanitização** de propósito (espelha a
   regra do runtime — divergir apontaria para outro banco) e documentado.
   Unit **403 · 384 pass · 0 fail · 19 skip**; `tsc --noEmit` limpo.
+
+- **2026-10-20 — Relevância do RAG de código: `labels`, piso `min_score` e
+  clamp do teto (D5–D8).** Fecha a lacuna medida no uso real: (a) a busca
+  injetava arquivo inteiro em vez do trecho, (b) `16384` de
+  `KILOCODE_GRAPH_INJECT_CODE_MAX_TOKENS` no `.bashrc` virava 2000 em silêncio,
+  e (c) não havia como cortar resultado irrelevante.
+  1. **`inject.code_labels`** (default `["CodeSymbol"]`, CSV/JSON array na env
+     `KILOCODE_GRAPH_INJECT_CODE_LABELS`) vai no body de `/v1/code/search`. O
+     default do **servidor** não muda (`CodeChunk`); a tool MCP segue igual.
+     Lista vazia/inválida ⇒ default (`labels: []` é 422).
+  2. **`inject.code_min_score`** (default **ausente** = desligado;
+     `KILOCODE_GRAPH_INJECT_CODE_MIN_SCORE`) envia `min_score` aditivo ao
+     `/v1/code/search`. O servidor filtra por `raw_score` (magnitude) antes do
+     `limit` — o cliente **não** re-filtra por score (D6). Calibração no corpus
+     real fica para a próxima entrega; só depois o default vira um valor medido.
+  3. **Clamp do teto (D8):** `resolveTokenCap` clampa `>16000` para `16000`
+     **com log**, em vez de cair no default; `<1`/inválido ⇒ default com log;
+     string vazia ⇒ "não configurado", sem log. Corrige a perda silenciosa
+     acima. Nota de operação (fora do repo): trocar o `16384` do `.bashrc` por
+     `16000` — o valor explícito documenta a intenção e dispensa o clamp.
+  4. **Degradação visível do piso:** servidor anterior ao campo ignora
+     `min_score` em silêncio; quando algum chunk volta sem `raw_score`, a
+     injeção loga **uma vez por turno** (uma por chamada no caminho avulso
+     `searchAndFormat`) que aqueles chunks seguiram sem filtro
+     (`code_search: min_score=… NÃO honrou o piso`). Piso honrado ⇒ nenhum log.
+  5. **Contrato do chunk:** `CodeChunkHit.raw_score?` (opcional — servidor
+     antigo não manda). `score` continua a ordem (RRF normalizado).
+  6. **Hermeticidade dos testes:** em `tests/config.test.ts`, `clearEnv()` passa
+     a limpar todo `KILOCODE_GRAPH_*` por prefixo (a lista fixa deixava o env do
+     `.bashrc` vazar e dois testes falhavam sem defeito de runtime).
+  7. **Desvio consciente do texto do plano:** o plano pede aviso quando
+     **nenhum** chunk traz `raw_score`; a implementação avisa quando **algum**
+     chunk não traz. Motivo: um servidor parcialmente compatível (ou um proxy
+     que remova o campo em parte da resposta) degradaria em silêncio
+     justamente nos chunks que ficaram sem o campo. Teste:
+     `code_floor_partial_raw_score_still_warns`.
+  8. **Verificação:** `tsc --noEmit` limpo; `npm test` **527 · 507 pass · 0 fail ·
+     20 skip** (os 20 skip são E2E gated `E2E=1`). E2E do piso contra stack real
+     fica para a entrega de calibração (o piso está desligado por default).

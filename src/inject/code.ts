@@ -130,7 +130,7 @@ function warnIfFloorNotHonored(
   log(
     `code_search: min_score=${cfg.minScore} configurado mas o servidor NÃO ` +
       `honrou o piso em ${semRaw.length}/${chunks.length} chunk(s) ` +
-      `(sem raw_score) — esses foram injetados SEM filtro de relevância ` +
+      `(sem raw_score) — esses seguem SEM filtro de relevância ` +
       `(${escopo})`,
   );
   return true;

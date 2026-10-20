@@ -506,9 +506,15 @@ export class MemtierClient {
   /**
    * `POST /v1/code/search` (E3c-S1). Busca híbrida read-only do workspace.
    * `limit` é limitado a `MAX_SEARCH_LIMIT` (50) — o servidor devolve **422**
-   * acima disso, então o cliente nunca manda. `labels` **nunca** é enviado (o
-   * omitir pede o default; lista vazia explícita é 422 — spec §8). Quando
-   * houver `maxTokens`, envia `max_tokens` (orçamento A1 no servidor).
+   * acima disso, então o cliente nunca manda. Quando houver `maxTokens`, envia
+   * `max_tokens` (orçamento A1 no servidor).
+   *
+   * `labels` PASSOU a ser enviado (D5; antes era sempre omitido): só entra com
+   * ao menos um item útil — `labels: []` explícito é **422** no servidor e
+   * itens vazios são descartados. Omitir pede o default do servidor.
+   * `minScore` (D7) vira `min_score` só quando definido e em `[0,1]`; fora
+   * disso é omitido em vez de falhar o turno com 422. O piso é aplicado no
+   * SERVIDOR sobre `raw_score` — o cliente **não** re-filtra por score (D6).
    * Lança erro tipado no HTTP não-2xx — quem chama (o hook) degrada.
    */
   async searchCode(

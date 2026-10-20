@@ -106,15 +106,18 @@ E11) além de `workspace`.
 ```json
 // request
 { "workspace": "waweb", "program": "default", "query": "...", "limit": 5,
-  "labels": ["CodeSymbol", "CodeFullFile"], "max_tokens": 2000 }
+  "labels": ["CodeSymbol"], "max_tokens": 2000, "min_score": 0.6 }
 
 // response
 { "chunks": [ { "path": "internal/billing/store.go", "symbol": "SaveInvoice",
                 "start_line": 42, "end_line": 55, "code": "...",
-                "score": 0.79, "match": "hybrid" } ] }
+                "score": 0.79, "raw_score": 0.74, "match": "hybrid" } ] }
 ```
 
-`labels=None` → `["CodeChunk"]` (default). `match ∈ vector|fulltext|hybrid`.
+`labels=None` → `["CodeChunk"]` (default do servidor; o plugin manda
+`["CodeSymbol"]`). `match ∈ vector|fulltext|hybrid`. `score` é a ORDEM (RRF
+normalizado, top-1 = 1.0) e `raw_score` é a MAGNITUDE — é sobre ela que o
+`min_score` (opcional, `[0,1]`) filtra, no servidor e antes do `limit`.
 Escrita só existe via `/v1/code/sync` (abaixo) — a busca é read-only.
 
 ### `POST /v1/code/sync` — **o destino do coletor**
@@ -468,7 +471,9 @@ Nada hardcoded no script (FR-303). **JSON** + env vars, precedência:
     "code_max_tokens": 2000,              // KILOCODE_GRAPH_INJECT_CODE_MAX_TOKENS
     "timeout_ms": 4000,                   // orçamento do hook (por chamada)
     "code_enabled": false,                // E3c — injeção de código (desligada)
-    "max_code_chunks": 3                  // E3c — nº de chunks de código
+    "max_code_chunks": 3,                 // E3c — nº de chunks de código
+    "code_labels": ["CodeSymbol"],        // D5 — labels da busca (CSV/JSON na env)
+    // "code_min_score": 0.6,             // D7 — piso de relevância (AUSENTE = desligado)
   },
   "code_index": {                         // E3a — o coletor
     "enabled": false,                     // ativado por flag, como hoje
@@ -487,7 +492,8 @@ Nada hardcoded no script (FR-303). **JSON** + env vars, precedência:
 > **Envs** (todas `KILOCODE_GRAPH_*`): `URL`, `TOKEN`, `TOKEN_FILE`, `PROGRAM`,
 > `INJECT_ENABLED`, `INJECT_MAX_MEMORIES`, `INJECT_MEMORY_MAX_TOKENS`,
 > `INJECT_CODE_MAX_TOKENS`, `INJECT_TIMEOUT_MS`, `INJECT_CODE_ENABLED`,
-> `INJECT_MAX_CODE_CHUNKS`, `INDEX_ENABLED`, `INDEXER_BIN`,
+> `INJECT_MAX_CODE_CHUNKS`, `INJECT_CODE_LABELS`, `INJECT_CODE_MIN_SCORE`,
+> `INDEX_ENABLED`, `INDEXER_BIN`,
 > `INDEX_SYNC_TIMEOUT_MS`, `INDEX_LOAD_IGNORES`, `MCP_ENABLED`, `MCP_NAME`, `DEBUG`,
 > `INGEST_ENABLED`, `INGEST_BATCH_SIZE`, `INGEST_MAX_HASHES`, `INGEST_TIMEOUT_MS`,
 > `MANAGER_TOKEN`, `WORKSPACE`. O prefixo da env de config é `KILOCODE_GRAPH_` (o
@@ -497,6 +503,35 @@ Nada hardcoded no script (FR-303). **JSON** + env vars, precedência:
 > deixaram de ser lidas; se setadas no ambiente, o boot emite **um** log de
 > depreciação e as ignora (quem calibrou não perde o ajuste em silêncio) — as
 > substitutas são `INJECT_MEMORY_MAX_TOKENS`/`INJECT_CODE_MAX_TOKENS`.
+>
+> **Clamp do `max_tokens` (D8) — vale para os DOIS tetos.** Um valor acima do teto interno do servidor
+> (16000, `MAX_RESPONSE_TOKENS` — acima dele o memtier responde **422**) é
+> **clampado para 16000 com log**, não descartado: o default silencioso fazia
+> `16384` virar 2000, ou seja, o operador pedia 8× mais orçamento e recebia
+> menos que o default. Valor abaixo de 1 ou não-inteiro cai no default, também
+> com log; string vazia é "não configurado" e não loga.
+>
+> **Relevância do bloco de código (D5/D6/D7).**
+> `inject.code_labels` (default `["CodeSymbol"]`, aceita CSV ou JSON array na
+> env; em `options`/arquivo, um array JSON é o formato previsto — um array JS
+> nativo passa por `String()` e só funciona se nenhum label tiver vírgula) vai
+> no body de `/v1/code/search`: restringe a busca a chunks de símbolo e
+> deixa `FullFile`/`Contextual` de fora — é o que evita injetar arquivo inteiro
+> no lugar do trecho. Lista vazia/inválida cai no default, porque `labels: []`
+> explícito é **422** no servidor. O default do SERVIDOR não muda.
+>
+> `inject.code_min_score` é o piso de relevância (`min_score` no body),
+> **desligado por default** (campo ausente). O piso é aplicado no servidor sobre
+> o `raw_score` (magnitude), não sobre o `score` (ordem/RRF normalizada): o
+> cliente **nunca** re-filtra por score. Calibração: o servidor já corta a perna
+> vetorial com `VEC_MIN_SCORE = 0.65`, então um piso abaixo disso só afeta
+> chunks fulltext-only. **Servidor antigo ignora o campo em silêncio** (pydantic
+> descarta extra) e devolve chunks sem `raw_score`; quando isso acontece a
+> injeção loga **uma vez por turno** que aqueles chunks seguiram sem filtro
+> (`code_search: min_score=… NÃO honrou o piso`). O caminho avulso
+> (`searchAndFormat`, sem estado de turno) loga uma vez por chamada; o hook, uma
+> vez por turno. O valor default só será definido por medição no corpus real —
+> esta entrega deixa o piso desligado.
 
 > **Defaults desligados** para indexação e injeção — é a preferência registrada
 > do dono no plugin atual.
