@@ -269,8 +269,14 @@ rust_indexer (JSONL stdio)
    ├─ chunk_emitted  ──▶ collector: agrupa por `file` → files[].chunks[]
    ├─ import_edge    ──┐
    ├─ call_edge      ──┴▶ edges.ts: resolve to_file/to_symbol_id; descarta se alvo ausente
-   └─ pause/resume   ──▶ runner: consome backpressure (ack/resume), nunca trava
+   └─ pause/resume   ──▶ runner: ack com a contagem DRENADA; `resume` é notificação
 ```
+
+O runner grava os eventos num **spool em disco** (`index/spool.ts`, por arquivo)
+em vez de acumular o corpus em RAM; `index/sync-spool.ts` envia lotes de ≤100
+arquivos. O `cpu-guard.ts` rebaixa a prioridade (`nice`) e pausa o processo com
+`SIGSTOP` quando o SISTEMA passa de 85% (retomando em 75% ou no `max_pause_ms`) —
+sem limitar núcleos.
 
 O `manifest.ts` guarda, por workspace, o conjunto de arquivos já sincronizados —
 para mandar `chunks: []` aos que sumiram (FR-504) e para saber se é o 1º sync. O
@@ -490,7 +496,21 @@ Nada hardcoded no script (FR-303). **JSON** + env vars, precedência:
     "enabled": false,                     // ativado por flag, como hoje
     "indexer_bin": "",                    // caminho do rust_indexer (FR-306)
     "sync_timeout_ms": 120000,            // KILOCODE_GRAPH_INDEX_SYNC_TIMEOUT_MS
-    "load_ignores": false                 // git ls-files --exclude-standard
+    "load_ignores": false,                // git ls-files --exclude-standard
+    "backpressure": {                     // KILOCODE_GRAPH_INDEX_BACKPRESSURE (JSON)
+      "max_queue_size": 500,              // fila que dispara `pause` (mín. 10)
+      "threshold_percent": 90,            // resume abaixo deste % (80–99)
+      "ack_required": false,
+      "pause_timeout_secs": 60            // anti-travamento do produtor
+    },
+    "cpu_guard": {                        // KILOCODE_GRAPH_INDEX_CPU_GUARD (JSON)
+      "enabled": true,
+      "threshold_percent": 85,            // pausa (SIGSTOP) quando o SISTEMA passa
+      "resume_percent": 75,               // retoma (SIGCONT) quando normaliza
+      "sample_ms": 1000,
+      "max_pause_ms": 30000,              // nunca deixa o job travado
+      "nice": 10                          // prioridade menor; não limita núcleos
+    }
   },
   "mcp": {                                // E3b — registro do MCP do memtier
     "enabled": true,
@@ -590,7 +610,8 @@ isso a separação em `adapters/`.
 | **estado de ingestão perdido/corrompido** | degrada para vazio, **registra** o reset; o próximo `session.idle` reenvia (custo aceito, L-3) |
 | Token rejeitado (401/403) | log de erro visível; sem retry infinito |
 | **`indexer_bin` ausente** | coletor desligado (não é erro fatal); memória segue (FR-306) |
-| **Indexer trava em `pause`** | runner consome backpressure (`resume`); se persistir, aborta o job, turno segue |
+| **Indexer trava em `pause`** | runner responde `ack {count: drenados}`; o `pause_timeout_secs` do indexer é a rede de segurança; se persistir, aborta o job, turno segue |
+| **Sistema saturado durante a indexação** | `cpu_guard` pausa o processo (`SIGSTOP`) em ≥85% e retoma em ≤75% (ou no `max_pause_ms`) |
 | **`/v1/code/sync` 422** (aresta órfã) | loga o lote; descarta a aresta e reenvia (ADR-012 D3) |
 | **MCP não registra** | loga; turno segue sem tools; nunca fatal (FR-604) |
 

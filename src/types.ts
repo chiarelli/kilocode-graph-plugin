@@ -55,6 +55,42 @@ export function chunkingFingerprint(opts?: ChunkingOptions): string {
   ]);
 }
 
+/**
+ * Backpressure do `rust-ast-indexer` (`options.backpressure`). Sem esses campos
+ * o indexer NÃO instancia o monitor: emite chunks sem freio e nunca publica
+ * `pause`. `max_queue_size` mínimo 10; `threshold_percent` em 80–99.
+ */
+export interface BackpressureOptions {
+  /** Tamanho da fila que dispara `pause` (default 500). */
+  max_queue_size?: number;
+  /** Percentual do teto abaixo do qual retoma (80–99; default 90). */
+  threshold_percent?: number;
+  /** `resume` exige ack do consumidor (default `false`). */
+  ack_required?: boolean;
+  /** Segundos até retomar sozinho após uma pausa (default 60). */
+  pause_timeout_secs?: number;
+}
+
+/**
+ * Guarda de CPU do processo do indexer. Não limita núcleos: rebaixa a
+ * prioridade (`nice`) e pausa o processo (`SIGSTOP`) quando o SISTEMA passa de
+ * `threshold_percent`, retomando quando cai a `resume_percent` (ou no
+ * `max_pause_ms`).
+ */
+export interface CpuGuardOptions {
+  enabled: boolean;
+  /** Percentual do sistema que dispara a pausa (default 85). */
+  threshold_percent: number;
+  /** Percentual do sistema que permite retomar (default 75). */
+  resume_percent: number;
+  /** Intervalo de amostragem (ms, default 1000). */
+  sample_ms: number;
+  /** Pausa máxima antes de retomar de qualquer forma (ms, default 30000). */
+  max_pause_ms: number;
+  /** Prioridade `nice` do processo (0 = não aplicar; default 10). */
+  nice: number;
+}
+
 /** Relatório de saúde do memtier — sempre retornado, ok ou degradado. */
 export interface HealthReport {
   /** `status === "ok"`. Nunca lança: degradação é um valor, não uma exceção. */
@@ -236,6 +272,17 @@ export interface Config {
      * junto com o plugin.
      */
     chunking?: ChunkingOptions;
+    /**
+     * Backpressure do indexer (`options.backpressure`). `undefined` ⇒ o plugin
+     * envia o default (`DEFAULT_BACKPRESSURE`). `false` ⇒ não envia (indexer
+     * emite sem freio — desaconselhado).
+     */
+    backpressure?: BackpressureOptions | false;
+    /**
+     * Guarda de CPU do indexer. `undefined` ⇒ default (`nice` 10, pausa em 85%
+     * do sistema). `false` ⇒ desligada.
+     */
+    cpu_guard?: CpuGuardOptions | false;
   };
   ingest: {
     /** Liga a ingestão assíncrona (default `false`). */

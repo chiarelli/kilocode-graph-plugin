@@ -228,7 +228,7 @@ export function capChunkText(text: string): string {
  * Texto acima de `MAX_FULLFILE_CHARS` é truncado com marca (`capChunkText`); o
  * `end_line` reflete o texto enviado, não o arquivo original.
  */
-function ensureFullFile(
+export function ensureFullFile(
   entry: CodeFile,
   repoRoot: string,
   read: ReadFileLike,
@@ -257,7 +257,7 @@ function ensureFullFile(
 }
 
 /** Arquivo removido (estava no manifest, sumiu) ⇒ `chunks: []` (FR-504). */
-function removedFile(path: string): CodeFile {
+export function removedFile(path: string): CodeFile {
   return { file_path: path, language: "rust", chunks: [] };
 }
 
@@ -265,6 +265,15 @@ function removedFile(path: string): CodeFile {
  * Eventos → body do sync. S3: inclui `edges[]` resolvidas, `FullFile` sintético
  * quando ausente (habilitando as arestas de import) e os `removed` (`chunks: []`).
  */
+/** Leitor de arquivo padrão (utf-8; erro ⇒ texto vazio). */
+export function defaultReadFile(p: string): string {
+  try {
+    return readFileSync(p, "utf-8") as string;
+  } catch {
+    return "";
+  }
+}
+
 export function buildSyncBody(
   events: IndexerEvent[],
   identity: SyncIdentity,

@@ -14,7 +14,8 @@ import {
   MemtierHttpError,
 } from "../client.ts";
 import { debug, log, logFatal } from "../logger.ts";
-import { buildSyncBody } from "../index/collector.ts";
+import { EventSpool } from "../index/spool.ts";
+import { syncSpool } from "../index/sync-spool.ts";
 import type { GitPort } from "../index/git.ts";
 import { acquireLock } from "../index/lock.ts";
 import {
@@ -44,6 +45,13 @@ export interface CollectConfig {
    * Ausente ⇒ o indexer aplica o default dele. Ver `ChunkingOptions`.
    */
   chunking?: ChunkingOptions;
+  /**
+   * Backpressure do indexer (`options.backpressure`). Ausente ⇒ o runner envia
+   * o default (`DEFAULT_BACKPRESSURE`); `false` ⇒ não envia.
+   */
+  backpressure?: import("../types.ts").BackpressureOptions | false;
+  /** Guarda de CPU (nice + pausa em 85% do sistema). `false` ⇒ desligada. */
+  cpu_guard?: import("../types.ts").CpuGuardOptions | false;
 }
 
 /** Dependências do hook (injetáveis para teste, sem spawn real). */
@@ -352,6 +360,9 @@ async function collectUnderLock(
     return null;
   }
 
+  // Spool em DISCO: os eventos vão para arquivos temporários durante o job, em
+  // vez de um `events[]` com o corpus inteiro. O sync lê lote a lote depois.
+  const spool = EventSpool.create();
   let result;
   try {
     result = await run({
@@ -361,14 +372,26 @@ async function collectUnderLock(
       gitRange: trigger.gitRange,
       loadIgnores: rt.cfg.load_ignores ?? false,
       chunking: rt.cfg.chunking,
+      backpressure: rt.cfg.backpressure,
+      // No Windows não há SIGSTOP/SIGCONT: a guarda fica desligada.
+      cpuGuard:
+        process.platform === "win32" ? false : rt.cfg.cpu_guard,
+      // Runner de produção faz streaming direto para o spool.
+      onEvent: (ev) => spool.write(ev),
     });
   } catch (err) {
+    spool.dispose();
     logFatal("collect indexer", err);
     return null;
   }
+  // Runner injetado (teste) devolve `events` em vez de chamar `onEvent`: grava
+  // no MESMO spool para o caminho de sync ser único.
+  for (const ev of result.events) spool.write(ev);
+  spool.close();
   const indexerMs = Date.now() - start;
 
   if (result.skipped) {
+    spool.dispose();
     logCollection(rt, {
       mode,
       trigger: rt.forceMode,
@@ -386,6 +409,7 @@ async function collectUnderLock(
   // num full marcaria TODO o manifest como removido e apagaria o grafo
   // (chunks:[]). Aborta sem sincronizar — o grafo fica intacto.
   if (result.error) {
+    spool.dispose();
     log(
       `collect: indexer abortou (${result.error.code}: ${result.error.message}); ` +
         `sync cancelado (grafo preservado)`,
@@ -410,7 +434,8 @@ async function collectUnderLock(
   //     Sem isso o indexer emite chunk vazio para o arquivo deletado e o grafo
   //     cria um nó fantasma.
   // `present` (full) = arquivos com chunk no stream COMPLETO.
-  const presentFull = collectPresent(result.events);
+  const spoolFiles = spool.files().map((f) => f.filePath);
+  const presentFull = spoolFiles;
   let removed: string[];
   if (mode === "full") {
     // Troca de identidade: o manifest antigo é de OUTRO workspace — seus arquivos
@@ -431,31 +456,13 @@ async function collectUnderLock(
   }
 
   // M2 (git é a verdade no incremental): se o indexer emitir um chunk para um
-  // arquivo que o git reporta deletado (nó fantasma "medido"), o `buildSyncBody`
-  // o descartaria do tombstone (`removed.filter(p => !present.has(p))`). Remove os
-  // eventos desses caminhos ANTES de montar o body, para a deleção vencer sempre.
+  // arquivo que o git reporta deletado (nó fantasma "medido"), o arquivo é
+  // EXCLUÍDO do lote (`syncSpool` filtra por `removed`), para a deleção vencer.
   const removedSet = new Set(removed);
-  const events =
-    mode === "incremental" && removedSet.size > 0
-      ? result.events.filter((ev) => {
-          if (ev.event !== "chunk_emitted") return true;
-          const p = ev.payload as { file?: unknown } | null;
-          return !(p && typeof p.file === "string" && removedSet.has(p.file));
-        })
-      : result.events;
-  const present = collectPresent(events);
+  const present = spoolFiles.filter((f) => !removedSet.has(f));
 
-  const buildStart = Date.now();
-  const body = buildSyncBody(events, rt.identity, {
-    repoRoot: rt.repoRoot,
-    removed,
-  });
-  const buildMs = Date.now() - buildStart;
-  debug(
-    `collect: build files=${body.files.length} edges=${body.edges.length} ` +
-      `build_ms=${buildMs} events=${result.events.length}`,
-  );
-  if (body.files.length === 0 && removed.length === 0) {
+  if (present.length === 0 && removed.length === 0) {
+    spool.dispose();
     debug("collect: nenhum chunk emitido; nada a sincronizar");
     logCollection(rt, {
       mode,
@@ -482,14 +489,18 @@ async function collectUnderLock(
   }
 
   try {
-    const sync = await rt.client.syncCode(body.files, body.edges);
+    const sent = await syncSpool(spool, rt.client, rt.identity, {
+      repoRoot: rt.repoRoot,
+      removed,
+    });
+    const sync = sent.sync;
     logCollection(rt, {
       mode,
       trigger: rt.forceMode,
       indexerMs,
-      files: body.files.length,
-      edges: body.edges.length,
-      removed: removed.length,
+      files: sent.files,
+      edges: sent.edges,
+      removed: sent.removed,
       sync,
     });
     // Estado pós-sync: arquivos ATUAIS (sem removidos) + HEAD atual. No
@@ -519,18 +530,9 @@ async function collectUnderLock(
   } catch (err) {
     logSyncFailure(err);
     return null;
+  } finally {
+    spool.dispose();
   }
-}
-
-/** Arquivos com `chunk_emitted` no stream (para o diff de removidos). */
-function collectPresent(events: import("../types.ts").IndexerEvent[]): string[] {
-  const seen = new Set<string>();
-  for (const ev of events) {
-    if (ev.event !== "chunk_emitted") continue;
-    const p = ev.payload as { file?: unknown } | null;
-    if (p && typeof p.file === "string" && p.file) seen.add(p.file);
-  }
-  return [...seen];
 }
 
 /**

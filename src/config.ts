@@ -30,7 +30,13 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { debug, log } from "./logger.ts";
-import { CHUNKING_STRATEGIES, type ChunkingOptions, type Config } from "./types.ts";
+import {
+  CHUNKING_STRATEGIES,
+  type BackpressureOptions,
+  type ChunkingOptions,
+  type Config,
+  type CpuGuardOptions,
+} from "./types.ts";
 
 /**
  * Teto interno de `max_tokens` no servidor (memtier `budget.py:61`,
@@ -109,6 +115,24 @@ export const DEFAULTS = {
       include_context: true,
       token_counting: false,
     } as ChunkingOptions,
+    // Backpressure ligado por default: sem `options.backpressure` o indexer não
+    // instancia o monitor e emite o corpus inteiro sem freio (CPU/memória).
+    backpressure: {
+      max_queue_size: 500,
+      threshold_percent: 90,
+      ack_required: false,
+      pause_timeout_secs: 60,
+    } as BackpressureOptions,
+    // Não limita núcleos; rebaixa a prioridade e pausa o processo quando o
+    // sistema passa de 85%, retomando em 75%.
+    cpu_guard: {
+      enabled: true,
+      threshold_percent: 85,
+      resume_percent: 75,
+      sample_ms: 1000,
+      max_pause_ms: 30_000,
+      nice: 10,
+    } as CpuGuardOptions,
   },
   ingest: {
     // Defaults desligados (preferência do dono, coerente com index/inject).
@@ -343,6 +367,95 @@ function resolveChunking(
       if (isChunkingOptions(parsed)) return normalizeChunking(parsed);
     } catch {
       // String não-JSON ⇒ default (modo degenerado não passa em silêncio).
+    }
+  }
+  return fallback;
+}
+
+/**
+ * Valida `options.backpressure`. O indexer REJEITA o job (`BACKPRESSURE_CONFIG`)
+ * com `max_queue_size < 10` ou `threshold_percent` fora de 80–99 — um valor
+ * inválido abortaria a coleta inteira. Campo inválido cai no default.
+ */
+function isBackpressureOptions(v: unknown): v is BackpressureOptions {
+  if (!isPlainObject(v)) return false;
+  const q = v.max_queue_size;
+  if (q !== undefined && (!Number.isInteger(q) || (q as number) < 10)) return false;
+  const t = v.threshold_percent;
+  if (t !== undefined && (!Number.isInteger(t) || (t as number) < 80 || (t as number) > 99)) {
+    return false;
+  }
+  if (v.ack_required !== undefined && typeof v.ack_required !== "boolean") return false;
+  const p = v.pause_timeout_secs;
+  if (p !== undefined && (!Number.isInteger(p) || (p as number) < 0)) return false;
+  return true;
+}
+
+/** `code_index.backpressure`: objeto, `false` (desliga) ou default. */
+function resolveBackpressure(
+  val: unknown,
+  envValue: string | undefined,
+  fileValue: string | undefined,
+  fallback: BackpressureOptions | false,
+): BackpressureOptions | false {
+  if (val === false) return false;
+  if (isBackpressureOptions(val)) return val;
+  const raw = envValue ?? fileValue;
+  if (raw !== undefined && raw.trim() !== "" && raw.trim() !== "undefined") {
+    if (raw.trim() === "false") return false;
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (isBackpressureOptions(parsed)) return parsed;
+    } catch {
+      // não-JSON ⇒ default
+    }
+  }
+  return fallback;
+}
+
+/**
+ * Valida `options.cpu_guard`. Percentuais em 0–100, `sample_ms` positivo e
+ * `resume_percent <= threshold_percent` (senão a guarda oscilaria).
+ */
+function isCpuGuardOptions(v: unknown): v is CpuGuardOptions {
+  if (!isPlainObject(v)) return false;
+  if (v.enabled !== undefined && typeof v.enabled !== "boolean") return false;
+  for (const k of ["threshold_percent", "resume_percent"]) {
+    const n = v[k];
+    if (n !== undefined && (!Number.isInteger(n) || (n as number) < 0 || (n as number) > 100)) {
+      return false;
+    }
+  }
+  for (const k of ["sample_ms", "max_pause_ms"]) {
+    const n = v[k];
+    if (n !== undefined && (!Number.isInteger(n) || (n as number) <= 0)) return false;
+  }
+  const nice = v.nice;
+  if (nice !== undefined && (!Number.isInteger(nice) || (nice as number) < 0 || (nice as number) > 19)) {
+    return false;
+  }
+  const threshold = (v.threshold_percent as number | undefined) ?? 85;
+  const resume = (v.resume_percent as number | undefined) ?? 75;
+  return resume <= threshold;
+}
+
+/** `code_index.cpu_guard`: objeto, `false` (desliga) ou default. */
+function resolveCpuGuard(
+  val: unknown,
+  envValue: string | undefined,
+  fileValue: string | undefined,
+  fallback: CpuGuardOptions | false,
+): CpuGuardOptions | false {
+  if (val === false) return false;
+  if (isCpuGuardOptions(val)) return { ...fallback, ...val } as CpuGuardOptions;
+  const raw = envValue ?? fileValue;
+  if (raw !== undefined && raw.trim() !== "" && raw.trim() !== "undefined") {
+    if (raw.trim() === "false") return false;
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (isCpuGuardOptions(parsed)) return { ...fallback, ...parsed } as CpuGuardOptions;
+    } catch {
+      // não-JSON ⇒ default
     }
   }
   return fallback;
@@ -646,6 +759,18 @@ export function loadConfig(
         filePick(file, "code_index.chunking"),
         DEFAULTS.code_index.chunking,
       ),
+      backpressure: resolveBackpressure(
+        pick(options, "code_index.backpressure"),
+        env.KILOCODE_GRAPH_INDEX_BACKPRESSURE,
+        filePick(file, "code_index.backpressure"),
+        DEFAULTS.code_index.backpressure,
+      ),
+      cpu_guard: resolveCpuGuard(
+        pick(options, "code_index.cpu_guard"),
+        env.KILOCODE_GRAPH_INDEX_CPU_GUARD,
+        filePick(file, "code_index.cpu_guard"),
+        DEFAULTS.code_index.cpu_guard,
+      ),
     },
     ingest: {
       enabled: resolveBool(
@@ -747,6 +872,8 @@ export function configStateFrom(config: Config): PluginOptions {
       sync_timeout_ms: config.code_index.sync_timeout_ms,
       load_ignores: config.code_index.load_ignores,
       chunking: config.code_index.chunking,
+      backpressure: config.code_index.backpressure,
+      cpu_guard: config.code_index.cpu_guard,
     },
     ingest: {
       enabled: config.ingest.enabled,

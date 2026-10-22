@@ -535,3 +535,91 @@ test("config_token_cap_empty_string: vazio = não configurado, sem ruído de log
     lines.join("\n"),
   );
 });
+
+// --- Guardas de recurso: backpressure + CPU guard --------------------------
+
+test("config_code_backpressure: default ligado com valores aceitos pelo indexer", () => {
+  clearEnv();
+  const bp = loadConfig().code_index.backpressure;
+  assert.ok(bp, "sem backpressure o indexer não freia");
+  assert.deepEqual(bp, {
+    max_queue_size: 500,
+    threshold_percent: 90,
+    ack_required: false,
+    pause_timeout_secs: 60,
+  });
+});
+
+test("config_code_backpressure_invalid: max_queue_size<10 / threshold fora de 80–99 ⇒ default", () => {
+  clearEnv();
+  // O indexer aborta o job com BACKPRESSURE_CONFIG nesses casos: um valor
+  // inválido NÃO pode chegar ao binário.
+  const lowQueue = loadConfig({
+    code_index: { backpressure: { max_queue_size: 5 } },
+  }).code_index.backpressure;
+  assert.equal((lowQueue as { max_queue_size: number }).max_queue_size, 500);
+
+  const badThreshold = loadConfig({
+    code_index: { backpressure: { threshold_percent: 50 } },
+  }).code_index.backpressure;
+  assert.equal((badThreshold as { threshold_percent: number }).threshold_percent, 90);
+});
+
+test("config_code_backpressure_false: desliga o envio", () => {
+  clearEnv();
+  assert.equal(loadConfig({ code_index: { backpressure: false } }).code_index.backpressure, false);
+  process.env.KILOCODE_GRAPH_INDEX_BACKPRESSURE = "false";
+  assert.equal(loadConfig().code_index.backpressure, false);
+});
+
+test("config_code_backpressure_env: string JSON sobrepõe o default", () => {
+  clearEnv();
+  process.env.KILOCODE_GRAPH_INDEX_BACKPRESSURE =
+    '{"max_queue_size":64,"threshold_percent":85,"ack_required":false,"pause_timeout_secs":30}';
+  const bp = loadConfig().code_index.backpressure as unknown as Record<string, number>;
+  assert.equal(bp.max_queue_size, 64);
+  assert.equal(bp.threshold_percent, 85);
+  assert.equal(bp.pause_timeout_secs, 30);
+});
+
+test("config_code_cpu_guard: default 85/75 com nice 10", () => {
+  clearEnv();
+  assert.deepEqual(loadConfig().code_index.cpu_guard, {
+    enabled: true,
+    threshold_percent: 85,
+    resume_percent: 75,
+    sample_ms: 1000,
+    max_pause_ms: 30000,
+    nice: 10,
+  });
+});
+
+test("config_code_cpu_guard_overrides: parcial mescla com o default", () => {
+  clearEnv();
+  const guard = loadConfig({
+    code_index: { cpu_guard: { threshold_percent: 70, resume_percent: 60 } },
+  }).code_index.cpu_guard as unknown as Record<string, number>;
+  assert.equal(guard.threshold_percent, 70);
+  assert.equal(guard.resume_percent, 60);
+  assert.equal(guard.nice, 10, "campo não informado mantém o default");
+});
+
+test("config_code_cpu_guard_invalid: resume>threshold ou percentual fora de 0–100 ⇒ default", () => {
+  clearEnv();
+  const inverted = loadConfig({
+    code_index: { cpu_guard: { threshold_percent: 60, resume_percent: 80 } },
+  }).code_index.cpu_guard as unknown as Record<string, number>;
+  assert.equal(inverted.threshold_percent, 85, "oscilação seria inevitável");
+
+  const outOfRange = loadConfig({
+    code_index: { cpu_guard: { threshold_percent: 120 } },
+  }).code_index.cpu_guard as unknown as Record<string, number>;
+  assert.equal(outOfRange.threshold_percent, 85);
+});
+
+test("config_code_cpu_guard_false: desliga a guarda", () => {
+  clearEnv();
+  assert.equal(loadConfig({ code_index: { cpu_guard: false } }).code_index.cpu_guard, false);
+  process.env.KILOCODE_GRAPH_INDEX_CPU_GUARD = "false";
+  assert.equal(loadConfig().code_index.cpu_guard, false);
+});

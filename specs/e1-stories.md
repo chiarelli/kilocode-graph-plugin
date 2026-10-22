@@ -78,6 +78,8 @@ Chaves (todas com env `KILOCODE_GRAPH_*`):
 | `code_index.enabled` | `KILOCODE_GRAPH_INDEX_ENABLED` | `false` | desligado por padrão |
 | `code_index.indexer_bin` | `KILOCODE_GRAPH_INDEXER_BIN` | `""` | caminho do binário (FR-306) |
 | `code_index.load_ignores` | `KILOCODE_GRAPH_INDEX_LOAD_IGNORES` | `false` | E3a — fonte via `git ls-files --exclude-standard`; exige git/repo (senão `GIT_UNAVAILABLE`, sem fallback) |
+| `code_index.backpressure` | `KILOCODE_GRAPH_INDEX_BACKPRESSURE` | `{max_queue_size:500,threshold_percent:90,ack_required:false,pause_timeout_secs:60}` | JSON ou `false`; vai em `options.backpressure` (sem ela o indexer não freia) |
+| `code_index.cpu_guard` | `KILOCODE_GRAPH_INDEX_CPU_GUARD` | `{enabled:true,threshold_percent:85,resume_percent:75,sample_ms:1000,max_pause_ms:30000,nice:10}` | JSON ou `false`; `nice` + SIGSTOP quando o sistema passa do limiar |
 | `mcp.enabled` | `KILOCODE_GRAPH_MCP_ENABLED` | `true` | E3b |
 | `mcp.name` | `KILOCODE_GRAPH_MCP_NAME` | `memtier` | E3b |
 | `debug` | `KILOCODE_GRAPH_DEBUG` | `false` | log verboso |

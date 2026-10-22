@@ -95,7 +95,7 @@ function edgeKey(edge: CodeEdge): string {
 }
 
 /** Índices de símbolos dos arquivos: `(path, sym)` conhecido + símbolos por arquivo. */
-interface SymbolIndex {
+export interface SymbolIndex {
   has(path: string, symbol: string): boolean;
   /** Origem de aresta existe? `null` ⇒ `FullFile`/`Contextual` do arquivo. */
   hasOrigin(path: string, symbol: string | null): boolean;
@@ -103,23 +103,33 @@ interface SymbolIndex {
   paths: string[];
 }
 
-function buildIndex(files: CodeFile[]): SymbolIndex {
+/**
+ * Entrada do índice construída SEM os chunks: `{path, symbols, hasFileChunk}`.
+ * Permite resolver arestas a partir do spool em disco (streaming), sem manter o
+ * texto dos chunks em RAM — só os nomes de símbolo.
+ */
+export interface EdgeIndexEntry {
+  filePath: string;
+  symbols: Iterable<string>;
+  /** O arquivo terá nó `FullFile`/`Contextual` (origem de import_edge). */
+  hasFileChunk: boolean;
+}
+
+/** Constrói o índice a partir de metadados já extraídos (spool). */
+export function buildEdgeIndex(entries: Iterable<EdgeIndexEntry>): SymbolIndex {
   const byName = new Set<string>();
   const fullFiles = new Set<string>();
   const callable = new Map<string, Set<string>>();
   const paths: string[] = [];
-  for (const f of files) {
-    paths.push(f.file_path);
-    const set = callable.get(f.file_path) ?? new Set<string>();
-    for (const c of f.chunks) {
-      if (c.chunk_kind === "Symbol" && c.symbol_id) {
-        byName.add(`${f.file_path}\u0000${c.symbol_id}`);
-        set.add(c.symbol_id);
-      } else if (c.chunk_kind !== "Symbol") {
-        fullFiles.add(f.file_path);
-      }
+  for (const e of entries) {
+    paths.push(e.filePath);
+    const set = new Set<string>();
+    for (const sym of e.symbols) {
+      byName.add(`${e.filePath}\u0000${sym}`);
+      set.add(sym);
     }
-    callable.set(f.file_path, set);
+    if (e.hasFileChunk) fullFiles.add(e.filePath);
+    callable.set(e.filePath, set);
   }
   return {
     has: (path, symbol) => byName.has(`${path}\u0000${symbol}`),
@@ -128,6 +138,18 @@ function buildIndex(files: CodeFile[]): SymbolIndex {
     symbolsOf: (path) => callable.get(path) ?? new Set<string>(),
     paths,
   };
+}
+
+function buildIndex(files: CodeFile[]): SymbolIndex {
+  return buildEdgeIndex(
+    files.map((f) => ({
+      filePath: f.file_path,
+      symbols: f.chunks
+        .filter((c) => c.chunk_kind === "Symbol" && c.symbol_id)
+        .map((c) => c.symbol_id as string),
+      hasFileChunk: f.chunks.some((c) => c.chunk_kind !== "Symbol"),
+    })),
+  );
 }
 
 /** Ultimo segmento do callee (`Parser::parse`/`dsn.to_string` → `parse`/`to_string`). */
@@ -145,7 +167,15 @@ export function resolveEdges(
   calls: CallEdge[],
   files: CodeFile[],
 ): CodeEdge[] {
-  const index = buildIndex(files);
+  return resolveEdgesWithIndex(imports, calls, buildIndex(files));
+}
+
+/** `resolveEdges` sobre um índice já construído (spool/streaming). */
+export function resolveEdgesWithIndex(
+  imports: ImportEdge[],
+  calls: CallEdge[],
+  index: SymbolIndex,
+): CodeEdge[] {
   const known = new Set(index.paths);
   const edges: CodeEdge[] = [];
   const seen = new Set<string>();

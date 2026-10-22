@@ -144,12 +144,12 @@ test("collect_hook_returns_boot_promise: background, não bloqueia", async () =>
 // --- E3a-S3: removidos via manifest ----------------------------------------
 
 /** Manifest em memória para o teste: `load` devolve `initial`, `save` acumula. */
-function fakeState(initial: string[]) {
+function fakeState(initial: string[], lastGitHead: string | null = null) {
   const saved: string[][] = [];
   return {
     initial,
     saved,
-    load: () => ({ files: initial }),
+    load: () => ({ files: initial, last_git_head: lastGitHead }),
     save: (files: string[]) => {
       saved.push(files);
     },
@@ -568,4 +568,100 @@ test("sync_single_no_pagination: ≤100 arquivos ⇒ 1 request", async () => {
   });
   await client.syncCode([emptyFile(0)], []);
   assert.equal(calls, 1);
+});
+
+// --- Regressões: guardas de recurso chegam ao runner -----------------------
+
+test("collect_forwards_backpressure_and_cpu_guard: opções do operador vão ao runner", async () => {
+  let seen: Record<string, unknown> = {};
+  const rt = runtime({
+    cfg: {
+      enabled: true,
+      indexer_bin: "/fake",
+      backpressure: { max_queue_size: 64, threshold_percent: 85 },
+      cpu_guard: { enabled: false, threshold_percent: 85, resume_percent: 75, sample_ms: 1000, max_pause_ms: 30000, nice: 10 },
+    },
+    run: async (opts) => {
+      seen = opts as unknown as Record<string, unknown>;
+      return { events: [chunkEvent("src/a.rs", "a1")], skipped: false };
+    },
+  });
+  await collectCode(rt);
+  assert.deepEqual(seen.backpressure, { max_queue_size: 64, threshold_percent: 85 });
+  assert.equal((seen.cpuGuard as { enabled: boolean }).enabled, false);
+});
+
+test("collect_streams_to_spool: runner de produção usa onEvent (não events[])", async () => {
+  let usedOnEvent = false;
+  let retained = 0;
+  const rt = runtime({
+    run: async (opts) => {
+      usedOnEvent = typeof opts.onEvent === "function";
+      // Simula o runner de produção: emite via callback e NÃO retorna eventos.
+      opts.onEvent?.(chunkEvent("src/a.rs", "a1"));
+      opts.onEvent?.(chunkEvent("src/b.rs", "b1"));
+      return { events: [], skipped: false, eventCount: 2 };
+    },
+    client: {
+      syncCode: async (f) => {
+        retained = f.length;
+        return EMPTY_SYNC;
+      },
+    },
+  });
+  await collectCode(rt);
+  assert.equal(usedOnEvent, true);
+  assert.equal(retained, 2, "os dois arquivos chegam ao sync via spool");
+});
+
+test("collect_multi_batch: >100 arquivos ⇒ sync em lotes de ≤100", async () => {
+  const sizes: number[] = [];
+  const rt = runtime({
+    run: async (opts) => {
+      for (let i = 0; i < 150; i++) opts.onEvent?.(chunkEvent(`src/f${i}.rs`, `s${i}`));
+      return { events: [], skipped: false };
+    },
+    client: {
+      syncCode: async (f) => {
+        sizes.push(f.length);
+        return EMPTY_SYNC;
+      },
+    },
+  });
+  await collectCode(rt);
+  assert.deepEqual(sizes, [100, 50]);
+});
+
+test("collect_incremental_removed_skips_chunk: arquivo deletado não vai no lote", async () => {
+  const sent: string[] = [];
+  const tombstones: string[] = [];
+  const rt = runtime({
+    run: async (opts) => {
+      opts.onEvent?.(chunkEvent("src/a.rs", "a1"));
+      opts.onEvent?.(chunkEvent("src/gone.rs", "g1"));
+      return { events: [], skipped: false };
+    },
+    // `last_git_head` presente + ancestral ⇒ modo INCREMENTAL (o caso em que o
+    // git é a fonte de verdade das deleções).
+    state: fakeState(["src/a.rs", "src/gone.rs"], "sha-prev"),
+    git: {
+      isRepo: () => true,
+      head: () => "sha-head",
+      isAncestor: () => true,
+      deletedFiles: () => ["src/gone.rs"],
+      hooksDir: () => null,
+    },
+    client: {
+      syncCode: async (f) => {
+        for (const file of f) {
+          if (file.chunks.length === 0) tombstones.push(file.file_path);
+          else sent.push(file.file_path);
+        }
+        return EMPTY_SYNC;
+      },
+    },
+  });
+  await collectCode(rt);
+  assert.equal(sent.includes("src/gone.rs"), false, "deletado não pode ir como chunk");
+  assert.ok(tombstones.includes("src/gone.rs"), "deletado vai como tombstone");
 });
