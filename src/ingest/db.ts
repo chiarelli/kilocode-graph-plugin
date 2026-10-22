@@ -16,7 +16,7 @@
 
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 import { debug } from "../logger.ts";
 
@@ -431,6 +431,193 @@ export function readBatch(
 /** ID para mensagem de erro (o próprio id já é string; guarda contra vazio). */
 function msgIdSafe(id: string): string {
   return id || "?";
+}
+
+/**
+ * Escopo de uma sessão no `kilo.db` — de ONDE ela vem (para a guarda de
+ * workspace do CLI `--ingest`). É o mesmo vínculo que o
+ * `kilo session list` usa para filtrar por projeto: `session.project_id` ⇒
+ * `project.worktree` (+ `session.directory`/worktrees secundárias de
+ * `project_directory` como âncoras).
+ */
+export interface SessionScope {
+  /** `true` quando a sessão existe no banco. */
+  found: boolean;
+  /** `project.worktree` do projeto dono (vazio quando ausente). */
+  projectWorktree: string;
+  /** `session.directory` (a sessão corrente do prompt). */
+  sessionDirectory: string;
+  /** Diretórios secundários do projeto (`project_directory`, git worktrees). */
+  extraDirectories: string[];
+}
+
+/**
+ * Localiza o escopo de `sessionId` no banco. Devolve `found: false` quando a
+ * sessão não existe (ou o banco não pôde ser lido) — o chamador trata como
+ * recusa (fail-closed), nunca como "pertence". **Nunca lança.**
+ */
+export function lookupSessionScope(
+  backend: SqliteBackend,
+  sessionId: string,
+): SessionScope {
+  const none: SessionScope = {
+    found: false,
+    projectWorktree: "",
+    sessionDirectory: "",
+    extraDirectories: [],
+  };
+  if (!sessionId) return none;
+  try {
+    const rows = backend.query(
+      "SELECT s.project_id AS project_id, s.directory AS directory, " +
+        "p.worktree AS worktree FROM session s " +
+        "LEFT JOIN project p ON p.id = s.project_id WHERE s.id = ? LIMIT 1",
+      [sessionId],
+    );
+    const row = rows[0];
+    if (!row) return none;
+    const projectId = typeof row.project_id === "string" ? row.project_id : "";
+    const directory = typeof row.directory === "string" ? row.directory : "";
+    const worktree = typeof row.worktree === "string" ? row.worktree : "";
+    let extra: string[] = [];
+    if (projectId) {
+      try {
+        const dirs = backend.query(
+          "SELECT directory FROM project_directory WHERE project_id = ?",
+          [projectId],
+        );
+        for (const d of dirs) {
+          if (typeof d.directory === "string" && d.directory) extra.push(d.directory);
+        }
+      } catch {
+        // Diretórios secundários são âncora auxiliar: sem eles a guarda segue
+        // com `worktree` + `directory` (fail-open parcial NUNCA — a recusa
+        // continua possível; só a aceitação fica mais estrita).
+      }
+    }
+    return {
+      found: true,
+      projectWorktree: worktree,
+      sessionDirectory: directory,
+      extraDirectories: extra,
+    };
+  } catch {
+    return none;
+  }
+}
+
+/**
+ * `true` quando a sessão pertence ao workspace de `workspaceDir` — i.e., algum
+ * dos vínculos (`project.worktree`, `session.directory`, worktrees
+ * secundárias) está **dentro** de `workspaceDir`. Comparação por caminho
+ * resolvido (sem `..` nem prefixo ingênuo: `/a/foo` não casa `/a/foobar`).
+ * Sessão inexistente/banco ilegível ⇒ `false` (fail-closed).
+ */
+export function sessionBelongsToWorkspace(
+  backend: SqliteBackend,
+  sessionId: string,
+  workspaceDir: string,
+): boolean {
+  const scope = lookupSessionScope(backend, sessionId);
+  if (!scope.found) return false;
+  const root = resolve(workspaceDir);
+  const candidates = [
+    scope.projectWorktree,
+    scope.sessionDirectory,
+    ...scope.extraDirectories,
+  ];
+  for (const c of candidates) {
+    if (!c) continue;
+    if (isPathInside(root, c)) return true;
+  }
+  return false;
+}
+
+/** `true` quando `child` está contido em `parent` (ou é o próprio). */
+function isPathInside(parent: string, child: string): boolean {
+  const resolved = resolve(child);
+  if (resolved === parent) return true;
+  return resolved.startsWith(`${parent}/`);
+}
+
+/** Entrada da listagem de sessões do workspace (para o CLI `--ingest --all`). */
+export interface WorkspaceSession {
+  /** `session.id` (o `session_id` do Kilo). */
+  id: string;
+  /** `session.time_created` (ordenação; `0` quando ausente). */
+  timeCreated: number;
+}
+
+/**
+ * Lista os ids das sessões **do workspace** (`workspaceDir`), da **mais antiga
+ * para a mais nova** (`time_created ASC`, desempate por `id`). O filtro espelha
+ * a guarda (`sessionBelongsToWorkspace`): `project.worktree`,
+ * `session.directory` e worktrees secundárias (`project_directory`) **dentro**
+ * de `workspaceDir` — sessões de OUTROS workspaces nunca entram. Comparação por
+ * caminho resolvido, com fronteira de diretório (`/ws/%` + igualdade exata —
+ * `/ws-evil` nunca casa `/ws`). **Nunca lança** (erro ⇒ `[]`).
+ */
+export function listWorkspaceSessions(
+  backend: SqliteBackend,
+  workspaceDir: string,
+): WorkspaceSession[] {
+  try {
+    const root = resolve(workspaceDir);
+    const likeRoot = `${escapeLike(root)}/%`;
+    // Pré-filtro em SQL (candidatas) + verificação exata em JS (abaixo): o
+    // LIKE usa fronteira `/` e `ESCAPE`, mas a decisão final é `isPathInside`
+    // (resolve `..`, sem prefixo ingênuo) — defesa em profundidade.
+    const rows = backend.query(
+      "SELECT s.id AS id, s.time_created AS time_created, s.directory AS directory, " +
+        "s.project_id AS project_id, p.worktree AS worktree FROM session s " +
+        "LEFT JOIN project p ON p.id = s.project_id " +
+        "WHERE s.directory = ? OR s.directory LIKE ? ESCAPE '\\' " +
+        "OR p.worktree = ? OR p.worktree LIKE ? ESCAPE '\\' " +
+        "OR EXISTS (SELECT 1 FROM project_directory d WHERE d.project_id = s.project_id " +
+        "AND (d.directory = ? OR d.directory LIKE ? ESCAPE '\\'))",
+      [root, likeRoot, root, likeRoot, root, likeRoot],
+    );
+    // Projetos com worktree secundária dentro do workspace (uma query só, sem
+    // N+1): a sessão ancora pelo projeto mesmo com `directory` fora.
+    const inWsProjects = new Set<string>();
+    try {
+      const dirs = backend.query(
+        "SELECT project_id FROM project_directory WHERE directory = ? OR directory LIKE ? ESCAPE '\\'",
+        [root, likeRoot],
+      );
+      for (const d of dirs) {
+        if (typeof d.project_id === "string" && d.project_id) inWsProjects.add(d.project_id);
+      }
+    } catch {
+      // Sem as secundárias a listagem segue com `worktree` + `directory`
+      // (mais estrita, nunca mais frouxa).
+    }
+    const out: WorkspaceSession[] = [];
+    for (const r of rows) {
+      if (typeof r.id !== "string" || !r.id) continue;
+      const directory = typeof r.directory === "string" ? r.directory : "";
+      const worktree = typeof r.worktree === "string" ? r.worktree : "";
+      const projectId = typeof r.project_id === "string" ? r.project_id : "";
+      const belongs =
+        (directory !== "" && isPathInside(root, directory)) ||
+        (worktree !== "" && isPathInside(root, worktree)) ||
+        (projectId !== "" && inWsProjects.has(projectId));
+      if (!belongs) continue;
+      const ts = typeof r.time_created === "number" && Number.isFinite(r.time_created)
+        ? r.time_created
+        : 0;
+      out.push({ id: r.id, timeCreated: ts });
+    }
+    // Mais antiga primeiro (desempate por id — ordem total, determinística).
+    return out.sort((a, b) => a.timeCreated - b.timeCreated || (a.id < b.id ? -1 : 1));
+  } catch {
+    return [];
+  }
+}
+
+/** Escapa `%`, `_` e `\` para uso em `LIKE ... ESCAPE '\\'`. */
+function escapeLike(s: string): string {
+  return s.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
 }
 
 /**

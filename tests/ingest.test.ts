@@ -30,8 +30,11 @@ import {
   defaultDbPath,
   fakeBackend,
   IngestReadError,
+  listWorkspaceSessions,
+  lookupSessionScope,
   readBatch,
   resolveRuntimeDbPath,
+  sessionBelongsToWorkspace,
   type DbRow,
   type IngestMessage,
   type SqliteBackend,
@@ -1534,6 +1537,180 @@ test("s2_rows_threshold_semantics: limiar conta LINHAS (sanção ADR-007 §4.4),
   // mudança futura de semântica seja intencional, não acidental.
   assert.equal(shouldSend(20, 20), true);
   assert.equal(shouldSend(19, 20), false);
+});
+
+// ---------------------------------------------------------------------------
+// Guarda de workspace do `--ingest` (fail-closed)
+// ---------------------------------------------------------------------------
+
+/** Backend fake com UMA sessão e seu projeto (vínculo `session→project`). */
+function scopeBackend(
+  session: { project_id: string; directory: string; worktree: string } | null,
+  extraDirs: string[] = [],
+): SqliteBackend {
+  return fakeBackend((sql: string): DbRow[] => {
+    if (sql.includes("FROM session")) {
+      return session ? [{ ...session }] : [];
+    }
+    if (sql.includes("FROM project_directory")) {
+      return extraDirs.map((directory) => ({ directory }));
+    }
+    return [];
+  });
+}
+
+test("scope_lookup_found: sessão existente ⇒ worktree + directory", () => {
+  const scope = lookupSessionScope(
+    scopeBackend({ project_id: "p1", directory: "/ws", worktree: "/ws" }),
+    "ses_a",
+  );
+  assert.equal(scope.found, true);
+  assert.equal(scope.projectWorktree, "/ws");
+  assert.equal(scope.sessionDirectory, "/ws");
+});
+
+test("scope_lookup_missing: sessão inexistente ⇒ found=false", () => {
+  assert.equal(lookupSessionScope(scopeBackend(null), "ses_nope").found, false);
+});
+
+test("scope_lookup_db_error: banco ilegível ⇒ found=false (nunca lança)", () => {
+  const bad: SqliteBackend = {
+    query: () => {
+      throw new Error("SQLITE_BUSY");
+    },
+    close: () => {},
+  };
+  assert.equal(lookupSessionScope(bad, "ses_a").found, false);
+});
+
+test("scope_belongs_same: vínculo dentro do workspace ⇒ true", () => {
+  const b = scopeBackend({ project_id: "p1", directory: "/ws", worktree: "/ws" });
+  assert.equal(sessionBelongsToWorkspace(b, "ses_a", "/ws"), true);
+});
+
+test("scope_belongs_nested: sessão em subdir do workspace ⇒ true", () => {
+  const b = scopeBackend({ project_id: "p1", directory: "/ws/sub", worktree: "/ws" });
+  assert.equal(sessionBelongsToWorkspace(b, "ses_a", "/ws"), true);
+});
+
+test("scope_belongs_extra_dir: worktree secundária dentro do workspace ⇒ true", () => {
+  const b = scopeBackend(
+    { project_id: "p1", directory: "/elsewhere", worktree: "/elsewhere" },
+    ["/ws/wt-1"],
+  );
+  assert.equal(sessionBelongsToWorkspace(b, "ses_a", "/ws"), true);
+});
+
+test("scope_rejects_other: sessão de OUTRO workspace ⇒ false", () => {
+  const b = scopeBackend({
+    project_id: "p2",
+    directory: "/other/repo",
+    worktree: "/other/repo",
+  });
+  assert.equal(sessionBelongsToWorkspace(b, "ses_x", "/ws"), false);
+});
+
+test("scope_rejects_prefix: /ws-evil NÃO casa /ws (sem prefixo ingênuo)", () => {
+  const b = scopeBackend({
+    project_id: "pe",
+    directory: "/ws-evil",
+    worktree: "/ws-evil",
+  });
+  assert.equal(sessionBelongsToWorkspace(b, "ses_evil", "/ws"), false);
+});
+
+test("scope_rejects_missing: sessão inexistente ⇒ false (fail-closed)", () => {
+  assert.equal(sessionBelongsToWorkspace(scopeBackend(null), "ses_nope", "/ws"), false);
+});
+
+// ---------------------------------------------------------------------------
+// Listagem do workspace (`--ingest --all`: mais antiga primeiro)
+// ---------------------------------------------------------------------------
+
+/**
+ * Fake para `listWorkspaceSessions`: a query principal é `FROM session` (com
+ * subquery `FROM project_directory` embutida — por isso `session` é checado
+ * primeiro) e a dedicada de secundárias é `FROM project_directory` com LIKE.
+ */
+function listBackend(
+  sessions: Array<{
+    id: string;
+    project_id: string;
+    directory: string;
+    worktree: string;
+    time_created: number;
+  }>,
+  inWsProjectIds: string[] = [],
+): SqliteBackend {
+  return fakeBackend((sql: string): DbRow[] => {
+    if (sql.includes("FROM session")) return sessions.map((s) => ({ ...s }));
+    if (sql.includes("FROM project_directory")) {
+      return inWsProjectIds.map((project_id) => ({ project_id }));
+    }
+    return [];
+  });
+}
+
+test("list_oldest_first: ordena por time_created ASC (desempate por id)", () => {
+  const b = listBackend([
+    { id: "ses_new", project_id: "p", directory: "/ws", worktree: "/ws", time_created: 300 },
+    { id: "ses_old", project_id: "p", directory: "/ws", worktree: "/ws", time_created: 100 },
+    { id: "ses_mid", project_id: "p", directory: "/ws", worktree: "/ws", time_created: 200 },
+  ]);
+  assert.deepEqual(
+    listWorkspaceSessions(b, "/ws").map((s) => s.id),
+    ["ses_old", "ses_mid", "ses_new"],
+  );
+});
+
+test("list_excludes_other_workspace: sessão alheia nunca entra", () => {
+  const b = listBackend([
+    { id: "ses_own", project_id: "p", directory: "/ws", worktree: "/ws", time_created: 1 },
+    {
+      id: "ses_out",
+      project_id: "q",
+      directory: "/other/repo",
+      worktree: "/other/repo",
+      time_created: 0,
+    },
+  ]);
+  assert.deepEqual(
+    listWorkspaceSessions(b, "/ws").map((s) => s.id),
+    ["ses_own"],
+  );
+});
+
+test("list_rejects_prefix: /ws-evil não entra em /ws", () => {
+  const b = listBackend([
+    {
+      id: "ses_evil",
+      project_id: "pe",
+      directory: "/ws-evil",
+      worktree: "/ws-evil",
+      time_created: 1,
+    },
+  ]);
+  assert.deepEqual(listWorkspaceSessions(b, "/ws"), []);
+});
+
+test("list_includes_nested: subdir do workspace entra", () => {
+  const b = listBackend([
+    { id: "ses_sub", project_id: "p", directory: "/ws/sub", worktree: "/ws", time_created: 1 },
+  ]);
+  assert.deepEqual(
+    listWorkspaceSessions(b, "/ws").map((s) => s.id),
+    ["ses_sub"],
+  );
+});
+
+test("list_db_error: banco ilegível ⇒ [] (nunca lança)", () => {
+  const bad: SqliteBackend = {
+    query: () => {
+      throw new Error("SQLITE_BUSY");
+    },
+    close: () => {},
+  };
+  assert.deepEqual(listWorkspaceSessions(bad, "/ws"), []);
 });
 
 // ---------------------------------------------------------------------------

@@ -270,6 +270,11 @@ export async function ingestOnce(
  * **dreno completo**, quando `drainAll`) e **nunca lança** (falha vira log).
  * Chamada em background pelos gatilhos.
  *
+ * Devolve as passadas executadas (para observabilidade do chamador — o CLI
+ * manual agrega o resumo no console). Chamada concorrente na mesma sessão ⇒
+ * `[]` (nada executado). Falha ⇒ passadas até o erro (o erro vira log, não
+ * propaga).
+ *
  * Com `drainAll = true` (`session.idle`), repete passadas até não sobrar nada
  * (`pendentes == 0`, decisão 4 do ADR-007) — o último lote leva o resto. O
  * avanço do cursor a cada passada garante a terminação; um passo sem progresso
@@ -280,7 +285,7 @@ export async function runIngest(
   backend: SqliteBackend,
   sessionId: string,
   drainAll = false,
-): Promise<void> {
+): Promise<IngestOutcome[]> {
   // Uma passada "não-dreno" segurando a trava por sessão (I/O de banco + estado)
   // não pode fazer um `session.idle` que chega nesse intervalo ser DESCARTADO —
   // senão o resto < lote fica preso até o próximo evento (fere a decisão 4). O
@@ -293,9 +298,10 @@ export async function runIngest(
     } else {
       debug(`ingest: execução concorrente ignorada session=${sessionId}`);
     }
-    return;
+    return [];
   }
   rt.lock.add(sessionId);
+  const outcomes: IngestOutcome[] = [];
   try {
     let guard = 0;
     let drain = drainAll;
@@ -305,6 +311,7 @@ export async function runIngest(
       const outcome = await withWorkspaceLock(rt.statePath, () =>
         ingestOnce(rt, backend, sessionId, drain),
       );
+      outcomes.push(outcome);
       if (!drain) {
         // Consome um dreno pedido por um `session.idle` que chegou durante esta
         // passada — uma vez só, sem laço extra.
@@ -312,26 +319,27 @@ export async function runIngest(
           drain = true;
           continue;
         }
-        return;
+        return outcomes;
       }
       // Nada pendente ⇒ drenou (o resto, se havia, saiu no lote anterior).
       if (outcome.rows === 0) {
         debug(`ingest: drenado session=${sessionId}`);
-        return;
+        return outcomes;
       }
       // Progresso esperado: o cursor avançou (send/dedup/sem-texto). Se não
       // avançou e não enviou, para — não girar sobre o mesmo estado.
       if (outcome.cursorAdvanced === false) {
         debug(`ingest: dreno sem progresso session=${sessionId}; encerrando`);
-        return;
+        return outcomes;
       }
       if (++guard > 10_000) {
         logFatal("ingest guard", new Error(`dreno excedeu o teto de passadas session=${sessionId}`));
-        return;
+        return outcomes;
       }
     }
   } catch (err) {
     logIngestFailure(err);
+    return outcomes;
   } finally {
     rt.lock.delete(sessionId);
   }

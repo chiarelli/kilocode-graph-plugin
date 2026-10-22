@@ -23,6 +23,7 @@ import { join } from "node:path";
 import { after, test } from "node:test";
 
 import { main, parseArgs, runCli } from "../src/cli.ts";
+import { fakeBackend } from "../src/ingest/db.ts";
 import type { CollectRuntime, CollectState } from "../src/hooks/collect.ts";
 import { collectCode } from "../src/hooks/collect.ts";
 import { CONFIG_STATE_REL_PATH, READY_REL_PATH } from "../src/config.ts";
@@ -122,6 +123,53 @@ test("parseArgs_invalid_mode: --mode xyz ⇒ erro", () => {
 test("parseArgs_source: --source post-merge é lido", () => {
   const p = parseArgs(["--workspace", "/w", "--source", "post-merge"]);
   assert.equal((p as { source?: string }).source, "post-merge");
+});
+
+test("parseArgs_ingest_single: --ingest lê um session_id", () => {
+  const p = parseArgs(["--workspace", "/w", "--ingest", "ses_abc123"]);
+  assert.ok(!("error" in p));
+  assert.deepEqual((p as { ingest?: unknown }).ingest, {
+    ids: ["ses_abc123"],
+    all: false,
+  });
+});
+
+test("parseArgs_ingest_multi: --ingest repetido acumula ids", () => {
+  const p = parseArgs([
+    "--workspace",
+    "/w",
+    "--ingest",
+    "ses_a",
+    "--ingest",
+    "ses_b",
+  ]);
+  assert.ok(!("error" in p));
+  assert.deepEqual((p as { ingest?: unknown }).ingest, {
+    ids: ["ses_a", "ses_b"],
+    all: false,
+  });
+});
+
+test("parseArgs_ingest_all: --ingest --all marca lote total", () => {
+  const p = parseArgs(["--workspace", "/w", "--ingest", "--all"]);
+  assert.ok(!("error" in p));
+  assert.deepEqual((p as { ingest?: unknown }).ingest, {
+    ids: [],
+    all: true,
+  });
+  // Ordem inversa também vale.
+  const q = parseArgs(["--workspace", "/w", "--all", "--ingest", "--all"]);
+  assert.ok(!("error" in q));
+  assert.equal((q as { ingest?: { all: boolean } }).ingest?.all, true);
+});
+
+test("parseArgs_ingest_all_needs_ingest: --all sozinho ⇒ erro", () => {
+  assert.ok("error" in parseArgs(["--workspace", "/w", "--all"]));
+});
+
+test("parseArgs_ingest_empty: valor vazio ⇒ erro", () => {
+  assert.ok("error" in parseArgs(["--workspace", "/w", "--ingest", ""]));
+  assert.ok("error" in parseArgs(["--workspace", "/w", "--ingest", "--mode"]));
 });
 
 // --- Sentinela (§3) --------------------------------------------------------
@@ -590,6 +638,260 @@ test("cli_boot_writes_ready_file: full inicial grava graph-ready no disco", asyn
 
 test("cli_main_returns_2_on_bad_args: sem --workspace ⇒ exit 2", async () => {
   assert.equal(await main([]), 2);
+});
+
+// --- --ingest (guarda de workspace, fail-closed) ---------------------
+
+// Fake de mapa de sessões (por id) para o `--ingest`: responde ao escopo
+// (`WHERE s.id = ?`) e à listagem (`--all`, linhas completas — o filtro/ordem
+// é da função real, que opera sobre o `query`). A subquery de
+// `project_directory` com LIKE responde `[]` (fixtures sem extras, salvo
+// `extraDirs`, que ancora o escopo).
+function sessionsBackend(
+  sessions: Array<{
+    id: string;
+    project_id: string;
+    directory: string;
+    worktree: string;
+    time_created: number;
+  }>,
+  extraDirs: Record<string, string[]> = {},
+): ReturnType<typeof fakeBackend> {
+  const byId = new Map(sessions.map((s) => [s.id, s]));
+  return fakeBackend((sql: string, params: unknown[]) => {
+    // Ordem importa: a listagem principal é `FROM session` com subquery
+    // `FROM project_directory` embutida — checar `session` primeiro, senão a
+    // listagem cai no ramo da subquery dedicada e volta vazia.
+    if (sql.includes("FROM session")) {
+      // Escopo por id (lookup): `WHERE s.id = ?`.
+      if (sql.includes("s.id = ?")) {
+        const s = byId.get(params[0] as string);
+        return s ? [{ ...s }] : [];
+      }
+      // Listagem (`--all`): linhas completas; o filtro/ordem é da função real.
+      return sessions.map((s) => ({ ...s }));
+    }
+    if (sql.includes("FROM project_directory")) {
+      if (!sql.includes("LIKE") && typeof params[0] === "string") {
+        return (extraDirs[params[0]] ?? []).map((directory) => ({ directory }));
+      }
+      return [];
+    }
+    return [];
+  });
+}
+
+function ingestDeps(
+  over: Record<string, unknown> = {},
+  scope: { project_id: string; directory: string; worktree: string } | null = {
+    project_id: "proj-ws",
+    directory: "/ws",
+    worktree: "/ws",
+  },
+) {
+  const calls: Array<{ sessionId: string; drainAll: boolean }> = [];
+  return {
+    calls,
+    deps: {
+      git: fakeGit(),
+      ingestBackend: sessionsBackend(
+        scope
+          ? [
+              {
+                id: "ses_a",
+                time_created: 1,
+                ...scope,
+              },
+            ]
+          : [],
+      ),
+      runIngestFn: (async (
+        _rt: unknown,
+        _backend: unknown,
+        sessionId: string,
+        drainAll: boolean,
+      ) => {
+        calls.push({ sessionId, drainAll });
+        return [{ sent: true, rows: 1, jobId: "job_stub" }];
+      }) as never,
+      ...over,
+    },
+  };
+}
+
+test("cli_ingest_same_workspace: sessão do workspace ⇒ drena (exit 0)", async () => {
+  const ws = tmpDir("graph-ingest-cli-");
+  mkdirSync(join(ws, ".kilo"), { recursive: true });
+  writeFileSync(
+    join(ws, CONFIG_STATE_REL_PATH),
+    JSON.stringify({ ingest: { enabled: true } }),
+  );
+  // O backend fake espelha o vínculo real: a sessão pertence a ESTE `ws`.
+  const { calls, deps } = ingestDeps({}, { project_id: "proj-ws", directory: ws, worktree: ws });
+  const code = await runCli(
+    { workspace: ws, mode: "auto", ingest: { ids: ["ses_a"], all: false } },
+    deps,
+  );
+  assert.equal(code, 0);
+  assert.deepEqual(calls, [{ sessionId: "ses_a", drainAll: true }]);
+});
+
+test("cli_ingest_multi: vários ids ⇒ drena todos em ordem (exit 0)", async () => {
+  const ws = tmpDir("graph-ingest-cli-");
+  mkdirSync(join(ws, ".kilo"), { recursive: true });
+  writeFileSync(
+    join(ws, CONFIG_STATE_REL_PATH),
+    JSON.stringify({ ingest: { enabled: true } }),
+  );
+  const { calls, deps } = ingestDeps({
+    ingestBackend: sessionsBackend([
+      { id: "ses_a", project_id: "p", directory: ws, worktree: ws, time_created: 2 },
+      { id: "ses_b", project_id: "p", directory: ws, worktree: ws, time_created: 1 },
+    ]),
+  });
+  const code = await runCli(
+    { workspace: ws, mode: "auto", ingest: { ids: ["ses_a", "ses_b", "ses_a"], all: false } },
+    deps,
+  );
+  assert.equal(code, 0);
+  // Ordem dada, duplicata removida.
+  assert.deepEqual(calls.map((c) => c.sessionId), ["ses_a", "ses_b"]);
+});
+
+test("cli_ingest_mixed: lote com alheia ⇒ pula a alheia, drena a própria (exit 0)", async () => {
+  const ws = tmpDir("graph-ingest-cli-");
+  mkdirSync(join(ws, ".kilo"), { recursive: true });
+  writeFileSync(
+    join(ws, CONFIG_STATE_REL_PATH),
+    JSON.stringify({ ingest: { enabled: true } }),
+  );
+  const { calls, deps } = ingestDeps({
+    ingestBackend: sessionsBackend([
+      { id: "ses_a", project_id: "p", directory: ws, worktree: ws, time_created: 1 },
+      {
+        id: "ses_x",
+        project_id: "proj-other",
+        directory: "/other/repo",
+        worktree: "/other/repo",
+        time_created: 2,
+      },
+    ]),
+  });
+  const code = await runCli(
+    { workspace: ws, mode: "auto", ingest: { ids: ["ses_a", "ses_x"], all: false } },
+    deps,
+  );
+  assert.equal(code, 0, "recusa parcial não aborta o lote");
+  assert.deepEqual(calls.map((c) => c.sessionId), ["ses_a"]);
+});
+
+test("cli_ingest_all: --all drena da mais antiga para a mais nova", async () => {
+  const ws = tmpDir("graph-ingest-cli-");
+  mkdirSync(join(ws, ".kilo"), { recursive: true });
+  writeFileSync(
+    join(ws, CONFIG_STATE_REL_PATH),
+    JSON.stringify({ ingest: { enabled: true } }),
+  );
+  const { calls, deps } = ingestDeps({
+    ingestBackend: sessionsBackend([
+      { id: "ses_new", project_id: "p", directory: ws, worktree: ws, time_created: 300 },
+      { id: "ses_old", project_id: "p", directory: ws, worktree: ws, time_created: 100 },
+      { id: "ses_mid", project_id: "p", directory: ws, worktree: ws, time_created: 200 },
+      {
+        id: "ses_out",
+        project_id: "proj-other",
+        directory: "/other/repo",
+        worktree: "/other/repo",
+        time_created: 50,
+      },
+    ]),
+  });
+  const code = await runCli(
+    { workspace: ws, mode: "auto", ingest: { ids: [], all: true } },
+    deps,
+  );
+  assert.equal(code, 0);
+  assert.deepEqual(
+    calls.map((c) => c.sessionId),
+    ["ses_old", "ses_mid", "ses_new"],
+    "mais antiga primeiro; a alheia nem é listada",
+  );
+});
+
+test("cli_ingest_all_empty: --all sem sessões no workspace ⇒ exit 2", async () => {
+  const ws = tmpDir("graph-ingest-cli-");
+  mkdirSync(join(ws, ".kilo"), { recursive: true });
+  writeFileSync(
+    join(ws, CONFIG_STATE_REL_PATH),
+    JSON.stringify({ ingest: { enabled: true } }),
+  );
+  const { calls, deps } = ingestDeps({ ingestBackend: sessionsBackend([]) });
+  const code = await runCli(
+    { workspace: ws, mode: "auto", ingest: { ids: [], all: true } },
+    deps,
+  );
+  assert.equal(code, 2);
+  assert.equal(calls.length, 0);
+});
+
+test("cli_ingest_unknown: sessão inexistente sozinha ⇒ pulada, exit 0", async () => {
+  const ws = tmpDir("graph-ingest-cli-");
+  mkdirSync(join(ws, ".kilo"), { recursive: true });
+  writeFileSync(
+    join(ws, CONFIG_STATE_REL_PATH),
+    JSON.stringify({ ingest: { enabled: true } }),
+  );
+  const { calls, deps } = ingestDeps({
+    ingestBackend: fakeBackend(() => []),
+  });
+  const code = await runCli(
+    { workspace: ws, mode: "auto", ingest: { ids: ["ses_nope"], all: false } },
+    deps,
+  );
+  assert.equal(code, 0, "lote só com recusadas conclui sem ingerir");
+  assert.equal(calls.length, 0);
+});
+
+test("cli_ingest_prefix_attack: /ws-evil não casa /ws (pulada, exit 0)", async () => {
+  const ws = "/ws";
+  const { calls, deps } = ingestDeps({
+    ingestBackend: fakeBackend((sql: string) => {
+      if (sql.includes("FROM session")) {
+        return [
+          {
+            project_id: "proj-evil",
+            directory: "/ws-evil",
+            worktree: "/ws-evil",
+          },
+        ];
+      }
+      return [];
+    }),
+  });
+  const code = await runCli(
+    { workspace: ws, mode: "auto", ingest: { ids: ["ses_evil"], all: false } },
+    { ...deps, loadConfigState: () => ({}) } as never,
+  );
+  assert.equal(code, 0, "prefixo ingênuo não pode vazar sessão alheia");
+  assert.equal(calls.length, 0);
+});
+
+test("cli_main_error_visible: erro de args aparece no console (não só no arquivo)", async () => {
+  // Regressão: `log()` vai só para `/tmp/kilocode-graph-plugin.log` — o usuário
+  // via exit 2 sem nenhuma mensagem no terminal.
+  const err: string[] = [];
+  const origErr = process.stderr.write.bind(process.stderr);
+  (process.stderr as unknown as { write: (c: string) => boolean }).write = (c: string) => {
+    err.push(c);
+    return true;
+  };
+  try {
+    const code = await main([]);
+    assert.equal(code, 2);
+    assert.match(err.join(""), /--workspace é obrigatório/, "mensagem de uso no stderr");
+  } finally {
+    (process.stderr as unknown as { write: unknown }).write = origErr;
+  }
 });
 
 // --- Trava cross-process (§3b) — spawn REAL --------------------------------
