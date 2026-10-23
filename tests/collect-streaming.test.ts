@@ -75,7 +75,7 @@ test("streaming_full_job_into_spool: nada retido no runner, tudo chega ao sync",
       cpuGuard: false,
       onEvent: (ev: IndexerEvent) => spool.write(ev),
     });
-    spool.close();
+    spool.commit();
     assert.deepEqual(result.events, [], "memória do runner: nenhum evento retido");
     assert.equal(result.eventCount, FILES * 2 + 1 + 1, "chunks + import + job_completed");
 
@@ -122,7 +122,7 @@ test("streaming_incremental_removed_filter: removido não viaja como chunk", asy
       cpuGuard: false,
       onEvent: (ev) => spool.write(ev),
     });
-    spool.close();
+    spool.commit();
     await syncSpool(
       spool,
       {

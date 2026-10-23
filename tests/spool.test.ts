@@ -137,7 +137,7 @@ test("sync_spool_batches_by_file: >batchSize ⇒ múltiplos requests", async () 
     for (const f of ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"]) {
       spool.write(chunk(f, f.replace(".rs", "")));
     }
-    spool.close();
+    spool.commit();
     const calls: Array<{ files: CodeFile[]; edges: CodeEdge[] }> = [];
     const result = await syncSpool(spool, noopClient(calls), IDENTITY, {
       repoRoot: "/repo",
@@ -156,7 +156,7 @@ test("sync_spool_batches_by_file: >batchSize ⇒ múltiplos requests", async () 
 test("sync_spool_batch_never_exceeds_limit: lote não materializa o corpus inteiro", async () => {
   await withSpool(async (spool) => {
     for (let i = 0; i < 250; i++) spool.write(chunk(`f${i}.rs`, `s${i}`));
-    spool.close();
+    spool.commit();
     const calls: Array<{ files: CodeFile[]; edges: CodeEdge[] }> = [];
     const result = await syncSpool(spool, noopClient(calls), IDENTITY, {
       repoRoot: "/repo",
@@ -180,7 +180,7 @@ test("sync_spool_edges_follow_origin_batch: aresta vai no lote do from_file", as
       event: "import_edge",
       payload: { from_file: "src/b.rs", to_module: "crate::a" },
     });
-    spool.close();
+    spool.commit();
     const calls: Array<{ files: CodeFile[]; edges: CodeEdge[] }> = [];
     await syncSpool(spool, noopClient(calls), IDENTITY, {
       repoRoot: "/repo",
@@ -197,7 +197,7 @@ test("sync_spool_edges_follow_origin_batch: aresta vai no lote do from_file", as
 test("sync_spool_removed_last_batch: removidos entram com chunks: []", async () => {
   await withSpool(async (spool) => {
     spool.write(chunk("src/a.rs", "a"));
-    spool.close();
+    spool.commit();
     const calls: Array<{ files: CodeFile[]; edges: CodeEdge[] }> = [];
     const result = await syncSpool(spool, noopClient(calls), IDENTITY, {
       repoRoot: "/repo",
@@ -213,7 +213,7 @@ test("sync_spool_removed_last_batch: removidos entram com chunks: []", async () 
 
 test("sync_spool_only_removed: sem arquivos, ainda envia os tombstones", async () => {
   await withSpool(async (spool) => {
-    spool.close();
+    spool.commit();
     const calls: Array<{ files: CodeFile[]; edges: CodeEdge[] }> = [];
     await syncSpool(spool, noopClient(calls), IDENTITY, {
       repoRoot: "/repo",
@@ -229,7 +229,7 @@ test("sync_spool_aggregates_results: soma upserted/edges dos lotes", async () =>
   await withSpool(async (spool) => {
     spool.write(chunk("a.rs", "a"));
     spool.write(chunk("b.rs", "b"));
-    spool.close();
+    spool.commit();
     const client = {
       async syncCode(files: CodeFile[]): Promise<SyncResult> {
         return {
@@ -287,5 +287,104 @@ test("spool_interleaved_files: escrita intercalada após evicção não perde ne
         "ordem de escrita preservada",
       );
     }
+  });
+});
+
+test("spool_commit_atomic: só após commit o spool é consumível", async () => {
+  await withSpool((spool) => {
+    spool.write(chunk("src/a.rs", "a1"));
+    assert.equal(spool.isCommitted(), false);
+    assert.throws(() => spool.assertCommitted(), /não commitado/);
+    spool.commit();
+    assert.equal(spool.isCommitted(), true);
+    assert.doesNotThrow(() => spool.assertCommitted());
+    assert.equal(spool.readFile("src/a.rs").length, 1);
+  });
+});
+
+test("spool_commit_is_idempotent: commit duas vezes não quebra", async () => {
+  await withSpool((spool) => {
+    spool.write(chunk("src/a.rs", "a1"));
+    spool.commit();
+    assert.doesNotThrow(() => spool.commit());
+  });
+});
+
+test("spool_stream_file: leitura por stream devolve os mesmos eventos", async () => {
+  await withSpool(async (spool) => {
+    spool.write(chunk("src/a.rs", "a1"));
+    spool.write(chunk("src/a.rs", "a2"));
+    spool.write(chunk("src/a.rs", "a3"));
+    spool.commit();
+
+    const streamed: string[] = [];
+    for await (const ev of spool.streamFile("src/a.rs")) {
+      streamed.push((ev.payload as { symbol_id: string }).symbol_id);
+    }
+    assert.deepEqual(streamed, ["a1", "a2", "a3"]);
+  });
+});
+
+test("spool_stream_missing_file: arquivo ausente ⇒ stream vazio, sem lançar", async () => {
+  await withSpool(async (spool) => {
+    spool.commit();
+    const got: unknown[] = [];
+    for await (const ev of spool.streamFile("src/nao-existe.rs")) got.push(ev);
+    assert.deepEqual(got, []);
+  });
+});
+
+test("spool_stream_requires_commit: stream de spool incompleto lança", async () => {
+  await withSpool(async (spool) => {
+    spool.write(chunk("src/a.rs", "a1"));
+    await assert.rejects(async () => {
+      for await (const _ev of spool.streamFile("src/a.rs")) {
+        // não deve chegar aqui
+      }
+    }, /não commitado/);
+  });
+});
+
+test("sync_aggregate_counts_only: agregado não acumula results por arquivo", async () => {
+  await withSpool(async (spool) => {
+    for (let i = 0; i < 5; i++) spool.write(chunk(`src/f${i}.rs`, `s${i}`));
+    spool.commit();
+    const client = {
+      calls: 0,
+      async syncCode(files: CodeFile[]): Promise<SyncResult> {
+        this.calls++;
+        return {
+          upserted: files.length,
+          deleted: 0,
+          changed: 0,
+          skipped: 0,
+          results: files.map((f) => ({ file_path: f.file_path, status: "changed" })),
+        };
+      },
+    };
+    const result = await syncSpool(spool, client, IDENTITY, {
+      repoRoot: "",
+      batchSize: 2,
+      readFile: () => "",
+    });
+    assert.equal(result.sync.upserted, 5);
+    // O detalhe por arquivo NÃO é retido: cresceria com o repo.
+    assert.equal(result.sync.results, undefined);
+  });
+});
+
+test("sync_batch_pause: pausa entre lotes é respeitada", async () => {
+  await withSpool(async (spool) => {
+    for (let i = 0; i < 4; i++) spool.write(chunk(`src/g${i}.rs`, `s${i}`));
+    spool.commit();
+    const t0 = Date.now();
+    await syncSpool(spool, noopClient([]), IDENTITY, {
+      repoRoot: "",
+      batchSize: 2,
+      batch_pause_ms: 50,
+      readFile: () => "",
+    });
+    // 2 lotes ⇒ 1 pausa de 50ms (a pausa é DEPOIS de cada lote).
+    assert.ok(Date.now() - t0 >= 90, `esperava >=90ms, veio ${Date.now() - t0}ms`);
   });
 });

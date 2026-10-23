@@ -42,6 +42,12 @@ import { CpuGuard, type CpuGuardConfig, type CpuGuardSnapshot } from "./cpu-guar
 export interface BackpressureOptions {
   /** Tamanho da fila que dispara `pause` (mínimo 10 no indexer). Default 500. */
   max_queue_size?: number;
+  /**
+   * Teto da fila em BYTES. A fila pausa no PRIMEIRO teto (eventos OU bytes):
+   * o teto por eventos não protege contra chunk gigante (poucos eventos, muitos
+   * MB). `0`/ausente no indexer = desligado.
+   */
+  max_queue_bytes?: number;
   /** Percentual do teto abaixo do qual o indexer retoma (80–99). Default 90. */
   threshold_percent?: number;
   /** `resume` exige ack do consumidor. Default `false`. */
@@ -53,6 +59,7 @@ export interface BackpressureOptions {
 /** Backpressure padrão do plugin: freia o indexer bem antes do pipe encher. */
 export const DEFAULT_BACKPRESSURE: Required<BackpressureOptions> = {
   max_queue_size: 500,
+  max_queue_bytes: 0,
   threshold_percent: 90,
   ack_required: false,
   pause_timeout_secs: 60,
@@ -107,6 +114,17 @@ export interface RunIndexerOptions {
    * desliga. Default: `DEFAULT_CPU_GUARD`.
    */
   cpuGuard?: Partial<CpuGuardConfig> | false;
+  /**
+   * Concorrência do indexer (`options.max_concurrency`). Enviado SEMPRE (o
+   * default do indexer é `num_cpus`, que satura a máquina). `undefined` ⇒ o
+   * chamador já resolveu via orçamento do boot.
+   */
+  maxConcurrency?: number;
+  /**
+   * Limites de conteúdo (`options.limits`). Enviado quando presente; o indexer
+   * pula arquivos gigantes com `file_skipped` em vez de parsear.
+   */
+  limits?: import("../types.ts").IndexLimits;
   /**
    * Consumidor de streaming: recebe cada evento no instante em que é lido.
    * Presente ⇒ o runner NÃO acumula `events` em RAM (o consumidor decide onde
@@ -185,6 +203,15 @@ export function buildCommand(
     extract_calls: opts.extractCalls ?? true,
     load_ignores: opts.loadIgnores ?? false,
   };
+  // Concorrência é teto de CPU/RAM: enviada SEMPRE (o default do indexer é
+  // `num_cpus`, que satura a máquina). O coletor resolve via orçamento do boot.
+  if (opts.maxConcurrency !== undefined) {
+    (payload.options as Record<string, unknown>).max_concurrency = opts.maxConcurrency;
+  }
+  // Limites de conteúdo: o indexer pula gigantes com `file_skipped`.
+  if (opts.limits) {
+    (payload.options as Record<string, unknown>).limits = opts.limits;
+  }
   // Chunking é repassado CRU (contrato do indexer); ausente ⇒ a chave não vai,
   // e o indexer aplica o default dele (não impomos valores que ele desconheça).
   if (opts.chunking) {

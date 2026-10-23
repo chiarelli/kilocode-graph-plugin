@@ -170,6 +170,29 @@ export function collectFiles(events: IndexerEvent[]): CodeFile[] {
 }
 
 /**
+ * `CodeFile` vazio para um arquivo que o spool ainda não tem chunks (ou tem só
+ * arestas). `ensureFullFile` sintetiza o `FullFile` depois.
+ */
+export function emptyCodeFile(filePath: string, language: string): CodeFile {
+  return { file_path: filePath, language, chunks: [] };
+}
+
+/**
+ * Variante STREAMING de `collectFiles`: acrescenta ao `entry` o chunk de UM
+ * evento `chunk_emitted` (payload inválido ⇒ `entry` inalterado). Permite ao
+ * consumidor do spool não carregar o JSONL inteiro do arquivo.
+ */
+export function appendChunk(entry: CodeFile, ev: IndexerEvent): CodeFile {
+  if (ev.event !== "chunk_emitted") return entry;
+  const payload = chunkPayload(ev.payload);
+  if (!payload) return entry;
+  const chunk = toChunk(payload);
+  if (!chunk) return entry;
+  entry.chunks.push(chunk);
+  return entry;
+}
+
+/**
  * `true` se há um `FullFile`/`Contextual` no arquivo (≤1 por arquivo; identidade
  * `file:chunk_kind` — ADR-002). O indexer emite só `Symbol`; o `FullFile` é
  * sintetizado por `ensureFullFile`.

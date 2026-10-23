@@ -375,3 +375,41 @@ test("runIndexer_ack_counts_drained: ack carrega o nº real de eventos drenados"
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("build_command_concurrency_limits: maxConcurrency/limits vão em options", () => {
+  const cmd = JSON.parse(
+    buildCommand("full", "/repo", {
+      bin: "x",
+      repoRoot: "/repo",
+      mode: "full",
+      maxConcurrency: 3,
+      limits: { max_file_bytes: 1048576, max_chunk_bytes: 131072, max_chunks_per_file: 2000 },
+    }).line,
+  ) as { payload: { options: Record<string, unknown> } };
+  assert.equal(cmd.payload.options.max_concurrency, 3);
+  assert.deepEqual(cmd.payload.options.limits, {
+    max_file_bytes: 1048576,
+    max_chunk_bytes: 131072,
+    max_chunks_per_file: 2000,
+  });
+});
+
+test("build_command_concurrency_absent: sem maxConcurrency/limits, chaves ausentes", () => {
+  const cmd = JSON.parse(
+    buildCommand("full", "/repo", { bin: "x", repoRoot: "/repo", mode: "full" }).line,
+  ) as { payload: { options: Record<string, unknown> } };
+  assert.equal("max_concurrency" in cmd.payload.options, false);
+  assert.equal("limits" in cmd.payload.options, false);
+});
+
+test("build_command_max_queue_bytes: backpressure leva o teto em bytes", () => {
+  const cmd = JSON.parse(
+    buildCommand("full", "/repo", {
+      bin: "x",
+      repoRoot: "/repo",
+      mode: "full",
+      backpressure: { max_queue_size: 500, max_queue_bytes: 67108864 },
+    }).line,
+  ) as { payload: { options: { backpressure: Record<string, unknown> } } };
+  assert.equal(cmd.payload.options.backpressure.max_queue_bytes, 67108864);
+});

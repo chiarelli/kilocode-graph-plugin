@@ -56,6 +56,21 @@ export function chunkingFingerprint(opts?: ChunkingOptions): string {
 }
 
 /**
+ * Limites de conteúdo do indexer (`options.limits`). Arquivo acima de
+ * `max_file_bytes` ⇒ `file_skipped` (sem parsear); chunk acima de
+ * `max_chunk_bytes` ⇒ truncado com `truncated: true`; arquivo acima de
+ * `max_chunks_per_file` ⇒ `file_skipped` (`chunks_capped`).
+ */
+export interface IndexLimits {
+  /** Arquivo acima deste tamanho ⇒ `file_skipped`, sem parsear. */
+  max_file_bytes?: number;
+  /** Chunk acima deste tamanho ⇒ truncado com `truncated: true`. */
+  max_chunk_bytes?: number;
+  /** Arquivo acima deste nº de chunks ⇒ `file_skipped` (`chunks_capped`). */
+  max_chunks_per_file?: number;
+}
+
+/**
  * Backpressure do `rust-ast-indexer` (`options.backpressure`). Sem esses campos
  * o indexer NÃO instancia o monitor: emite chunks sem freio e nunca publica
  * `pause`. `max_queue_size` mínimo 10; `threshold_percent` em 80–99.
@@ -63,6 +78,12 @@ export function chunkingFingerprint(opts?: ChunkingOptions): string {
 export interface BackpressureOptions {
   /** Tamanho da fila que dispara `pause` (default 500). */
   max_queue_size?: number;
+  /**
+   * Teto da fila em BYTES (default: 25% da memória usável). A fila pausa no
+   * primeiro teto atingido (eventos OU bytes) — sem isto, chunks gigantes
+   * (ex.: bundle minificado de 9 MB) estouravam a RAM com poucos eventos.
+   */
+  max_queue_bytes?: number;
   /** Percentual do teto abaixo do qual retoma (80–99; default 90). */
   threshold_percent?: number;
   /** `resume` exige ack do consumidor (default `false`). */
@@ -274,10 +295,32 @@ export interface Config {
     chunking?: ChunkingOptions;
     /**
      * Backpressure do indexer (`options.backpressure`). `undefined` ⇒ o plugin
-     * envia o default (`DEFAULT_BACKPRESSURE`). `false` ⇒ não envia (indexer
+     * envia o default (`DEFAULT_BACKPRESSURE`); `false` ⇒ não envia (indexer
      * emite sem freio — desaconselhado).
      */
     backpressure?: BackpressureOptions | false;
+    /**
+     * Concorrência do indexer (`options.max_concurrency`). `undefined` ⇒ o
+     * orçamento do boot (`ncpu - 1`, clamp [1, 8]). Enviado sempre (o default
+     * do indexer é `num_cpus`, que satura a máquina).
+     */
+    max_concurrency?: number;
+    /**
+     * Limites de conteúdo do indexer (`options.limits`). `undefined` ⇒ os
+     * defaults do orçamento (1 MiB / 128 KiB / 2000). Arquivo gigante nunca é
+     * parseado: o indexer emite `file_skipped` no lugar.
+     */
+    limits?: IndexLimits;
+    /**
+     * Tamanho do lote de sync em arquivos (default: derivado do orçamento,
+     * clamp [10, 100]). Substitui o `batchSize` fixo do `syncSpool`.
+     */
+    sync_batch_size?: number;
+    /**
+     * Teto de arquivos num full (default 60000). Acima ⇒ o coletor recusa o
+     * job com `full acima do teto` (sem retry cego) e grava `graph-failed.json`.
+     */
+    max_full_files?: number;
     /**
      * Guarda de CPU do indexer. `undefined` ⇒ default (`nice` 10, pausa em 85%
      * do sistema). `false` ⇒ desligada.

@@ -101,6 +101,15 @@ export interface SymbolIndex {
   hasOrigin(path: string, symbol: string | null): boolean;
   symbolsOf(path: string): Set<string>;
   paths: string[];
+  /**
+   * Arquivo que define `symbol` (o primeiro na ordem do índice), ou `null`.
+   *
+   * Lookup DIRETO: antes a resolução de cada chamada varria `paths` inteiro
+   * (`for (const path of index.paths) if (index.has(path, needle))`), custo
+   * `O(chamadas × arquivos)`. Num full de 44 mil arquivos com ~780 mil chamadas
+   * isso é ~3,4e10 consultas — o boot parecia travado. Aqui é `O(1)`.
+   */
+  fileDefining(symbol: string): string | null;
 }
 
 /**
@@ -121,12 +130,16 @@ export function buildEdgeIndex(entries: Iterable<EdgeIndexEntry>): SymbolIndex {
   const fullFiles = new Set<string>();
   const callable = new Map<string, Set<string>>();
   const paths: string[] = [];
+  // Símbolo → primeiro arquivo que o define (lookup O(1) da resolução de chamada).
+  const definingFile = new Map<string, string>();
   for (const e of entries) {
     paths.push(e.filePath);
     const set = new Set<string>();
     for (const sym of e.symbols) {
       byName.add(`${e.filePath}\u0000${sym}`);
       set.add(sym);
+      // Primeiro definidor vence (ordem determinística do spool).
+      if (!definingFile.has(sym)) definingFile.set(sym, e.filePath);
     }
     if (e.hasFileChunk) fullFiles.add(e.filePath);
     callable.set(e.filePath, set);
@@ -135,10 +148,14 @@ export function buildEdgeIndex(entries: Iterable<EdgeIndexEntry>): SymbolIndex {
     has: (path, symbol) => byName.has(`${path}\u0000${symbol}`),
     hasOrigin: (path, symbol) =>
       symbol === null ? fullFiles.has(path) : byName.has(`${path}\u0000${symbol}`),
-    symbolsOf: (path) => callable.get(path) ?? new Set<string>(),
+    symbolsOf: (path) => callable.get(path) ?? EMPTY_SYMBOLS,
     paths,
+    fileDefining: (symbol) => definingFile.get(symbol) ?? null,
   };
 }
+
+/** Conjunto vazio compartilhado (evita alocar um `Set` por consulta miss). */
+const EMPTY_SYMBOLS: Set<string> = new Set<string>();
 
 function buildIndex(files: CodeFile[]): SymbolIndex {
   return buildEdgeIndex(
@@ -225,19 +242,15 @@ export function resolveEdgesWithIndex(
     if (!srcFile || !index.symbolsOf(srcFile).has(srcSym)) continue;
 
     const needle = lastSegment(callee);
-    let target: { file: string; symbol: string } | null = null;
-    for (const path of index.paths) {
-      if (index.has(path, needle)) {
-        target = { file: path, symbol: needle };
-        break;
-      }
-    }
-    if (!target) continue;
+    // Lookup DIRETO símbolo→arquivo: antes varria `index.paths` por chamada
+    // (O(chamadas × arquivos)); num full grande isso travava o boot.
+    const targetFile = index.fileDefining(needle);
+    if (!targetFile) continue;
     push({
       from_file: srcFile,
       from_symbol_id: srcSym,
-      to_file: target.file,
-      to_symbol_id: target.symbol,
+      to_file: targetFile,
+      to_symbol_id: needle,
       edge_kind: "call",
     });
   }

@@ -15,10 +15,11 @@
  * semântica do envio em bloco anterior (o servidor exige a origem no payload).
  */
 
-import type { SyncResult } from "../types.ts";
+import type { CodeFile, SyncResult } from "../types.ts";
 import {
-  collectFiles,
+  appendChunk,
   defaultReadFile,
+  emptyCodeFile,
   ensureFullFile,
   removedFile,
 } from "./collector.ts";
@@ -28,7 +29,7 @@ import {
   type CallEdge,
   type ImportEdge,
 } from "./edges.ts";
-import type { EventSpool } from "./spool.ts";
+import { SpoolNotCommittedError, type EventSpool } from "./spool.ts";
 
 /** Identidade lógica do sync. */
 export interface SyncIdentityLike {
@@ -54,6 +55,12 @@ export interface SyncSpoolOptions {
   batchSize?: number;
   /** Leitor injetável (default `readFileSync` do collector). */
   readFile?: (path: string) => string;
+  /**
+   * Pausa entre lotes (ms) para ceder CPU/rede. `0`/ausente ⇒ sem pausa.
+   * O `cpu_guard` do indexer controla o PARSER, não o sync — sem isto, um
+   * corpus grande mantém um núcleo ocupado em `JSON.parse` sem trégua.
+   */
+  batch_pause_ms?: number;
 }
 
 /** Resultado agregado de todos os lotes. */
@@ -78,11 +85,16 @@ function emptyAggregate(workspace: string | undefined): SyncResult {
     skipped: 0,
     edges_upserted: 0,
     edges_deleted: 0,
-    results: [],
   };
 }
 
-/** Soma um `SyncResult` de lote no agregado (campos aditivos). */
+/**
+ * Soma um `SyncResult` de lote no agregado. **Só contadores.**
+ *
+ * Antes: `acc.results = [...(acc.results ?? []), ...res.results]` — o array de
+ * resultados por arquivo crescia com o repositório (memória do plugin sem teto,
+ * independente do lote). O retorno passa a carregar apenas totais.
+ */
 function addInto(acc: SyncResult, res: SyncResult): void {
   acc.upserted += res.upserted ?? 0;
   acc.deleted += res.deleted ?? 0;
@@ -90,7 +102,6 @@ function addInto(acc: SyncResult, res: SyncResult): void {
   acc.skipped += res.skipped ?? 0;
   acc.edges_upserted = (acc.edges_upserted ?? 0) + (res.edges_upserted ?? 0);
   acc.edges_deleted = (acc.edges_deleted ?? 0) + (res.edges_deleted ?? 0);
-  if (res.results) acc.results = [...(acc.results ?? []), ...res.results];
 }
 
 /**
@@ -146,20 +157,32 @@ export async function syncSpool(
   for (const batch of batches) {
     const read = opts.readFile ?? defaultReadFile;
     const languageOf = new Map(files.map((f) => [f.filePath, f.language]));
-    const batchFiles = batch.files.map((filePath) => {
-      // Só os chunks DESTE arquivo são materializados: o pico de RAM é o lote.
-      const entry = collectFiles(spool.readFile(filePath))[0] ?? {
-        file_path: filePath,
-        language: languageOf.get(filePath) ?? "rust",
-        chunks: [],
-      };
-      return ensureFullFile(entry, opts.repoRoot, read);
-    });
+    // Chunks do lote: lidos por STREAM (um evento por vez). `readFile` carregava
+    // o JSONL inteiro de cada arquivo; um bundle minificado vira ~23 MB e o lote
+    // de 100 multiplicava. `appendChunk` mantém só o `CodeFile` montado.
+    const batchFiles: CodeFile[] = [];
+    let healthy = true;
+    for (const filePath of batch.files) {
+      let entry = emptyCodeFile(filePath, languageOf.get(filePath) ?? "rust");
+      try {
+        for await (const ev of spool.streamFile(filePath)) {
+          if (ev.event === "chunk_emitted") entry = appendChunk(entry, ev);
+        }
+      } catch (err) {
+        // Spool não commitado/inconsistente: aborta o sync inteiro (nunca
+        // trata ausentes como removidos).
+        if (err instanceof SpoolNotCommittedError) throw err;
+        healthy = false;
+        break;
+      }
+      batchFiles.push(ensureFullFile(entry, opts.repoRoot, read));
+    }
+    if (!healthy) break;
 
     const imports: ImportEdge[] = [];
     const calls: CallEdge[] = [];
     for (const filePath of batch.files) {
-      for (const ev of spool.readEdges(filePath)) {
+      for await (const ev of spool.streamEdges(filePath)) {
         const payload = ev.payload as Record<string, unknown> | null;
         if (!payload) continue;
         if (ev.event === "import_edge") imports.push(payload as ImportEdge);
@@ -176,6 +199,10 @@ export async function syncSpool(
     addInto(aggregate, res);
     sentFiles += batchFiles.length;
     sentEdges += edges.length;
+    // Cede CPU entre lotes (o guard do indexer não cobre o plugin).
+    if (opts.batch_pause_ms && opts.batch_pause_ms > 0) {
+      await new Promise((r) => setTimeout(r, opts.batch_pause_ms));
+    }
   }
 
   return {
