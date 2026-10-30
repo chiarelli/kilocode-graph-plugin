@@ -15,7 +15,6 @@
  */
 
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { test } from "node:test";
 
@@ -38,16 +37,47 @@ const REPO = process.env.E2E_CODE_REPO ?? "/tmp/e3a_collector_repo";
 const MAIN = "mod db;\n\nuse crate::db::connect;\n\nfn main() {\n    let pool = connect(\"postgres://localhost/app\");\n    let _ = pool;\n}\n";
 const DB = "pub fn connect(dsn: &str) -> String {\n    validate(dsn);\n    dsn.to_string()\n}\n\nfn validate(dsn: &str) {\n    if dsn.is_empty() {\n        panic!(\"empty dsn\");\n    }\n}\n";
 
-/** uuid5(CODE_NS, "{file}:{symbol}") — identidade determinística do memtier. */
-function chunkUuid(file: string, symbol: string | null): string {
-  const NS = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
-  const ns = Buffer.from(NS.replace(/-/g, ""), "hex");
-  const name = symbol ? `${file}:${symbol}` : `${file}:FullFile`;
-  const h = createHash("sha1").update(ns).update(name).digest();
-  h[6] = (h[6]! & 0x0f) | 0x50;
-  h[8] = (h[8]! & 0x3f) | 0x80;
-  const x = h.toString("hex");
-  return `${x.slice(0, 8)}-${x.slice(8, 12)}-${x.slice(12, 16)}-${x.slice(16, 20)}-${x.slice(20, 32)}`;
+/**
+ * uuid de um chunk lido da PRÓPRIA resposta de `code/search` (E8 item 9).
+ *
+ * Antes o teste recalculava `uuid5(CODE_NS, "{file}:{symbol}")` no cliente. A
+ * partir do memtier v1.1.0 o uuid é o 9º campo aditivo da resposta — fonte da
+ * verdade. Recalcular duplicava a regra do servidor e mascarava divergência: se
+ * o server mudasse a derivação, o teste continuaria navegando com um uuid que o
+ * grafo não tem.
+ *
+ * Falha (não faz skip) quando o campo some: é contrato do v1.1.0.
+ */
+async function symbolChunkId(
+  client: MemtierClient,
+  query: string,
+  path: string,
+  symbol: string,
+): Promise<string> {
+  const search = await client.request<{
+    chunks?: Array<{ path?: string; symbol?: string | null; uuid?: string }>;
+  }>("POST", "/v1/code/search", {
+    workspace: WS,
+    program: PROGRAM,
+    query,
+    // `CodeSymbol` deixa de fora o FullFile sintético; a busca devolve o chunk
+    // do símbolo. `limit` alto para alcançar os dois símbolos do mesmo arquivo.
+    labels: ["CodeSymbol"],
+    limit: 20,
+  });
+  const hit = (search.chunks ?? []).find(
+    (c) => (c.path ?? "").includes(path) && c.symbol === symbol,
+  );
+  assert.ok(
+    hit,
+    `code_search não devolveu ${path}::${symbol}; ` +
+      `hits=${(search.chunks ?? []).map((c) => `${c.path}::${c.symbol}`).join(",")}`,
+  );
+  assert.ok(
+    hit.uuid,
+    `o chunk ${path}::${symbol} veio SEM uuid — contrato v1.1.0 rompido`,
+  );
+  return hit.uuid;
 }
 
 function materialize(): void {
@@ -106,12 +136,13 @@ test("e2e: cadeia completa indexer→sync→search→neighbors (busca + navegaç
   );
 
   // 2) NAVEGAÇÃO: OUT call de db.rs::connect → db.rs::validate.
+  const connectUuid = await symbolChunkId(client, "validate", "db.rs", "connect");
   const out = await client.request<{
     neighbors?: Array<{ file_path?: string; symbol?: string }>;
   }>("POST", "/v1/code/neighbors", {
     workspace: WS,
     program: PROGRAM,
-    uuid: chunkUuid("src/db.rs", "connect"),
+    uuid: connectUuid,
     direction: "out",
     edge_kind: "call",
     limit: 20,
@@ -122,12 +153,13 @@ test("e2e: cadeia completa indexer→sync→search→neighbors (busca + navegaç
   );
 
   // 3) NAVEGAÇÃO IN: quem chama validate é connect.
+  const validateUuid = await symbolChunkId(client, "validate", "db.rs", "validate");
   const inc = await client.request<{
     neighbors?: Array<{ symbol?: string }>;
   }>("POST", "/v1/code/neighbors", {
     workspace: WS,
     program: PROGRAM,
-    uuid: chunkUuid("src/db.rs", "validate"),
+    uuid: validateUuid,
     direction: "in",
     edge_kind: "call",
     limit: 20,

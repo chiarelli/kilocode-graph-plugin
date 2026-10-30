@@ -20,6 +20,7 @@
 
 import type { CodeChunkHit, MemtierClient, SearchCodeOpts, SearchCodeResult } from "../client.ts";
 import { log } from "../logger.ts";
+import { isValidUuid } from "./uuid.ts";
 
 /** Sentinela do bloco de código (distinta da de memória — FR-105). */
 export const CODE_SENTINEL = "graph-code";
@@ -63,12 +64,17 @@ function sanitizeCodeText(text: string): string {
   return text.replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-/** Cabeçalho de procedência de um chunk (`[CÓDIGO RELEVANTE — path:ini-fim]`). */
+/**
+ * Cabeçalho de procedência de um chunk (`[CÓDIGO RELEVANTE — path:ini-fim]`),
+ * com `[id=<uuid>]` quando o servidor manda o uuid do vértice (E8-S1). O uuid
+ * vai COMPLETO (36 chars) e validado por forma: a tool exige o id exato e um id
+ * torto devolve `[]` em silêncio. Puro — omitir não loga (o aviso é do injetor).
+ */
 function chunkHeader(chunk: CodeChunkHit): string {
-  return (
+  const header =
     `[${CODE_HEADER} — ${sanitizeCodeText(chunk.path)}:` +
-    `${chunk.start_line}-${chunk.end_line}]`
-  );
+    `${chunk.start_line}-${chunk.end_line}]`;
+  return isValidUuid(chunk.uuid) ? `${header} [id=${chunk.uuid}]` : header;
 }
 
 /**
@@ -151,6 +157,32 @@ export function chunkIdentity(chunk: CodeChunkHit): string {
   return `${chunk.path}:${chunk.start_line}-${chunk.end_line}`;
 }
 
+/**
+ * Quantos chunks têm `uuid` **presente mas inválido** (E8 decisão 2). Ausência
+ * (`undefined`/`null`/`""`) é servidor antigo esperado e não conta.
+ */
+function invalidIdCount(chunks: CodeChunkHit[]): number {
+  return chunks.filter((c) => {
+    if (c.uuid === undefined || c.uuid === null || c.uuid === "") return false;
+    return !isValidUuid(c.uuid);
+  }).length;
+}
+
+/**
+ * Emite o aviso de uuid malformado (E8 decisão 2). Devolve `true` quando avisou
+ * — o injetor usa o retorno para manter "uma vez por turno" sem reimplementar a
+ * condição (que divergiria do aviso).
+ */
+function warnMalformedIds(chunks: CodeChunkHit[], escopo: string): boolean {
+  const invalid = invalidIdCount(chunks);
+  if (invalid === 0) return false;
+  log(
+    `code_search: uuid fora do formato 8-4-4-4-12 em ${invalid} chunk(s) — ` +
+      `marcador [id=] omitido no bloco (${escopo})`,
+  );
+  return true;
+}
+
 /** Remove repetições da própria resposta (mesma identidade ⇒ um só chunk). */
 function dedupeByIdentity(chunks: CodeChunkHit[]): CodeChunkHit[] {
   const seen = new Set<string>();
@@ -216,6 +248,7 @@ export async function searchAndFormat(
   const { chunks } = await runSearch(client, cfg, query, signal);
   // Caminho avulso não tem estado de turno: uma chamada = um aviso.
   warnIfFloorNotHonored(cfg, chunks, "busca avulsa");
+  warnMalformedIds(chunks, "busca avulsa");
   return formatCodeBlock(chunks);
 }
 
@@ -235,6 +268,7 @@ export class CodeInjector {
   private turnoId: string | null = null;
   private injectedThisTurn = false;
   private floorWarnedThisTurn = false;
+  private idsWarnedThisTurn = false;
   private readonly seen = new Set<string>();
 
   constructor(client: SearchClient, cfg: CodeConfig) {
@@ -249,8 +283,20 @@ export class CodeInjector {
       this.seen.clear();
       this.injectedThisTurn = false;
       this.floorWarnedThisTurn = false;
+      this.idsWarnedThisTurn = false;
     }
     return !this.injectedThisTurn;
+  }
+
+  /**
+   * Avisa UMA vez por turno quando o uuid do chunk veio presente mas malformado
+   * (E8 decisão 2). Mesma política do piso (`floorWarnedThisTurn`): o aviso é
+   * para o operador saber que o servidor está fora do contrato — repetir por
+   * chunk viraria spam de log.
+   */
+  private warnInvalidIds(chunks: CodeChunkHit[]): void {
+    if (this.idsWarnedThisTurn) return;
+    this.idsWarnedThisTurn = warnMalformedIds(chunks, "injeção do turno");
   }
 
   /**
@@ -277,6 +323,7 @@ export class CodeInjector {
         "injeção do turno",
       );
     }
+    this.warnInvalidIds(fresh);
     return { chunks: fresh, searchMs };
   }
 

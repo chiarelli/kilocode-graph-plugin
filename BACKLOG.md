@@ -181,6 +181,11 @@ Convenções válidas para todas as epics:
 ### E7 — Observabilidade
 - [ ] **E7** — Observabilidade (log de recall/coleta, flag de debug)
 
+### E8 — Identidade no bloco injetado e instrução de uso do memtier
+- [x] **E8-S1** — Identidade: `uuid`/`episodes` em `Fact`, `uuid` em `CodeChunkHit`, `[id=<uuid>]`/`[ep=<uuid> +N]`, dedup por uuid
+- [x] **E8-S2** — Instrução de sistema: `system.transform` derivado da config efetiva (`mcp.enabled`; código por `code_index.enabled`, não `inject.code_enabled` — pull ≠ push)
+- [x] **E8-S3** — Fechamento: E2E de ida-e-volta (id → tool), `chunkUuid` eliminado, docs
+
 ---
 
 ## Protocolo tracer bullet (obrigatório onde indicado)
@@ -233,6 +238,7 @@ unidade com happy path e unhappy path**:
 | **E2 — Injeção de memória** | **SIM** — `messages.transform` injeta bloco de memória de 1 recall real | **SIM** — recall real injetado no turno | E1 |
 | **E3a — Coletor de código** | **SIM** — spawn do indexer → `chunk_emitted` → `/v1/code/sync` (1 arquivo) | **SIM** — ciclo de vida real (cresce/encolhe/deleta) | E1, rust-ast-indexer |
 | **E3b — Registro do MCP do memtier** | **SIM** — `status`→`add`→`connect` do MCP remoto no boot | **SIM** — tools listáveis/chamáveis via cliente MCP | memtier MCP ✅ |
+| **E8 — Identidade no bloco e instrução de uso** | **SIM, na S2** — `system.transform` nunca atravessou camada nenhuma; a S1 é aditiva | **SIM** — id injetado → `memory_episodes`/`code_neighbors` devolve conteúdo | E2, E3c, E3b, memtier v1.1.0 ✅ |
 
 ---
 
@@ -308,12 +314,51 @@ navegação `neighbors` (bloqueada até o memtier expor tool MCP).
 **Tracer bullet:** SIM — `status`→`add`→`connect` de 1 MCP remoto real.
 
 **Critérios de aceite:**
-- As 4 tools (`recall`/`ingest`/`code_search`/`code_sync`) ficam disponíveis.
+- As tools do servidor ficam disponíveis (**7** no memtier v1.1.0:
+  `recall`/`ingest`/`code_search`/`code_sync`/`code_neighbors`/`memory_episodes`/
+  `memory_neighbors`).
 - Registro é implícito (o usuário não define nada em `kilo.jsonc`).
 - Se já definido lá, o plugin não registra por cima.
 - Falha de registro é logada, nunca fatal.
 
-**Fora de escopo:** navegação `neighbors` (não é tool MCP no memtier).
+**Fora de escopo:** o plugin escolher **quais** tools aparecem — o registro é
+**por servidor**, não por tool.
+
+---
+
+## E8 — Identidade no bloco injetado e instrução de uso do memtier
+
+> **Objetivo:** o bloco injetado passa a carregar o `uuid` do fato/chunk e o do
+> primeiro episódio, e o system prompt passa a explicar como expandir por esses
+> ids com as tools MCP. Fecha os achados 3, 4 e 6 da
+> [RFC-001](docs/rfc/001-navegacao-e-integridade-do-grafo-de-codigo.md); spec:
+> [`specs/e8-stories.md`](specs/e8-stories.md).
+
+**Entrega:** `uuid`/`episodes` em `Fact` e `uuid` em `CodeChunkHit`
+(`src/client.ts`); marcadores `[id=<uuid completo>]` e `[ep=<uuid> +N]` em
+`formatFact`/`chunkHeader`; `factKey` (dedup por uuid, com fallback para o
+texto); `src/hooks/system.ts` com `experimental.chat.system.transform` derivado
+do estado real; chave `inject.instruction_enabled`.
+
+**Tracer bullet:** **SIM, na S2** — `experimental.chat.system.transform` nunca
+atravessou camada nenhuma deste plugin, então a S2 começa por uma fatia vertical
+mínima (texto fixo empurrado num turno real, provado no E2E). A **S1** é contrato
+aditivo puro sobre E2/E3c e não usa a fatia. Marcadores `TODO(tracer-bullet):`
+aparecem **só na S2**; a epic fecha com `rg` = 0.
+
+**Critérios de aceite:**
+- Cada item injetado traz id **completo** (36 chars) — é a entrada que a tool
+  exige; id truncado devolve `[]` em silêncio.
+- O bloco **não** contém `score` (decisão da RFC-001 §3).
+- `[ep=…]` do bloco → `memory_episodes` devolve o `content` original.
+- A instrução cita **apenas** tools que a config efetiva habilita (`mcp.enabled`;
+  código por `code_index.enabled`); nunca `ingest` nem `code_sync` (escrita).
+- O hook de sistema **nunca lança** e **acrescenta** ao `output.system`, sem
+  substituir o prompt do host.
+
+**Fora de escopo:** `score` no bloco · `depth` no plugin · multi-hop de código ·
+injetar o `content` do episódio · duplicar navegação por HTTP · trocar o dedup de
+código para `uuid`.
 
 ---
 
@@ -1021,3 +1066,70 @@ redescobertas no meio do loop.
   8. **Verificação:** `tsc --noEmit` limpo; `npm test` **527 · 507 pass · 0 fail ·
      20 skip** (os 20 skip são E2E gated `E2E=1`). E2E do piso contra stack real
      fica para a entrega de calibração (o piso está desligado por default).
+
+- **2026-10-30 — E8 especificada a partir da RFC-001 rev. 5:**
+  O memtier v1.1.0 fechou os achados 1/2/5 no servidor; o que resta é plugin.
+  A spec [`specs/e8-stories.md`](specs/e8-stories.md) cobre os itens 3a, 3b, 4a,
+  6, 8 e 9 do Encaminhamento da RFC.
+  1. **`score` não é injetado** (achado 3c, descartado). Medido em 3 consultas
+     reais: o top-1 é `1.0` **por construção** (RRF normalizado pelo top-1 da
+     própria consulta). O valor não é comparável entre itens nem entre consultas;
+     a ordem já transmite o ranking. O aceite testa a **ausência**.
+  2. **Marcador único `[id=<uuid completo>]`** nos dois blocos (memória e
+     código) e `[ep=<uuid> +N]` para o primeiro episódio. O uuid vai com **36
+     chars**: é a entrada exata que as tools exigem, e um id truncado devolve
+     `[]` **em silêncio** (o pior modo de falha — o modelo não vê erro).
+  3. **`episodes`: primeiro + `+N`.** 100% dos fatos amostrados (15, em 3
+     consultas) têm exatamente 1 episódio; injetar todos custaria ~36 chars cada
+     sem ganho.
+  4. **`depth` no plugin descartado** (achado 5a). Navegação é **pull**; `depth>1`
+     no push troca precisão por recall no caminho crítico, e a medição do
+     RFC-004 D6 mostra que o ganho é de volume (4,3 → 19,6 vizinhos), não de
+     alcance.
+  5. **Dedup do turno passa a usar o `uuid`**, com fallback para o texto
+     (`factKey`). Hoje a chave é `f.fact`, que colapsa fatos distintos de mesmo
+     texto. O dedup de **código não muda** (`path:start-end`): é guarda local do
+     turno, e depender de `uuid` deixaria de deduplicar com servidor antigo.
+  6. **Instrução em `system.transform` derivada do estado real**: o MCP é
+     registrado **por servidor**, não por tool, então a derivação só alcança
+     `mcp.enabled` e `code_index.enabled` (o conteúdo; `inject.code_enabled` é
+     push e não governa a tool). `ingest`/`code_sync` **nunca** são
+     anunciadas (são escrita). Chave nova `inject.instruction_enabled`
+     (default `true`, efetiva só com `inject.enabled=true`).
+  7. **E8 é tracer bullet na S2**: `system.transform` é superfície nova, nunca
+     exercitada neste plugin; a S1 é aditiva e não usa a fatia. Registrar assim,
+     como manda o protocolo do BACKLOG.
+  8. **Pré-requisito de documentação:** as correções do item 7 da RFC-001
+     (README, ADR-006, ARCHITECTURE, PRD e o E2E do MCP) estão em **stash**, não
+     aplicadas — e a RFC ainda as declarava "feitas". Item 7 des-riscado.
+     Aplicar **antes do fechamento (S3)**; não bloqueia S1/S2.
+
+- **2026-10-30 — E8 fechada (S1 → S2 → S3).**
+  1. **S1 — identidade no bloco.** `Fact.uuid?`/`episodes?` e
+     `CodeChunkHit.uuid?` no fio; `src/inject/uuid.ts` (`isValidUuid`,
+     `8-4-4-4-12` minúsculo) como regra única; `[id=<uuid>]`/`[ep=<uuid> +N]`
+     no fim da linha (memória) e `[id=]` no cabeçalho do chunk (código);
+     `factKey` (uuid validado, fallback `text:<fato>`) no dedup; aviso de uuid
+     malformado **um por turno por família**. `chunkIdentity` segue
+     `path:start-end`. `score`/`raw_score` nunca no envelope.
+  2. **S2 — instrução de sistema.** `experimental.chat.system.transform`
+     (hook irmão do `messages.transform`) via `src/hooks/system.ts`; texto
+     derivado da config efetiva (memória com `mcp.enabled`; código com
+     `mcp.enabled` E `code_index.enabled` — pull ≠ push; `ingest`/`code_sync`
+     nunca); `push` sem substituir, idempotente, never-throws. Chave nova
+     `inject.instruction_enabled` (default `true`), fora de `configStateFrom`.
+     **Custo final medido: 707 chars** com código / **555** sem (rascunho da spec
+     dizia 870), teto assertado `≤ 1000`. Tracer bullet cumprido; marcadores
+     `TODO(tracer-bullet)` removidos (`rg src/` = 0).
+  3. **S3 — fechamento.** E2E de ida-e-volta (`tests/e2e/test_e2e_e8_roundtrip.test.ts`):
+     `recall` → `[ep=…]` → `/v1/memory/episodes` (`uuids: []`) resolve com
+     `content` não vazio, **contraprova** `resolved: 0` com o uuid do **fato** e
+     `422` no campo singular; `code_search` → `[id=…]` → `/v1/code/neighbors`
+     `200`; `system.transform` sem tools de código com `code_index=false`. O E2E
+     do coletor deixou de recalcular `uuid5` (`rg "chunkUuid" tests/` = 0).
+     `stash@{0}` (item 7 da RFC-001) aplicado: README, ADR-006, ARCHITECTURE
+     (§2/§3/§5/§6), PRD, E2E do MCP (conjunto **exato** de 7 tools) e RFC §7.
+     `rg "travada|4 tools"` = 0.
+  4. **Verificação:** `tsc --noEmit` limpo; `npm test` **672 · 643 pass · 0 fail
+     · 29 skip** (E2E gated). E2E verdes contra o stack local (`E2E=1` com
+     `E2E_TOKEN`/`E2E_CODE_TOKEN` por suíte).

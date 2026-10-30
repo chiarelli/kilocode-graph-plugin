@@ -244,6 +244,13 @@ export interface Config {
      * 0.65`), então um piso abaixo disso só afeta chunks fulltext-only.
      */
     code_min_score?: number;
+    /**
+     * E8-S2 — liga o parágrafo de sistema que explica como expandir o bloco
+     * injetado com as tools MCP (default `true`). Efetiva **só** com
+     * `inject.enabled=true` **e** `mcp.enabled=true`. Governa o TEXTO, não o
+     * bloco: desligar mantém os `[id=…]` (ainda servem para citar).
+     */
+    instruction_enabled: boolean;
   };
   code_index: {
     enabled: boolean;

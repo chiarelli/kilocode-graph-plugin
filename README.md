@@ -149,8 +149,8 @@ mudanças não-commitadas ficam fora (FR-507). Ver
 - **Implementar o parser/chunker** — é do `rust-ast-indexer`, que é uma
   **dependência de runtime do cliente**. O plugin apenas o executa e **coleta** os
   eventos (agrupar por arquivo, resolver arestas, sincronizar).
-- **Navegação por código vizinho** (`/v1/code/neighbors`) — **travada** até o
-  memtier expor a tool MCP (hoje só `recall`/`ingest`/`code_search`/`code_sync`).
-  Ver [`docs/rfc/001`](docs/rfc/001-navegacao-e-integridade-do-grafo-de-codigo.md)
-  (a rota HTTP também é inutilizável: falta o `uuid` de entrada).
+- **Reimplementar a navegação por HTTP.** O memtier v1.1.0 expõe
+  `code_neighbors`, `memory_episodes` e `memory_neighbors` como tools MCP (7 no
+  total) e o `uuid` de chunk como 9º campo de `code_search`. A navegação é
+  **pull**: o modelo chama a tool, o plugin não a duplica por HTTP (ADR-006).
 - Migrar as memórias antigas (cancelado no memtier).

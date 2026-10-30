@@ -117,15 +117,15 @@ O `kilo-openviking-plugin` funciona, mas tem três limitações herdadas do prov
 |---|---|---|
 | FR-601 | Registrar o MCP remoto do memtier **implicitamente** | `client.mcp.add` (`type:"remote"`, URL `…/v1/mcp`, header `Authorization: Bearer`) + `connect`, no boot do plugin; reuso de `registerOpenVikingMcp`. **O usuário não precisa definir nada em `kilo.jsonc`** |
 | FR-602 | Não duplicar registro | Se `kilo.jsonc` já define o MCP do memtier, o plugin **não** registra por cima (idempotência); registro implícito é o caminho padrão |
-| FR-603 | Ferramentas disponíveis ao modelo | `recall`, `ingest`, `code_search`, `code_sync` listáveis e chamáveis pelo agente |
+| FR-603 | Ferramentas disponíveis ao modelo | 7 tools listáveis e chamáveis pelo agente: `recall`, `ingest`, `code_search`, `code_sync`, `code_neighbors`, `memory_episodes`, `memory_neighbors` (as três últimas desde o memtier v1.1.0) |
 | FR-604 | Degradação | MCP indisponível ⇒ turno segue; falha de registro é logada, nunca fatal |
 
-> **Bloqueio cross-projeto (navegação):** `/v1/code/neighbors` (E12) **não é tool
-> MCP** no memtier — existe só como rota HTTP (`src/memtier/tools/__init__.py`
-> registra apenas `recall`, `ingest`, `code_search`, `code_sync`). **Navegação
-> por código vizinho fica travada no plugin até o memtier expor a tool MCP.**
-> Não é lacuna do plugin: é dependência do memtier. Enquanto isso, o plugin
-> **não** promete navegação (nem a reimplementa).
+> **Navegação — DESBLOQUEADA no memtier v1.1.0.** O servidor publica
+> `code_neighbors`, `memory_episodes` e `memory_neighbors` (7 tools no total) e
+> `code_search` devolve o `uuid` do chunk como 9º campo aditivo. O plugin herda
+> as tools pelo registro do MCP (que é por servidor), sem código novo, e **não**
+> reimplementa navegação por HTTP (ADR-006). Ver
+> [`docs/rfc/001`](rfc/001-navegacao-e-integridade-do-grafo-de-codigo.md).
 
 ### Escopo e configuração
 
@@ -180,8 +180,10 @@ O `kilo-openviking-plugin` funciona, mas tem três limitações herdadas do prov
 - **E3c depende do memtier E6** (busca híbrida em código) — **satisfeita**.
 - **E3a depende do `rust-ast-indexer`** (binário + protocolo JSONL) — o binário é
   **externo ao plugin**; build via `make build` no repo do indexer.
-- **Navegação (`neighbors`) — BLOQUEADA:** depende de o memtier expor a tool MCP
-  (hoje só `recall`/`ingest`/`code_search`/`code_sync`). Ver §5.
+- **Navegação (`neighbors`) — DESBLOQUEADA:** o memtier v1.1.0 expõe
+  `code_neighbors`, `memory_episodes` e `memory_neighbors`. Multi-hop de código
+  segue adiado por medição (RFC-004 D6). Ver
+  [`docs/rfc/001`](rfc/001-navegacao-e-integridade-do-grafo-de-codigo.md).
 - Ordem natural: E1→E2 (memória) e E3a→E3b→E3c (código) em paralelo; E5 por
   último a fechar as duas pernas.
 

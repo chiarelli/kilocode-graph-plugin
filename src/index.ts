@@ -24,6 +24,7 @@ import { cliPath, spawnCollectCli } from "./cli-spawn.ts";
 import { resolveTokenFile } from "./token-file.ts";
 import { ingestHook } from "./hooks/ingest.ts";
 import { messagesHook } from "./hooks/messages.ts";
+import { systemHook, systemRuntimeFrom } from "./hooks/system.ts";
 import {
   resolveRuntimeDbPath,
   type DbPathSource,
@@ -210,6 +211,11 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
       },
       client,
     }),
+    // E8-S2: `system.transform` (hook IRMÃO do `messages.transform`, não
+    // substituto) acrescenta o protocolo de uso do memtier ao system prompt.
+    // A lista de tools é derivada da config efetiva: `mcp.enabled` para as de
+    // memória, `+ code_index.enabled` para as de código (pull ≠ push).
+    ...systemHook(systemRuntimeFrom(config)),
     // E4: ingestão assíncrona — `message.updated` (S1) e `session.idle` (S3)
     // acordam a MESMA rotina; o conteúdo vem do `kilo.db` (ADR-007). O evento
     // nunca é `await` (não bloqueia o turno, FR-203). Desligado por default.

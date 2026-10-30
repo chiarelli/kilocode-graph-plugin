@@ -656,8 +656,9 @@ Oito pontos afirmam o oposto do que o servidor faz hoje. Seis são
 ### Propostas
 
 1. **Corrigir os documentos na mesma entrega** que toca o assunto — não numa
-   "limpeza" separada que nunca acontece. *(Feito nesta rev. 5: README,
-   ADR-006, ARCHITECTURE, PRD e o E2E do MCP.)*
+   "limpeza" separada que nunca acontece. *(Preparado na rev. 5 e **aplicado na
+   E8-S3** em README, ADR-006, ARCHITECTURE, PRD e o E2E do MCP; verificado
+   2026-10-30.)*
 2. **Trocar a asserção do E2E por conjunto exato** (as 7, em ordem), ou por
    "contém as 7" se a ordem não for contrato. Hoje `includes()` de 4 nomes é
    satisfeito por qualquer superset.
@@ -707,21 +708,26 @@ uma das 7 tools sumir.
 
 > **Todo o lado memtier está fechado no v1.1.0.** O que resta é plugin, exceto
 > onde indicado. Itens riscados foram entregues ou descartados.
+>
+> **Especificado na E8:** [`specs/e8-stories.md`](../../specs/e8-stories.md)
+> cobre os itens 3a, 3b, 4a, 6, 8 e 9 (identidade no bloco + instrução de
+> sistema). A S1 é o item 3a/3b/4a/8; a S2 é o item 6; a S3 fecha com os E2E de
+> ida-e-volta e o item 9.
 
 | Item | Dono | Ação |
 |---|---|---|
 | ~~1. Tool MCP de navegação~~ | ~~memtier~~ | **feito** — `code_neighbors` no v1.1.0 |
 | ~~2. Contrato `uuid` de `neighbors`~~ | ~~memtier~~ | **feito** — `uuid` como 9º campo de `code_search` |
-| 3a. `uuid` de memória no bloco | plugin | declarar `uuid`/`episodes` em `Fact`; formatar `[id=<uuid completo>]` em `formatFact` |
-| 3b. `uuid` de código no bloco | plugin | declarar `uuid` em `CodeChunkHit`; formatar em `chunkHeader`. **Sem dependência do memtier** |
+| ~~3a. `uuid` de memória no bloco~~ | ~~plugin · E8~~ | **feito na E8-S1** — `uuid`/`episodes` em `Fact`; `[id=<uuid completo>]`/`[ep=<uuid> +N]` |
+| ~~3b. `uuid` de código no bloco~~ | ~~plugin · E8~~ | **feito na E8-S1** — `uuid` em `CodeChunkHit`; `[id=]` em `chunkHeader` |
 | 3c. `score` no bloco | — | **descartado** (§3): a ordem já transmite o ranking; o score é relativo ao top-1 |
-| 4a. `episodes` no bloco | plugin | primeiro episódio + marcador `+N` quando houver mais |
+| ~~4a. `episodes` no bloco~~ | ~~plugin · E8~~ | **feito na E8-S1** — primeiro episódio + `+N` |
 | ~~4b. Leitura de episódio~~ | ~~memtier~~ | **feito** — `/v1/memory/episodes` + `memory_episodes` |
 | ~~5a. `depth` no plugin~~ | ~~plugin~~ | **descartado** (§5): navegação é pull; `depth>1` no push troca precisão por recall |
 | ~~5b. Âncora da BFS de memória~~ | ~~memtier~~ | **feito por outro caminho** — `/v1/memory/neighbors` (§5) |
 | ~~5c. Semântica de navegação de memória~~ | ~~memtier~~ | **decidida** — RFC-004 D2: documental + topológica, ambas entregues |
 | 5d. Multi-hop de código | memtier | **adiado com medição** (RFC-004 D6); cliente encadeia `code_neighbors` |
-| 6. System prompt de uso do memtier | plugin | hook `system.transform`; derivar do estado real (`code_enabled`), não de lista fixa |
-| ~~7. Dívida documental~~ | ~~plugin~~ | **feito na rev. 5** — README, ADR-006, ARCHITECTURE, PRD e E2E do MCP corrigidos (§7) |
-| 8. Dedup do turno | plugin | hoje a chave é `f.fact` (texto); com ids no bloco, usar `uuid` para não colapsar fatos de texto igual |
-| 9. E2E `chunkUuid` | plugin | `tests/e2e/test_e2e_collector.test.ts:42` recalcula `uuid5`; usar o `uuid` de `code_search` e apagar a fórmula |
+| ~~6. System prompt de uso do memtier~~ | ~~plugin · E8~~ | **feito na E8-S2** — hook `system.transform`; derivar do estado real, não de lista fixa (ver a correção push×pull na [E8](../../specs/e8-stories.md): é `code_index.enabled`, não `inject.code_enabled`) |
+| ~~7. Dívida documental~~ | ~~plugin~~ | **feito na E8-S3** — README, ADR-006, ARCHITECTURE (§2/§3/§5/§6), PRD e o E2E do MCP corrigidos; `rg "travada\|4 tools"` = 0 |
+| ~~8. Dedup do turno~~ | ~~plugin · E8~~ | **feito na E8-S1** — `factKey` usa uuid validado, fallback `text:` |
+| ~~9. E2E `chunkUuid`~~ | ~~plugin · E8~~ | **feito na E8-S3** — uuid lido de `code_search`; fórmula `uuid5` apagada (`rg "chunkUuid" tests/` = 0) |

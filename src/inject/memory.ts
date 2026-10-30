@@ -21,6 +21,7 @@
 import type { Fact, MemtierClient, RecallOpts, RecallResult } from "../client.ts";
 import { debug, log } from "../logger.ts";
 import { applyBudget, type Budget } from "./budget.ts";
+import { isValidUuid } from "./uuid.ts";
 
 /** Sentinela do bloco de memória (não colide com `ov-memory` do antecessor). */
 export const MEMORY_SENTINEL = "graph-memory";
@@ -43,11 +44,6 @@ export type RecallClient = Pick<MemtierClient, "recall"> &
   Partial<Pick<MemtierClient, "health">>;
 
 /**
- * Formata um fato como linha, com procedência temporal quando houver `valid_at`.
- * `invalid_at` não aparece (o recall só devolve vigentes). Fato sem `valid_at`
- * não mostra data.
- */
-/**
  * Sanitiza o texto VINDO DE FORA (o `fact` é conteúdo do grafo, não nosso).
  *
  * Sem isto, um fato contendo `\n</context>` FECHA o bloco da sentinela e o que
@@ -65,13 +61,98 @@ function sanitizeFactText(text: string): string {
 /**
  * Formata um fato como linha, com procedência temporal quando houver `valid_at`.
  * `invalid_at` não aparece (o recall só devolve vigentes). Fato sem `valid_at`
- * não mostra data. O texto passa por `sanitizeFactText` — nunca confie no grafo.
+ * não mostra data.
+ *
+ * E8-S1: os marcadores de identidade vão no FIM da linha — `[id=<uuid>]` do fato
+ * e `[ep=<uuid> +N]` do primeiro episódio. Ambos passam por `isValidUuid`
+ * (forma `8-4-4-4-12`): um uuid torto degrada para a OMISSÃO do marcador, nunca
+ * para um id que a tool devolveria vazio. A função é PURA — omitir não loga; o
+ * aviso sai do injetor, que tem estado de turno (decisão 2).
  */
 function formatFact(fact: Fact): string {
   const suffix = fact.valid_at
     ? ` (válido desde ${sanitizeFactText(fact.valid_at)})`
     : "";
-  return `- ${sanitizeFactText(fact.fact)}${suffix}`;
+  return `- ${sanitizeFactText(fact.fact)}${suffix}${identityMarkers(fact)}`;
+}
+
+/**
+ * Marcadores `[id=…]` e `[ep=…]` de um fato, precedidos de espaço; `""` quando
+ * nenhum é válido (a linha fica **byte-idêntica** à anterior — sem espaço
+ * residual). Também decide, por campo, se houve degradação de forma, para o
+ * injetor avisar uma vez por turno.
+ */
+function identityMarkers(fact: Fact): string {
+  const markers: string[] = [];
+  if (isValidUuid(fact.uuid)) markers.push(`[id=${fact.uuid}]`);
+  const episodes = fact.episodes;
+  if (Array.isArray(episodes) && isValidUuid(episodes[0])) {
+    const extra = episodes.length - 1;
+    markers.push(extra > 0 ? `[ep=${episodes[0]} +${extra}]` : `[ep=${episodes[0]}]`);
+  }
+  return markers.length > 0 ? ` ${markers.join(" ")}` : "";
+}
+
+/**
+ * Quantos ITENS da família têm identidade **presente mas inválida** — o que o
+ * injetor loga uma vez por turno (decisão 2). Ausência (`undefined`/`null`/
+ * `""`/lista vazia) é servidor antigo esperado: não conta.
+ *
+ * Conta o **item** (fato), não o campo: um fato com `uuid` E `episodes[0]`
+ * tortos é UM item afetado, e o log diz "N item(ns)" — contar dois campos do
+ * mesmo fato faria a mensagem mentir sobre quantos itens degradaram.
+ * `episodes` presente mas que não é lista também é item afetado: o campo veio
+ * no fio com forma fora do contrato, e degradar sem avisar é o que a decisão 2
+ * proíbe.
+ */
+function invalidIdentityCount(facts: Fact[]): number {
+  return facts.filter((f) => itemHasInvalidIdentity(f)).length;
+}
+
+/** O item tem alguma identidade presente porém malformada? */
+function itemHasInvalidIdentity(fact: Fact): boolean {
+  if (presentButInvalid(fact.uuid)) return true;
+  const episodes = fact.episodes;
+  if (episodes === undefined || episodes === null) return false;
+  if (!Array.isArray(episodes)) return true;
+  if (episodes.length === 0) return false;
+  return presentButInvalid(episodes[0]);
+}
+
+/** Um valor existe no fio mas não é uuid válido (ausência não é anomalia). */
+function presentButInvalid(value: unknown): boolean {
+  if (value === undefined || value === null) return false;
+  if (typeof value === "string" && value === "") return false;
+  return !isValidUuid(value);
+}
+
+/**
+ * Identidade de um fato no dedup do turno (decisão 4).
+ *
+ * Usa a MESMA validação do bloco: `uuid ?? fact` estaria errado — um uuid
+ * malformado (ou `""`, que o `??` não protege) viraria chave de dedup enquanto
+ * o marcador correspondente é omitido. O prefixo `text:` separa os dois espaços
+ * de nome (um `fact` que por acaso fosse um uuid não colide com outro fato).
+ */
+export function factKey(fact: Fact): string {
+  return isValidUuid(fact.uuid) ? fact.uuid : `text:${fact.fact}`;
+}
+
+/**
+ * Remove repetições da própria resposta (mesma identidade ⇒ um só fato). Espelha
+ * `dedupeByIdentity` do `CodeInjector`: o dedup do turno não pode deixar dois
+ * itens de mesma identidade entrarem juntos.
+ */
+function dedupeByFactKey(facts: Fact[]): Fact[] {
+  const seen = new Set<string>();
+  const out: Fact[] = [];
+  for (const f of facts) {
+    const key = factKey(f);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(f);
+  }
+  return out;
 }
 
 /**
@@ -160,11 +241,27 @@ export function logInjection(m: InjectionResult): void {
 }
 
 /**
+ * Emite o aviso de identidade malformada (decisão 2). Devolve `true` quando
+ * avisou — quem tem estado de turno usa o retorno para "uma vez por turno" sem
+ * reimplementar a condição (que divergiria do aviso).
+ */
+function warnMalformedIds(facts: Fact[], escopo: string): boolean {
+  const invalid = invalidIdentityCount(facts);
+  if (invalid === 0) return false;
+  log(
+    `recall: uuid fora do formato 8-4-4-4-12 em ${invalid} item(ns) — ` +
+      `marcador(es) [id=]/[ep=] omitido(s) no bloco (${escopo})`,
+  );
+  return true;
+}
+
+/**
  * Recall + orçamento + formatação, sem estado. Devolve o bloco pronto para virar
  * um part injetado, ou `null` quando não há o que injetar (0 fatos após o
  * orçamento). **Lança** o erro do client — quem chama (o hook) degrada.
  *
  * Sem observabilidade de turno (isso é do `MemoryInjector`, o caminho do hook).
+ * Caminho avulso não tem estado de turno: uma chamada = um aviso.
  */
 export async function recallAndFormat(
   client: RecallClient,
@@ -174,6 +271,7 @@ export async function recallAndFormat(
 ): Promise<string | null> {
   const { result } = await runRecall(client, cfg, query, signal);
   const facts = applyBudget(result.facts, cfg);
+  warnMalformedIds(facts, "recall avulso");
   return formatMemoryBlock(facts);
 }
 
@@ -204,6 +302,8 @@ export class MemoryInjector {
   private turnoId: string | null = null;
   /** O turno corrente já injetou um bloco? Um turno injeta **no máximo um**. */
   private injectedThisTurn = false;
+  /** Aviso de uuid malformado já saiu neste turno? Um **por turno por família**. */
+  private idsWarnedThisTurn = false;
   private readonly seen = new Set<string>();
 
   constructor(client: RecallClient, cfg: RecallConfig) {
@@ -231,8 +331,20 @@ export class MemoryInjector {
       this.turnoId = turnoId;
       this.seen.clear();
       this.injectedThisTurn = false;
+      this.idsWarnedThisTurn = false;
     }
     return !this.injectedThisTurn;
+  }
+
+  /**
+   * Avisa UMA vez por turno quando a identidade veio presente mas malformada
+   * (decisão 2). Um booleano, como `floorWarnedThisTurn` do `CodeInjector`:
+   * repetir por uuid transformaria um deploy desalinhado em spam de log.
+   * Ausência de uuid (servidor antigo) NÃO avisa — é degradação esperada.
+   */
+  private warnInvalidIds(facts: Fact[]): void {
+    if (this.idsWarnedThisTurn) return;
+    this.idsWarnedThisTurn = warnMalformedIds(facts, "injeção do turno");
   }
 
   /**
@@ -249,8 +361,11 @@ export class MemoryInjector {
       query,
       timeoutSignal(this.cfg),
     );
-    const fresh = result.facts.filter((f) => !this.seen.has(f.fact));
+    const fresh = dedupeByFactKey(
+      result.facts.filter((f) => !this.seen.has(factKey(f))),
+    );
     const facts = fresh.slice(0, Math.max(0, this.cfg.maxMemories));
+    this.warnInvalidIds(facts);
     return { facts, recallMs };
   }
 
@@ -264,7 +379,7 @@ export class MemoryInjector {
   commit(prep: MemoryPrep, facts: Fact[]): InjectionResult | null {
     const block = formatMemoryBlock(facts);
     if (!block) return null;
-    for (const f of facts) this.seen.add(f.fact);
+    for (const f of facts) this.seen.add(factKey(f));
     this.injectedThisTurn = true;
     const injection: InjectionResult = {
       block,

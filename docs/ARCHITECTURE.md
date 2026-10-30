@@ -33,7 +33,7 @@
 │                              │                                │
 │  experimental.chat.messages.transform ◀── INJEÇÃO (push)      │
 │                              │                                │
-│  experimental.chat.system.transform  ◀── contexto de sistema  │
+│  experimental.chat.system.transform  ◀── instrução de uso MCP │
 │  experimental.session.compacting     ◀── preserva memória     │
 │                                                               │
 │  ┌─────────────────────────────────────────────────────────┐ │
@@ -61,7 +61,7 @@
 | Modo | Direção | O que | Quando |
 |---|---|---|---|
 | **Push** | plugin → turno | memória + `code/search` injetados | automático, todo turno |
-| **Pull** | modelo → MCP | `recall`/`ingest`/`code_search`/`code_sync` | sob demanda do agente |
+| **Pull** | modelo → MCP | 7 tools (`recall`, `ingest`, `code_search`, `code_sync`, `code_neighbors`, `memory_episodes`, `memory_neighbors`) | sob demanda do agente |
 
 O RAG automático (valor central) é **push**. As ferramentas MCP são **pull** — o
 modelo decide. Não se injeta o mesmo que já se oferece como tool.
@@ -94,12 +94,40 @@ E11) além de `workspace`.
 
 // response
 { "facts": [ { "fact": "...", "valid_at": "...", "invalid_at": null,
-               "score": 0.83, "source": "memory" } ],
+               "score": 0.83, "source": "memory",
+               "uuid": "<fact uuid>", "episodes": ["<episode uuid>"] } ],
   "tokens_estimated": 1850, "truncated": false }
 ```
 
 > `max_tokens` (A1) é opcional: sem ele o payload é o legado exato. O corte é por
 > **fato inteiro**, sem reordenar o ranking. Estouro do teto interno (16k) → 422.
+> `uuid` e `episodes` chegam no fio desde o memtier v1.1.0 e o plugin os consome
+> desde a E8: o bloco injeta `[id=<uuid>]` do fato e `[ep=<uuid> +N]` do primeiro
+> episódio (ver §5). Um uuid truncado ou malformado devolve `[]` em silêncio nas
+> tools — por isso o marcador só sai com a forma `8-4-4-4-12` completa.
+
+#### O que `depth` faz — BFS enraizada na query
+
+`depth` liga a perna BFS do graphiti (`EdgeSearchMethod.bfs`). O memtier não
+passa `bfs_origin_node_uuids` (`memory.py:170`), então a lib deriva as origens
+das arestas casadas por BM25/vetor:
+
+```python
+source_node_uuids = [
+    edge.source_node_uuid for result in search_results for edge in result
+]
+```
+
+A expansão é `*1..depth` sobre `[:RELATES_TO|MENTIONS]`, com orçamento de
+`2 × limit`, e percorre **só arestas de saída** (`search_utils.py:544`). Como
+parte do **nó de origem** e não da aresta casada, `depth=1` já reencontra a
+aresta casada **e adiciona as irmãs** daquele nó (`memory.py:172-175`).
+
+Consequências: `depth>1` troca precisão por recall (o RRF joga os fracos para o
+fim; o corte por `maxMemories` normalmente os elimina); e **não há âncora** —
+não existe `uuid` no body, então não dá para "expandir este fato". Ver
+[RFC-001 §5](rfc/001-navegacao-e-integridade-do-grafo-de-codigo.md) para o
+achado e as propostas.
 
 ### `POST /v1/code/search`
 
@@ -109,9 +137,10 @@ E11) além de `workspace`.
   "labels": ["CodeSymbol"], "max_tokens": 2000, "min_score": 0.6 }
 
 // response
-{ "chunks": [ { "path": "internal/billing/store.go", "symbol": "SaveInvoice",
-                "start_line": 42, "end_line": 55, "code": "...",
-                "score": 0.79, "raw_score": 0.74, "match": "hybrid" } ] }
+{ "chunks": [ { "uuid": "39e6c181-...", "path": "internal/billing/store.go",
+                "symbol": "SaveInvoice", "start_line": 42, "end_line": 55,
+                "code": "...", "score": 0.79, "raw_score": 0.74,
+                "match": "hybrid" } ] }
 ```
 
 `labels=None` → `["CodeChunk"]` (default do servidor; o plugin manda
@@ -170,7 +199,7 @@ Regras do contrato (memtier ARCH §2):
 - `changed`/`skipped` (A2) são aditivos; `upserted + skipped == total` quando o
   sync grava todos os chunks do payload.
 
-### `POST /v1/code/neighbors` — **HTTP-only (bloqueio MCP)**
+### `POST /v1/code/neighbors`
 
 ```json
 // request
@@ -178,13 +207,75 @@ Regras do contrato (memtier ARCH §2):
   "direction": "out|in|both", "edge_kind": "import|call|all", "depth": 1, "limit": 20 }
 
 // response
-{ "neighbors": [ { "file_path": "...", "symbol": "...", "edge": { "kind": "call" } } ],
+{ "neighbors": [ { "uuid": "...", "file_path": "...", "symbol": "...",
+                   "chunk_kind": "Symbol", "start_line": 69, "end_line": 74,
+                   "code": "...",
+                   "edge": { "kind": "call", "direction": "in",
+                             "from_uuid": "...", "to_uuid": "..." } } ],
   "total_neighbors": 2, "truncated": false }
 ```
 
-> ⚠️ **Bloqueio:** esta rota **não tem tool MCP** no memtier (só `recall`,
-> `ingest`, `code_search`, `code_sync` são expostas). O plugin **não** promete
-> navegação por vizinhos até o memtier expor a tool. `depth>1` → 422.
+> **Tool MCP:** `code_neighbors` (desde o memtier v1.1.0). O `uuid` de entrada é
+> o 9º campo de `code_search` — não recalcular `uuid5` no cliente. `depth>1`
+> continua 422: multi-hop de código foi adiado com medição (RFC-004 D6).
+
+Não é BFS: é travessia de profundidade fixa 1, sem `*1..N` no Cypher
+(`code.py:1526`). O campo `depth` existe no schema com teto 1
+(`main.py:1158`, `ge=1, le=1`) — `depth=2` responde 422. Multi-hop só no
+cliente, encadeando chamadas. Em compensação, é **ancorado no nó** (`uuid`) e
+expressivo (direção + `edge_kind`), o oposto do `recall`. Comparação lado a
+lado e propostas em
+[RFC-001 §5](rfc/001-navegacao-e-integridade-do-grafo-de-codigo.md).
+
+### `POST /v1/memory/episodes` — navegação **documental** (v1.1.0)
+
+Troca uuid de episódio por **`content`** (o texto original). Lote de 1..5, sem
+duplicata. Read-only, zero LLM.
+
+```json
+// request
+{ "workspace": "waweb", "program": "default", "uuids": ["<uuid>"] }
+
+// response
+{ "episodes": [ { "uuid": "...", "name": "ep-0eec5ace", "source": "message",
+                  "source_description": "cli-session",
+                  "valid_at": "...", "created_at": "...", "content": "..." } ],
+  "requested": 1, "resolved": 1 }
+```
+
+Uuid ausente no workspace é **omitido** (nunca 404 — omitir evita oráculo de
+existência) e `resolved < requested` sinaliza a omissão. Estouro do teto de
+16k tokens → **422**, nunca truncar. `entity_edges` e `group_id` nunca saem.
+
+> Medido: `content` de 2.436 chars no caso amostrado (máx 47.058 no grafo
+> `alfa`). Um episódio no teto de ingestão já estoura o orçamento sozinho — por
+> isso o lote é pequeno.
+
+### `POST /v1/memory/neighbors` — navegação **topológica** (v1.1.0)
+
+Dado o **uuid do fato** (o que `recall` devolve em `fact.uuid`), devolve os
+fatos vizinhos por aresta `RELATES_TO`, **não-dirigido** (as duas pontas),
+**1 salto**, excluindo a própria âncora.
+
+```json
+// request
+{ "workspace": "waweb", "program": "default", "uuid": "<uuid do fato>",
+  "limit": 10, "include_invalid": false }
+
+// response
+{ "neighbors": [ { "uuid": "...", "fact": "...", "name": "CONTAINS",
+                   "valid_at": "...", "invalid_at": null,
+                   "source": "memory", "episodes": ["..."] } ],
+  "total_neighbors": 7, "truncated": false }
+```
+
+`limit` 1..25 (default 10). Ordem: `valid_at` DESC com **nulos por último**,
+depois `uuid` ASC. `include_invalid=false` (default) exclui supersedidos, mesma
+semântica do `recall` (ADR-009). Uuid desconhecido → 200 com `[]`.
+
+> A âncora é a **aresta**, não o nó: a BFS da lib segue só arestas de saída e
+> perderia o outro lado do fato. `name` é a relação (`CONTAINS`,
+> `PROVIDES_BASE_FOR`) — sem ele o cliente não sabe o que liga os dois fatos.
 
 ### `POST /v1/ingest`
 
@@ -210,9 +301,10 @@ Usado pelo E5 (degradação) para decidir se injeta ou segue sem memória.
 
 Transporte **Streamable HTTP**, `stateless_http=True`. O plugin **registra** este
 MCP remoto no Kilo (ver §3, `src/mcp/`); o bearer viaja no header
-`Authorization`. Tools: `recall`, `ingest`, `code_search`, `code_sync`. Auth é
-validada por middleware **antes** de qualquer tool (sem token → 401; IAM down →
-503 fail-closed).
+`Authorization`. Tools (7, desde o memtier v1.1.0): `recall`, `ingest`,
+`code_search`, `code_sync`, `code_neighbors`, `memory_episodes`,
+`memory_neighbors`. Auth é validada por middleware **antes** de qualquer tool
+(sem token → 401; IAM down → 503 fail-closed).
 
 ## 3. Componentes
 
@@ -423,27 +515,54 @@ Blocos distintos, com procedência (FR-105) — o modelo precisa saber o que é 
 de memória e o que é código do repo. Cada família vira um **part separado** no
 mesmo turno (não há um segundo `transform`), com **sentinela própria**.
 
-Memória (sentinela `graph-memory`):
+Memória (sentinela `graph-memory`). Os marcadores de identidade vêm **no fim**
+da linha, com o uuid **completo** (36 chars): `[id=…]` é o uuid do fato, que
+`memory_neighbors` recebe em `uuid`; `[ep=…]` é o uuid do **primeiro** episódio
+(`+N` conta os demais), que `memory_episodes` recebe em `uuids`. Sem marcador
+válido a linha fica byte-idêntica à do formato antigo.
 
 ```
 <context graph-memory="true">
 [CONTEXTO DE MEMÓRIA]
-- O backend do Atlas roda em PostgreSQL 16 (válido desde 2026-04-22)
+- O backend do Atlas roda em PostgreSQL 16 (válido desde 2026-04-22) [id=3f2504e0-4f89-11d3-9a0c-0305e82c3301] [ep=cdd38cb4-7eea-4b8f-9f13-3c1e6a2b9d47 +1]
 - O timeout de conexão foi ajustado para 30s
 </context>
 ```
 
 Código (sentinela `graph-code`), com procedência **por chunk** — um cabeçalho
-`[CÓDIGO RELEVANTE — path:inicio-fim]` antes de cada trecho:
+`[CÓDIGO RELEVANTE — path:inicio-fim]` antes de cada trecho, seguido de
+`[id=<uuid do chunk>]` quando o servidor manda o 9º campo (é a entrada de
+`code_neighbors`):
 
 ```
 <context graph-code="true">
-[CÓDIGO RELEVANTE — internal/billing/store.go:42-55]
+[CÓDIGO RELEVANTE — internal/billing/store.go:42-55] [id=39e6c181-6a0e-4d5c-8b2b-7b0e5f2c9a11]
 func SaveInvoice(ctx context.Context, inv *Invoice) error {
     return db.Insert(ctx, "invoices", inv)
 }
 </context>
 ```
+
+> **Sem `score`.** O bloco **não** carrega `score`/`raw_score` (RFC-001 §3): o
+> `score` é normalizado pelo top-1 da própria consulta (o topo é sempre `1.0`),
+> logo não é comparável entre itens nem entre consultas — a **ordem** já dá o
+> ranking. O `raw_score` (magnitude) fica no cliente, para o `min_score` do
+> servidor, e nunca entra no bloco.
+>
+> **Ausência degrada visivelmente.** Servidor anterior ao v1.1.0 não manda os
+> campos: o marcador é omitido **sem** log (degradação esperada). Campo presente
+> com forma inválida (`8-4-4-4-12` é a única aceita) é omitido **com um** aviso
+> por turno por família — o mesmo padrão de `warnIfFloorNotHonored`. O valor
+> inválido é **omitido**, nunca escapado: o formato não admite `<`, `>`, espaço
+> nem quebra de linha, então `[ep=</context>]` não fura a sentinela.
+>
+> **Dedup.** A memória deduplica por `factKey` — uuid validado, com fallback para
+> `text:<fato>` (servidor antigo). O código continua em `chunkIdentity`
+> (`path:inicio-fim`): é guarda local do turno, não identidade de grafo.
+>
+> **Instrução de sistema.** O bloco carrega os ids e **nada mais**; o protocolo
+> de como expandi-los vive no `system.transform` (§3), que só é efetivo com
+> `inject.enabled` **e** `mcp.enabled`.
 
 > **Ordem e orçamento.** A memória é injetada **antes** do código. O teto de
 > **volume** é por endpoint, no servidor (`inject.memory_max_tokens` /
@@ -491,6 +610,7 @@ Nada hardcoded no script (FR-303). **JSON** + env vars, precedência:
     "max_code_chunks": 3,                 // E3c — nº de chunks de código
     "code_labels": ["CodeSymbol"],        // D5 — labels da busca (CSV/JSON na env)
     // "code_min_score": 0.6,             // D7 — piso de relevância (AUSENTE = desligado)
+    "instruction_enabled": true,          // E8 — instrução de uso do memtier no system prompt
   },
   "code_index": {                         // E3a — o coletor
     "enabled": false,                     // ativado por flag, como hoje
@@ -524,7 +644,7 @@ Nada hardcoded no script (FR-303). **JSON** + env vars, precedência:
 > `INJECT_ENABLED`, `INJECT_MAX_MEMORIES`, `INJECT_MEMORY_MAX_TOKENS`,
 > `INJECT_CODE_MAX_TOKENS`, `INJECT_TIMEOUT_MS`, `INJECT_CODE_ENABLED`,
 > `INJECT_MAX_CODE_CHUNKS`, `INJECT_CODE_LABELS`, `INJECT_CODE_MIN_SCORE`,
-> `INDEX_ENABLED`, `INDEXER_BIN`,
+> `INJECT_INSTRUCTION_ENABLED`, `INDEX_ENABLED`, `INDEXER_BIN`,
 > `INDEX_SYNC_TIMEOUT_MS`, `INDEX_LOAD_IGNORES`, `MCP_ENABLED`, `MCP_NAME`, `DEBUG`,
 > `INGEST_ENABLED`, `INGEST_BATCH_SIZE`, `INGEST_MAX_HASHES`, `INGEST_TIMEOUT_MS`,
 > `MANAGER_TOKEN`, `WORKSPACE`. O prefixo da env de config é `KILOCODE_GRAPH_` (o
@@ -534,6 +654,18 @@ Nada hardcoded no script (FR-303). **JSON** + env vars, precedência:
 > deixaram de ser lidas; se setadas no ambiente, o boot emite **um** log de
 > depreciação e as ignora (quem calibrou não perde o ajuste em silêncio) — as
 > substitutas são `INJECT_MEMORY_MAX_TOKENS`/`INJECT_CODE_MAX_TOKENS`.
+>
+> **`inject.instruction_enabled` (E8).** Env
+> `KILOCODE_GRAPH_INJECT_INSTRUCTION_ENABLED`, default **`true`** — o único
+> booleano de `inject.*` com default ligado, e o comportamento global não muda:
+> com `inject.enabled=false` (o default) nada é injetado nem instruído. Governa o
+> TEXTO, não o bloco: desligar mantém os `[id=…]`/`[ep=…]` (ainda servem para
+> citar). Efetiva só com `inject.enabled=true` **e** `mcp.enabled=true`; não é
+> persistida em `.kilo/graph-config.json` (o CLI não lê flags de injeção).
+>
+> **Custo da instrução.** Reenviada a cada turno: o teto é contrato de teste
+> (`≤ 1000` chars, unidade `chars/4` do ADR-009; a redação final mede 707 com
+> código e 555 só com memória).
 >
 > **Clamp do `max_tokens` (D8) — vale para os DOIS tetos.** Um valor acima do teto interno do servidor
 > (16000, `MAX_RESPONSE_TOKENS` — acima dele o memtier responde **422**) é
