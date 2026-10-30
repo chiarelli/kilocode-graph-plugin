@@ -242,7 +242,8 @@ export interface Identity {
  * Um fato de memória do recall (E2-S1). Espelha o contrato do memtier
  * (`memory.py:_serialize_fact`): `fact` é a frase atômica, `valid_at`/
  * `invalid_at` são ISO-8601 (ou `null`) e `score` é a relevância. `source` é
- * `"memory"`; `uuid`/`episodes` existem no fio mas a E2 não os consome.
+ * `"memory"`; `uuid`/`episodes` são a identidade que as tools MCP usam como
+ * entrada (E8-S1).
  */
 export interface Fact {
   fact: string;
@@ -250,6 +251,13 @@ export interface Fact {
   invalid_at: string | null;
   score: number;
   source?: string;
+  /**
+   * uuid do fato (`memory.py:_serialize_fact`, v1.1.0). Ausente ⇒ servidor
+   * anterior ao contrato; o bloco omite o marcador (E8 decisão 2).
+   */
+  uuid?: string;
+  /** uuids dos episódios de origem; o bloco usa só o primeiro (`[ep=… +N]`). */
+  episodes?: string[];
 }
 
 /** Opções do recall (E2-S1). `maxTokens` liga o orçamento A1 no servidor. */
@@ -288,6 +296,11 @@ export interface CodeChunkHit {
    */
   raw_score?: number;
   match: string;
+  /**
+   * uuid do vértice do chunk (9º campo aditivo do `code/search`, v1.1.0).
+   * Ausente ⇒ servidor antigo; o cabeçalho omite `[id=…]` (E8 decisão 2).
+   */
+  uuid?: string;
 }
 
 /**

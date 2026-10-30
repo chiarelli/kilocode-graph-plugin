@@ -660,3 +660,29 @@ v1.1.0 o uuid vem na própria resposta de `code_search`, então:
       acrescentados; `factKey`/`isValidUuid` com unhappy path.
   12. Auditoria de impacto nos testes existentes refeita por arquivo, e a
       condição "byte-idêntico" passou a ser assertada, não argumentada.
+
+- **2026-10-30 — E8-S1 implementada.** Contrato aditivo como especificado:
+  `Fact.uuid?`/`Fact.episodes?` e `CodeChunkHit.uuid?` (`src/client.ts`),
+  `src/inject/uuid.ts` (`isValidUuid`, `8-4-4-4-12` minúsculo), marcadores
+  `[id=…]`/`[ep=… +N]` em `formatFact`/`chunkHeader`, `factKey` com fallback
+  `text:`, dedup por uuid em `prepare`/`commit` e aviso booleano por turno por
+  família em `MemoryInjector`/`CodeInjector`. `chunkIdentity` segue
+  `path:start-end`. 29 testes novos em `tests/e8_s1.test.ts`; suíte 642
+  (621 pass, 21 skip, 0 fail).
+
+  **Revisão adversarial (3 perfis em paralelo) — achados corrigidos:**
+  1. **Contador desonesto** — `invalidIdentityCount` somava por CAMPO; um fato
+     com `uuid` e `episodes[0]` tortos logava "2 itens" para 1 item. Passou a
+     contar o ITEM (fato), como a decisão 2 manda (`N item(ns)`).
+  2. **`episodes` não-array degradava em silêncio** — campo presente fora da
+     forma (string/objeto) omitia `[ep=]` sem aviso, contra a decisão 2. Agora
+     conta como item afetado e emite o aviso.
+  3. **Memória avulsa (`recallAndFormat`) não avisava** — só o caminho de turno
+     e o código avulso avisavam; assimetria contra "degradar sem avisar não".
+     Agora avisa por chamada (sem estado de turno), com teste dedicado.
+  4. Cobertura reforçada: hífen fora de 8/13/18/23, `episodes` não-array,
+     contagem por item, avulso (presente/ausente) e bloco vazio ⇒ `null`.
+  5. Refutado com evidência: `dedupeByFactKey` (dedup intra-resposta) não é
+     regressão — espelha `dedupeByIdentity` do código e é exigido por
+     `dedup_key_falls_back_to_text`; `warnInvalidIds` em `prepare` cobre
+     `inject`/hook, pois ambos passam por `prepare`.
