@@ -587,7 +587,12 @@ test("collect_forwards_backpressure_and_cpu_guard: opções do operador vão ao 
     },
   });
   await collectCode(rt);
-  assert.deepEqual(seen.backpressure, { max_queue_size: 64, threshold_percent: 85 });
+  // O operador manda no teto por EVENTOS; o teto por BYTES vem do orçamento do
+  // boot (proteção contra chunk gigante) e nunca é zero.
+  const bp = seen.backpressure as { max_queue_size: number; threshold_percent: number; max_queue_bytes: number };
+  assert.equal(bp.max_queue_size, 64);
+  assert.equal(bp.threshold_percent, 85);
+  assert.ok(bp.max_queue_bytes > 0, "teto em bytes deve ser aplicado");
   assert.equal((seen.cpuGuard as { enabled: boolean }).enabled, false);
 });
 

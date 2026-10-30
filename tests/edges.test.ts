@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { collectEdges, buildSyncBody } from "../src/index/collector.ts";
-import { resolveEdges, resolveModule } from "../src/index/edges.ts";
+import { buildEdgeIndex, resolveEdges, resolveModule } from "../src/index/edges.ts";
 import type { CodeFile, IndexerEvent } from "../src/types.ts";
 
 /** Arquivo com chunks Symbol (nome puro). */
@@ -206,4 +206,59 @@ test("collect_edges_splits: events separados em imports/calls", () => {
   const { imports, calls } = collectEdges(events);
   assert.equal(imports.length, 1);
   assert.equal(calls.length, 1);
+});
+
+test("edges_file_defining: lookup direto devolve o primeiro definidor", () => {
+  const idx = buildEdgeIndex([
+    { filePath: "a.ts", symbols: ["shared", "onlyA"], hasFileChunk: true },
+    { filePath: "b.ts", symbols: ["shared", "onlyB"], hasFileChunk: true },
+  ]);
+  assert.equal(idx.fileDefining("shared"), "a.ts");
+  assert.equal(idx.fileDefining("onlyB"), "b.ts");
+  assert.equal(idx.fileDefining("naoExiste"), null);
+});
+
+test("edges_resolve_call_uses_defining_file: chamada resolve sem varrer paths", () => {
+  const files: CodeFile[] = [
+    {
+      file_path: "a.ts",
+      language: "typescript",
+      chunks: [
+        { chunk_id: "a#caller", chunk_kind: "Symbol", symbol_id: "caller", start_line: 1, end_line: 2, chunk_md5: "m1", text: "x" },
+      ],
+    },
+    {
+      file_path: "z.ts",
+      language: "typescript",
+      chunks: [
+        { chunk_id: "z#late", chunk_kind: "Symbol", symbol_id: "late", start_line: 1, end_line: 2, chunk_md5: "m2", text: "y" },
+      ],
+    },
+  ];
+  const edges = resolveEdges(
+    [],
+    [{ from_file: "a.ts", caller_symbol_id: "caller", callee_name: "late" }],
+    files,
+  );
+  assert.equal(edges.length, 1);
+  assert.equal(edges[0]!.to_file, "z.ts");
+  assert.equal(edges[0]!.to_symbol_id, "late");
+});
+
+test("edges_resolve_call_missing: callee inexistente é descartado", () => {
+  const files: CodeFile[] = [
+    {
+      file_path: "a.ts",
+      language: "typescript",
+      chunks: [
+        { chunk_id: "a#caller", chunk_kind: "Symbol", symbol_id: "caller", start_line: 1, end_line: 2, chunk_md5: "m1", text: "x" },
+      ],
+    },
+  ];
+  const edges = resolveEdges(
+    [],
+    [{ from_file: "a.ts", caller_symbol_id: "caller", callee_name: "nope" }],
+    files,
+  );
+  assert.deepEqual(edges, []);
 });

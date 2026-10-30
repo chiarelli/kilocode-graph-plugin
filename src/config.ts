@@ -36,6 +36,7 @@ import {
   type ChunkingOptions,
   type Config,
   type CpuGuardOptions,
+  type IndexLimits,
 } from "./types.ts";
 
 /**
@@ -139,6 +140,12 @@ export const DEFAULTS = {
       max_pause_ms: 30_000,
       nice: 10,
     } as CpuGuardOptions,
+    // Concorrência/limites/lote/teto de full: `undefined` ⇒ derivado do
+    // orçamento do boot (`index/budget.ts`), nunca hardcoded. Explícito vence.
+    max_concurrency: undefined as number | undefined,
+    limits: undefined as IndexLimits | undefined,
+    sync_batch_size: undefined as number | undefined,
+    max_full_files: undefined as number | undefined,
   },
   ingest: {
     // Defaults desligados (preferência do dono, coerente com index/inject).
@@ -392,6 +399,8 @@ function isBackpressureOptions(v: unknown): v is BackpressureOptions {
     return false;
   }
   if (v.ack_required !== undefined && typeof v.ack_required !== "boolean") return false;
+  const mb = v.max_queue_bytes;
+  if (mb !== undefined && (!Number.isInteger(mb) || (mb as number) <= 0)) return false;
   const p = v.pause_timeout_secs;
   if (p !== undefined && (!Number.isInteger(p) || (p as number) < 0)) return false;
   return true;
@@ -465,6 +474,73 @@ function resolveCpuGuard(
     }
   }
   return fallback;
+}
+
+function isIndexLimits(v: unknown): v is IndexLimits {
+  if (!isPlainObject(v)) return false;
+  for (const k of ["max_file_bytes", "max_chunk_bytes", "max_chunks_per_file"]) {
+    const n = v[k];
+    if (n !== undefined && (!Number.isInteger(n) || (n as number) <= 0)) return false;
+  }
+  return true;
+}
+
+/**
+ * Resolve `code_index.max_concurrency` por precedência. Inteiro positivo em
+ * [1, 8] passa; o resto cai em `undefined` (o orçamento do boot decide).
+ */
+function resolveMaxConcurrency(
+  val: unknown,
+  envValue: string | undefined,
+  fileValue: string | undefined,
+): number | undefined {
+  const raw =
+    typeof val === "number"
+      ? val
+      : val !== undefined && val !== null
+        ? Number(String(val))
+        : envValue ?? fileValue;
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isInteger(n) || n <= 0) return undefined;
+  return Math.min(8, Math.max(1, n));
+}
+
+/** Inteiro positivo (`max_full_files`, `sync_batch_size`); inválido ⇒ `undefined`. */
+function resolvePositiveOrUndefined(
+  val: unknown,
+  envValue: string | undefined,
+  fileValue: string | undefined,
+): number | undefined {
+  const raw =
+    typeof val === "number"
+      ? val
+      : val !== undefined && val !== null
+        ? Number(String(val))
+        : envValue ?? fileValue;
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isInteger(n) || n <= 0) return undefined;
+  return n;
+}
+
+/** `code_index.limits`: objeto válido, JSON válido ou `undefined`. */
+function resolveIndexLimits(
+  val: unknown,
+  envValue: string | undefined,
+  fileValue: string | undefined,
+): IndexLimits | undefined {
+  if (val === undefined || val === null) {
+    const raw = envValue ?? fileValue;
+    if (raw === undefined) return undefined;
+    const text = raw.trim();
+    if (text === "" || text === "undefined") return undefined;
+    try {
+      const parsed = JSON.parse(text) as unknown;
+      return isIndexLimits(parsed) ? { ...(parsed as IndexLimits) } : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  return isIndexLimits(val) ? { ...(val as IndexLimits) } : undefined;
 }
 
 function globalConfigDir(): string {
@@ -785,6 +861,26 @@ export function loadConfig(
         filePick(file, "code_index.cpu_guard"),
         DEFAULTS.code_index.cpu_guard,
       ),
+      max_concurrency: resolveMaxConcurrency(
+        pick(options, "code_index.max_concurrency"),
+        env.KILOCODE_GRAPH_INDEX_MAX_CONCURRENCY,
+        filePick(file, "code_index.max_concurrency"),
+      ),
+      limits: resolveIndexLimits(
+        pick(options, "code_index.limits"),
+        env.KILOCODE_GRAPH_INDEX_LIMITS,
+        filePick(file, "code_index.limits"),
+      ),
+      sync_batch_size: resolvePositiveOrUndefined(
+        pick(options, "code_index.sync_batch_size"),
+        env.KILOCODE_GRAPH_INDEX_SYNC_BATCH_SIZE,
+        filePick(file, "code_index.sync_batch_size"),
+      ),
+      max_full_files: resolvePositiveOrUndefined(
+        pick(options, "code_index.max_full_files"),
+        env.KILOCODE_GRAPH_INDEX_MAX_FULL_FILES,
+        filePick(file, "code_index.max_full_files"),
+      ),
     },
     ingest: {
       enabled: resolveBool(
@@ -888,6 +984,10 @@ export function configStateFrom(config: Config): PluginOptions {
       chunking: config.code_index.chunking,
       backpressure: config.code_index.backpressure,
       cpu_guard: config.code_index.cpu_guard,
+      max_concurrency: config.code_index.max_concurrency,
+      limits: config.code_index.limits,
+      sync_batch_size: config.code_index.sync_batch_size,
+      max_full_files: config.code_index.max_full_files,
     },
     ingest: {
       enabled: config.ingest.enabled,

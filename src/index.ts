@@ -21,6 +21,8 @@ import {
 import { createGitPort } from "./index/git.ts";
 import { installHooks } from "./index/install-hooks.ts";
 import { cliPath, spawnCollectCli } from "./cli-spawn.ts";
+import { formatBudgetLine } from "./index/budget.ts";
+import { resolveBudget } from "./hooks/collect.ts";
 import { resolveTokenFile } from "./token-file.ts";
 import { ingestHook } from "./hooks/ingest.ts";
 import { messagesHook } from "./hooks/messages.ts";
@@ -131,6 +133,25 @@ const plugin = async (ctx: PluginCtx, options?: PluginOptions) => {
   //   3. instala os hooks git (§1) — idempotente, sem `core.hooksPath`.
   // Tudo fora do caminho crítico e à prova de falha (nunca derruba o boot).
   if (config.code_index.enabled) {
+    // Orçamento do boot: logado ANTES de qualquer spawn para o operador ver o
+    // que governa o pico de RAM (RAM/cgroup, fila, concorrência, limites).
+    const budget = resolveBudget({
+      enabled: config.code_index.enabled,
+      indexer_bin: config.code_index.indexer_bin,
+      load_ignores: config.code_index.load_ignores,
+      chunking: config.code_index.chunking,
+      backpressure: config.code_index.backpressure,
+      cpu_guard: config.code_index.cpu_guard,
+      max_concurrency: config.code_index.max_concurrency,
+      limits: config.code_index.limits,
+      sync_batch_size: config.code_index.sync_batch_size,
+      max_full_files: config.code_index.max_full_files,
+    });
+    log(formatBudgetLine(budget));
+    log(
+      `collect: indexer_bin=${config.code_index.indexer_bin || "<vazio>"} ` +
+        `load_ignores=${config.code_index.load_ignores ?? false}`,
+    );
     persistConfigState(dir, config);
     spawnCollectCli({
       workspace: dir,

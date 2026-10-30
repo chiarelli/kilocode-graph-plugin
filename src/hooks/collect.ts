@@ -27,8 +27,15 @@ import {
   saveManifest,
 } from "../index/manifest.ts";
 import { runIndexer, type IndexMode } from "../index/runner.ts";
+import {
+  applyOverrides,
+  computeBudget,
+  procMemoryReaders,
+  type EffectiveIndexBudget,
+} from "../index/budget.ts";
 import { decideTrigger, type TriggerDecision } from "../index/trigger.ts";
 import { join } from "node:path";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { chunkingFingerprint, type ChunkingOptions, type SyncResult } from "../types.ts";
 
 /** Config do coletor (subconjunto de `code_index.*`). */
@@ -52,6 +59,20 @@ export interface CollectConfig {
   backpressure?: import("../types.ts").BackpressureOptions | false;
   /** Guarda de CPU (nice + pausa em 85% do sistema). `false` ⇒ desligada. */
   cpu_guard?: import("../types.ts").CpuGuardOptions | false;
+  /**
+   * Orçamento efetivo do boot (`computeBudget` + overrides). Quando presente, o
+   * coletor deriva `maxConcurrency`/`limits`/`batchSize`/`maxFullFiles` dele;
+   * campos explícitos de `CollectConfig` vencem o calculado.
+   */
+  budget?: import("../index/budget.ts").EffectiveIndexBudget;
+  /** Concorrência do indexer (explícita vence o orçamento). */
+  max_concurrency?: number;
+  /** Limites de conteúdo (explícitos vencem o orçamento). */
+  limits?: import("../types.ts").IndexLimits;
+  /** Arquivos por lote de sync (explícito vence o orçamento). */
+  sync_batch_size?: number;
+  /** Teto de arquivos num full (explícito vence o orçamento). */
+  max_full_files?: number;
 }
 
 /** Dependências do hook (injetáveis para teste, sem spawn real). */
@@ -237,6 +258,123 @@ async function currentHead(repoRoot: string): Promise<string | null> {
   });
 }
 
+/** Diagnóstico de uma coleta que NÃO sincronizou (lido pelo operador/UI). */
+export const FAILED_REL_PATH = ".kilo/graph-failed.json";
+
+/** Grava o diagnóstico da falha. Nunca lança (é observabilidade). */
+function writeFailure(
+  repoRoot: string,
+  info: {
+    code: string;
+    message: string;
+    mode: IndexMode;
+    source?: string;
+    files?: number;
+    at: string;
+  },
+): void {
+  try {
+    // O diretório `.kilo/` pode não existir num repo recém-clonado — sem o
+    // mkdir o diagnóstico falhava em silêncio justamente no 1º boot.
+    mkdirSync(join(repoRoot, ".kilo"), { recursive: true });
+    writeFileSync(
+      join(repoRoot, FAILED_REL_PATH),
+      `${JSON.stringify(info, null, 2)}\n`,
+      "utf-8",
+    );
+  } catch {
+    // Sem FS gravável: o log já registrou.
+  }
+}
+
+/** Remove o diagnóstico após um sync bem-sucedido. */
+function clearFailure(repoRoot: string): void {
+  try {
+    rmSync(join(repoRoot, FAILED_REL_PATH), { force: true });
+  } catch {
+    // melhor esforço
+  }
+}
+
+/** Extensões-fonte reconhecidas (as mesmas do indexer). */
+const SOURCE_EXT = /\.(rs|go|py|ts|tsx|js|jsx|java)$/;
+
+/**
+ * Conta arquivos-fonte ANTES do full: com `load_ignores` usa `git ls-files
+ * --exclude-standard` (o MESMO escopo do indexer); sem git, varre o diretório.
+ * `null` ⇒ indeterminado (não recusa — o teto é proteção, não bloqueio cego).
+ */
+async function countSourceFiles(
+  repoRoot: string,
+  loadIgnores: boolean,
+): Promise<number | null> {
+  if (loadIgnores) {
+    const { execFile } = await import("node:child_process");
+    return new Promise((resolve) => {
+      execFile(
+        "git",
+        ["-C", repoRoot, "ls-files", "--cached", "--others", "--exclude-standard"],
+        { maxBuffer: 64 * 1024 * 1024 },
+        (err, stdout) => {
+          if (err) {
+            resolve(null);
+            return;
+          }
+          const lines = (stdout as string).split("\n");
+          let n = 0;
+          for (const line of lines) if (SOURCE_EXT.test(line.trim())) n++;
+          resolve(n);
+        },
+      );
+    });
+  }
+  try {
+    const { readdirSync, statSync } = await import("node:fs");
+    let n = 0;
+    const walk = (dir: string, depth: number): void => {
+      if (depth > 24) return; // profundidade absurda ⇒ não conta infinito
+      let names: string[];
+      try {
+        names = readdirSync(dir) as string[];
+      } catch {
+        return;
+      }
+      for (const name of names) {
+        if (name === "node_modules" || name === ".git" || name === "target") continue;
+        const full = join(dir, name);
+        let isDir = false;
+        try {
+          isDir = statSync(full).isDirectory();
+        } catch {
+          continue;
+        }
+        if (isDir) walk(full, depth + 1);
+        else if (SOURCE_EXT.test(name)) n++;
+      }
+    };
+    walk(repoRoot, 0);
+    return n;
+  } catch {
+    return null;
+  }
+}
+
+/** Orçamento efetivo da coleta: cálculo do boot + overrides de `code_index`. */
+export function resolveBudget(cfg: CollectConfig): EffectiveIndexBudget {
+  const base = cfg.budget ?? computeBudget(procMemoryReaders);
+  return applyOverrides(base, {
+    ...(cfg.max_concurrency !== undefined
+      ? { max_concurrency: cfg.max_concurrency }
+      : {}),
+    ...(cfg.sync_batch_size !== undefined
+      ? { sync_batch_size: cfg.sync_batch_size }
+      : {}),
+    ...(cfg.max_full_files !== undefined ? { max_full_files: cfg.max_full_files } : {}),
+    ...(cfg.limits !== undefined ? { limits: cfg.limits } : {}),
+    backpressure: cfg.backpressure,
+  });
+}
+
 /**
  * Coleta completa: decide full/incremental (trigger), spawna o indexer, monta o
  * body (removidos do manifest) e chama `/v1/code/sync`. **Nunca lança** — degrada
@@ -360,6 +498,41 @@ async function collectUnderLock(
     return null;
   }
 
+  // Orçamento efetivo: pico de RAM = f(budget), não do tamanho do repo.
+  const budget = resolveBudget(rt.cfg);
+
+  // Recusa de full GIGANTE (retry cego): um repo com mais arquivos-fonte que o
+  // teto não é indexado sem o operador decidir — senão todo boot refaz um full
+  // que estoura RAM/CPU e nunca termina. `max_full_files` explícito permite.
+  if (mode === "full" && !rt.forceMode /* auto/boot */) {
+    const count = await countSourceFiles(rt.repoRoot, rt.cfg.load_ignores ?? false);
+    if (count !== null && count > budget.maxFullFiles) {
+      const message =
+        `full recusado: ${count} arquivos-fonte acima do teto ` +
+        `(${budget.maxFullFiles}). Ajuste code_index.max_full_files ou ` +
+        `rode --mode full explicitamente.`;
+      log(`collect: ${message}`);
+      writeFailure(rt.repoRoot, {
+        code: "FULL_TOO_LARGE",
+        message,
+        mode,
+        source: rt.source,
+        files: count,
+        at: new Date().toISOString(),
+      });
+      logCollection(rt, {
+        mode,
+        trigger: rt.forceMode,
+        indexerMs: 0,
+        files: 0,
+        edges: 0,
+        removed: 0,
+        skip: "full acima do teto",
+      });
+      return null;
+    }
+  }
+
   // Spool em DISCO: os eventos vão para arquivos temporários durante o job, em
   // vez de um `events[]` com o corpus inteiro. O sync lê lote a lote depois.
   const spool = EventSpool.create();
@@ -372,7 +545,18 @@ async function collectUnderLock(
       gitRange: trigger.gitRange,
       loadIgnores: rt.cfg.load_ignores ?? false,
       chunking: rt.cfg.chunking,
-      backpressure: rt.cfg.backpressure,
+      backpressure:
+        rt.cfg.backpressure === false
+          ? false
+          : {
+              ...(rt.cfg.backpressure ?? {}),
+              max_queue_size: budget.maxQueueSize,
+              max_queue_bytes: budget.maxQueueBytes,
+            },
+      // Concorrência e limites: SEMPRE enviados (o default do indexer é
+      // `num_cpus`, e sem limites o chunk de 9 MB é parseado inteiro).
+      maxConcurrency: budget.maxConcurrency,
+      limits: budget.limits,
       // No Windows não há SIGSTOP/SIGCONT: a guarda fica desligada.
       cpuGuard:
         process.platform === "win32" ? false : rt.cfg.cpu_guard,
@@ -387,10 +571,21 @@ async function collectUnderLock(
   // Runner injetado (teste) devolve `events` em vez de chamar `onEvent`: grava
   // no MESMO spool para o caminho de sync ser único.
   for (const ev of result.events) spool.write(ev);
-  spool.close();
+  // Commit SÓ após job sem erro: um spool incompleto nunca é consumido (os
+  // ausentes do stream seriam tratados como removidos e apagariam o grafo).
+  const failedBeforeCommit = result.skipped || Boolean(result.error);
+  if (failedBeforeCommit) spool.close();
+  else spool.commit();
   const indexerMs = Date.now() - start;
 
   if (result.skipped) {
+    writeFailure(rt.repoRoot, {
+      code: "INDEXER_UNAVAILABLE",
+      message: result.reason ?? "indexer indisponível",
+      mode,
+      source: rt.source,
+      at: new Date().toISOString(),
+    });
     spool.dispose();
     logCollection(rt, {
       mode,
@@ -409,6 +604,13 @@ async function collectUnderLock(
   // num full marcaria TODO o manifest como removido e apagaria o grafo
   // (chunks:[]). Aborta sem sincronizar — o grafo fica intacto.
   if (result.error) {
+    writeFailure(rt.repoRoot, {
+      code: result.error.code,
+      message: result.error.message,
+      mode,
+      source: rt.source,
+      at: new Date().toISOString(),
+    });
     spool.dispose();
     log(
       `collect: indexer abortou (${result.error.code}: ${result.error.message}); ` +
@@ -492,6 +694,7 @@ async function collectUnderLock(
     const sent = await syncSpool(spool, rt.client, rt.identity, {
       repoRoot: rt.repoRoot,
       removed,
+      batchSize: budget.batchSize,
     });
     const sync = sent.sync;
     logCollection(rt, {
@@ -526,8 +729,17 @@ async function collectUnderLock(
     // `graph-ready` (§3). É o full inicial quem o cria; o incremental só roda
     // com ele presente.
     if (mode === "full") rt.onFullComplete?.();
+    clearFailure(rt.repoRoot);
     return sync;
   } catch (err) {
+    writeFailure(rt.repoRoot, {
+      code: "SYNC_FAILED",
+      message: err instanceof Error ? err.message : String(err),
+      mode,
+      source: rt.source,
+      files: present.length,
+      at: new Date().toISOString(),
+    });
     logSyncFailure(err);
     return null;
   } finally {

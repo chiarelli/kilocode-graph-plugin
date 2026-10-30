@@ -21,17 +21,38 @@
 import { createHash } from "node:crypto";
 import {
   closeSync,
+  createReadStream,
+  existsSync,
   mkdtempSync,
   mkdirSync,
   openSync,
   readFileSync,
+  renameSync,
   rmSync,
+  writeFileSync,
   writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createInterface } from "node:readline";
 
 import type { IndexerEvent } from "../types.ts";
+
+/** Marcador de spool COMPLETO (o job terminou sem erro). */
+const COMMITTED_MARKER = "COMMITTED";
+/** Marcador de spool EM ANDAMENTO (presente desde a criação). */
+const INCOMPLETE_MARKER = "INCOMPLETE";
+
+/**
+ * Spool consumido sem `commit()`: o job não terminou com sucesso. Consumir um
+ * spool incompleto trataria arquivos ainda não emitidos como removidos (wipe).
+ */
+export class SpoolNotCommittedError extends Error {
+  constructor(dir: string) {
+    super(`spool não commitado (job incompleto): ${dir}`);
+    this.name = "SpoolNotCommittedError";
+  }
+}
 
 /** Metadados de um arquivo visto no stream (nomes de símbolo, nunca o texto). */
 export interface SpoolFile {
@@ -84,6 +105,7 @@ export class EventSpool {
   private readonly edgeSinks = new Map<string, FileSink>();
   private readonly edgesDir: string;
   private closed = false;
+  private committed = false;
 
   private constructor(dir: string) {
     this.dir = dir;
@@ -91,6 +113,9 @@ export class EventSpool {
     this.edgesDir = join(dir, "edges");
     mkdirSync(this.chunksDir, { recursive: true });
     mkdirSync(this.edgesDir, { recursive: true });
+    // Estado inicial: INCOMPLETO. Só `commit()` troca a marca — um job morto
+    // (timeout/erro) deixa o spool sem commit e o consumidor recusa lê-lo.
+    writeFileSync(join(dir, INCOMPLETE_MARKER), "");
   }
 
   /** Cria o spool num diretório temporário (ou no `baseDir` dado). */
@@ -238,6 +263,42 @@ export class EventSpool {
     this.edgeSinks.clear();
   }
 
+  /**
+   * Commit ATÔMICO: fecha o spool e troca a marca `INCOMPLETE` por `COMMITTED`.
+   * Só depois disto os arquivos podem ser consumidos. Chamado pelo coletor
+   * SOMENTE após `job_completed` sem erro — um job que morreu (timeout, erro
+   * não-recuperável) deixa o spool incompleto, e o consumidor recusa lê-lo
+   * (`SpoolNotCommittedError`) em vez de tratar ausentes como removidos.
+   *
+   * O rename é o mesmo filesystem (mesmo diretório): atômico.
+   */
+  commit(): void {
+    if (this.committed) return;
+    this.close();
+    const tmp = join(this.dir, `${COMMITTED_MARKER}.tmp`);
+    const final = join(this.dir, COMMITTED_MARKER);
+    writeFileSync(tmp, "");
+    renameSync(tmp, final);
+    rmSync(join(this.dir, INCOMPLETE_MARKER), { force: true });
+    this.committed = true;
+  }
+
+  /** O job terminou com sucesso e o spool pode ser consumido? */
+  isCommitted(): boolean {
+    return this.committed;
+  }
+
+  /**
+   * Lança se o spool não foi commitado (job incompleto).
+   *
+   * `close()` sozinho NÃO é commit: o coletor só chama `commit()` depois de
+   * `job_completed` sem erro. Assim um job que morreu no meio não é consumido
+   * (ausentes virariam "removidos" e apagariam o grafo).
+   */
+  assertCommitted(): void {
+    if (!this.committed) throw new SpoolNotCommittedError(this.dir);
+  }
+
   /** Arquivos vistos, na ordem de primeira aparição. */
   files(): SpoolFile[] {
     return [...this.registry].map(([filePath, meta]) => ({
@@ -253,7 +314,7 @@ export class EventSpool {
    * Linha inválida é ignorada (mesma tolerância do runner).
    */
   readFile(filePath: string): IndexerEvent[] {
-    return this.readLines(join(this.chunksDir, fileNameFor(filePath)));
+    return this.readLinesSync(join(this.chunksDir, fileNameFor(filePath)));
   }
 
   /** Origens que têm arestas (`import_edge`/`call_edge`) no spool. */
@@ -263,11 +324,64 @@ export class EventSpool {
 
   /** Arestas cujo `from_file` é `filePath` (chamado lote a lote). */
   readEdges(filePath: string): IndexerEvent[] {
-    return this.readLines(join(this.edgesDir, fileNameFor(filePath)));
+    return this.readLinesSync(join(this.edgesDir, fileNameFor(filePath)));
+  }
+
+  /**
+   * Leitor STREAMING de `chunk_emitted` de um arquivo, linha a linha.
+   *
+   * `readFile` carrega o JSONL inteiro (`readFileSync`): um bundle minificado de
+   * 9 MB vira ~23 MB de JSONL e um lote de 100 arquivos multiplica isso. Aqui o
+   * pico é UMA linha — o consumidor processa e descarta cada evento.
+   *
+   * Retorna um `AsyncIterable`; o chamador pode parar quando quiser (o stream é
+   * fechado no `return`).
+   */
+  async *streamFile(filePath: string): AsyncGenerator<IndexerEvent> {
+    this.assertCommitted();
+    yield* this.streamLines(join(this.chunksDir, fileNameFor(filePath)));
+  }
+
+  /** Leitor STREAMING de arestas de um arquivo de origem. */
+  async *streamEdges(filePath: string): AsyncGenerator<IndexerEvent> {
+    this.assertCommitted();
+    yield* this.streamLines(join(this.edgesDir, fileNameFor(filePath)));
+  }
+
+  /** Linhas JSONL de um arquivo, uma por vez (memória ~1 evento). */
+  private async *streamLines(path: string): AsyncGenerator<IndexerEvent> {
+    // Arquivo ausente = arquivo sem chunks/arestas: fim normal, não erro.
+    if (!existsSync(path)) return;
+    const stream = createReadStream(path, {
+      encoding: "utf-8",
+      highWaterMark: 64 * 1024,
+    });
+    const rl = createInterface({ input: stream, crlfDelay: Infinity });
+    // O `readline` reemite o erro do input no `for await`; sem capturá-lo, um
+    // I/O no meio da leitura vira exceção do job.
+    try {
+      for await (const line of rl) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const parsed = JSON.parse(trimmed) as unknown;
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            yield parsed as IndexerEvent;
+          }
+        } catch {
+          // linha corrompida: ignora
+        }
+      }
+    } catch {
+      // erro de leitura: encerra o stream (o que já veio foi consumido)
+    } finally {
+      rl.close();
+      stream.destroy();
+    }
   }
 
   /** Lê um JSONL do spool linha a linha (linha corrompida é ignorada). */
-  private readLines(path: string): IndexerEvent[] {
+  private readLinesSync(path: string): IndexerEvent[] {
     let text: string;
     try {
       text = readFileSync(path, "utf-8");
