@@ -93,6 +93,12 @@ export const DEFAULTS = {
     // `VEC_MIN_SCORE = 0.65`, então um piso abaixo disso só afeta chunks
     // fulltext-only — não espere que ele descarte vetor fraco.
     code_min_score: undefined as number | undefined,
+    // E8-S2: instrução de uso do memtier no system prompt. Primeiro booleano de
+    // `inject.*` com default `true` (exceção consciente, declarada na spec): com
+    // `inject.enabled=false` (o default) é inalcançável, então o comportamento
+    // global não muda; ligou a injeção, liga o protocolo junto — id sem
+    // protocolo é um número sem significado.
+    instruction_enabled: true,
   },
   code_index: {
     enabled: false,
@@ -721,6 +727,14 @@ export function loadConfig(
           filePick(file, "inject.code_min_score"),
         ),
         DEFAULTS.inject.code_min_score,
+      ),
+      instruction_enabled: resolveBool(
+        resolve(
+          "inject.instruction_enabled",
+          "KILOCODE_GRAPH_INJECT_INSTRUCTION_ENABLED",
+          String(DEFAULTS.inject.instruction_enabled),
+        ),
+        DEFAULTS.inject.instruction_enabled,
       ),
     },
     code_index: {

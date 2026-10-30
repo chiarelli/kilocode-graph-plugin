@@ -686,3 +686,32 @@ v1.1.0 o uuid vem na própria resposta de `code_search`, então:
      regressão — espelha `dedupeByIdentity` do código e é exigido por
      `dedup_key_falls_back_to_text`; `warnInvalidIds` em `prepare` cobre
      `inject`/hook, pois ambos passam por `prepare`.
+
+- **2026-10-30 — E8-S2 implementada (tracer bullet).** Fatia mínima primeiro
+  (hook registrado + texto fixo empurrado + prova num boot real), endurecida na
+  mesma base: `buildInstruction` derivado da config, `appendInstruction`
+  idempotente e never-throws, `systemRuntimeFrom` puro para a derivação,
+  `inject.instruction_enabled` em `DEFAULTS`/`Config`/resolução/env (fora de
+  `configStateFrom`). Texto final medido: **707 chars** com código / **555** sem
+  (rascunho da spec: 870); teto assertado `≤ 1000`. Marcadores
+  `TODO(tracer-bullet):` removidos (`rg` = 0). 22 testes de unidade em
+  `tests/e8_s2.test.ts` + 3 E2E em `tests/e2e/test_e2e_system_instruction.test.ts`
+  (gated `E2E=1`, verdes contra o stack local). Suíte 667 (643 pass, 24 skip,
+  0 fail).
+
+  **Revisão adversarial (3 perfis em paralelo) — achados resolvidos:**
+  1. **`system_instruction_pull_only` era tautológico** — o unit testava o tipo
+     `SystemRuntime`, que não tem `code_enabled`, então passava por construção.
+     A derivação passou a ser uma função pura (`systemRuntimeFrom`) que lê a
+     config CRUA (com `code_enabled: false`) e prova a independência de push sem
+     bootar o plugin (boot com `code_index.enabled` spawna o indexer — efeito
+     colateral fora de teste de unidade).
+  2. **Comentário de custo defasado** — dizia "medido 870 no rascunho"; o texto
+     final mede 707/555. Corrigido no código.
+  3. Refutado com evidência: `push` em array congelado lança dentro do `try` e o
+     turno segue (NFR-03); dedup por VALOR (`includes`) cobre dois boots no mesmo
+     `output`; `inject.enabled=false` retorna `null` antes de montar parágrafos;
+     parâmetros citados batem com `tools/list` (`memory_episodes` usa `uuids`).
+  4. Nota para a S3: o valor final a registrar no histórico do BACKLOG é **707**
+     (a spec citava 870 do rascunho). Nenhum overclaim novo: o texto diz "tem
+     grafo consultável via MCP", não "tools disponíveis" (resíduo da decisão 6).

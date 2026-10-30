@@ -183,7 +183,7 @@ Convenções válidas para todas as epics:
 
 ### E8 — Identidade no bloco injetado e instrução de uso do memtier
 - [x] **E8-S1** — Identidade: `uuid`/`episodes` em `Fact`, `uuid` em `CodeChunkHit`, `[id=<uuid>]`/`[ep=<uuid> +N]`, dedup por uuid
-- [ ] **E8-S2** — Instrução de sistema: `system.transform` derivado da config efetiva (`mcp.enabled`; código por `code_index.enabled`, não `inject.code_enabled` — pull ≠ push)
+- [x] **E8-S2** — Instrução de sistema: `system.transform` derivado da config efetiva (`mcp.enabled`; código por `code_index.enabled`, não `inject.code_enabled` — pull ≠ push)
 - [ ] **E8-S3** — Fechamento: E2E de ida-e-volta (id → tool), `chunkUuid` eliminado, docs
 
 ---
