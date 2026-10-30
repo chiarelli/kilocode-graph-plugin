@@ -76,10 +76,15 @@ test("e2e: backpressure ligado, streaming em spool e sync em lotes", {
       cpuGuard: false,
       onEvent: (ev) => spool.write(ev),
     });
-    spool.close();
-
+    // O contrato do spool desde a v0.3.1: `close()` NÃO publica o job — só
+    // `commit()` troca a marca INCOMPLETE por COMMITTED, e o consumidor recusa
+    // ler um spool incompleto (`SpoolNotCommittedError`) para não tratar
+    // arquivos ainda não emitidos como removidos. O commit vem DEPOIS de
+    // conferir que o job terminou sem erro, que é a ordem do coletor.
     assert.equal(run.skipped, false, "o indexer deve rodar");
     assert.equal(run.error, undefined, "sem erro de job");
+    spool.commit();
+
     assert.deepEqual(run.events, [], "streaming: o runner não retém os eventos");
     assert.ok(
       (run.eventCount ?? 0) >= FILE_COUNT,
