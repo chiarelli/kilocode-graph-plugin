@@ -14,8 +14,9 @@ O plugin tem duas formas de dar contexto ao agente:
    chama as ferramentas quando quer.
 
 O memtier expõe as **duas** superfícies com paridade de contrato: as rotas HTTP
-(`/v1/recall`, `/v1/code/search`, `/v1/code/sync`, `/v1/ingest`) e as tools MCP
-(`recall`, `ingest`, `code_search`, `code_sync`) em `/v1/mcp` (E7).
+(`/v1/recall`, `/v1/code/search`, `/v1/code/sync`, `/v1/ingest`,
+`/v1/code/neighbors`, `/v1/memory/episodes`, `/v1/memory/neighbors`) e as tools
+MCP correspondentes em `/v1/mcp` (E7; navegação desde o v1.1.0).
 
 A decisão do dono (2026-10-14): *"o plugin registra o MCP do memtier no kilocode;
 o modelo decide se usa, como qualquer MCP tool"*.
@@ -27,7 +28,7 @@ o modelo decide se usa, como qualquer MCP tool"*.
 | Modo | Direção | O que | Quando |
 |---|---|---|---|
 | **Push** | plugin → turno | memória + `code/search` injetados | automático, todo turno |
-| **Pull** | modelo → MCP | `recall`/`ingest`/`code_search`/`code_sync` | sob demanda do agente |
+| **Pull** | modelo → MCP | 7 tools: `recall`/`ingest`/`code_search`/`code_sync` + `code_neighbors`/`memory_episodes`/`memory_neighbors` | sob demanda do agente |
 
 O **RAG automático** (valor central do produto) é push — o modelo não precisa
 saber pedir. As **ferramentas MCP** são pull — poder extra que o modelo aciona.
@@ -59,21 +60,23 @@ orçamento do turno duas vezes com o mesmo conteúdo.
   por cima (idempotência) — FR-601/FR-602.
 - **Requisito derivado:** degradação — MCP indisponível nunca é fatal — FR-604.
 
-## Bloqueio registrado (navegação)
+## Bloqueio de navegação — **RESOLVIDO no memtier v1.1.0**
 
-`/v1/code/neighbors` (E12) **não é tool MCP** no memtier — só `recall`, `ingest`,
-`code_search` e `code_sync` são expostas (`src/memtier/tools/__init__.py`).
+> **Estado anterior (2026-10-14 → 2026-10-29).** `/v1/code/neighbors` (E12) não
+> era tool MCP — só `recall`, `ingest`, `code_search` e `code_sync` eram
+> expostas — e o `uuid` de entrada não saía de nenhuma rota, então a navegação
+> era impossível nas duas pontas (ver
+> [`RFC-001`](../rfc/001-navegacao-e-integridade-do-grafo-de-codigo.md)).
 
-Portanto, **navegação por código vizinho fica travada no plugin até o memtier
-expor a tool MCP.** O plugin **não** promete navegação nem a reimplementa via
-HTTP: seria uma segunda superfície para o mesmo dado, fora do modelo pull
-escolhido. Quando o memtier expuser a tool, o plugin a herda sem código novo
-(mesmo padrão de registro).
+**Resolvido em 2026-10-30 (memtier v1.1.0).** O servidor publica **7** tools —
+`recall`, `ingest`, `code_search`, `code_sync`, `code_neighbors`,
+`memory_episodes`, `memory_neighbors` — e `code_search` devolve o `uuid` do
+chunk como 9º campo aditivo.
 
-> **Ver [`RFC-001`](../rfc/001-navegacao-e-integridade-do-grafo-de-codigo.md):**
-> além de não ser tool MCP, `/v1/code/neighbors` é **inutilizável de ponta a
-> ponta** mesmo por HTTP — `code_search`/`code_sync` não expõem o `uuid` que o
-> endpoint exige (o contrato de identificador está partido entre as pontas).
+A decisão original **vale como escrita**: o plugin **não** reimplementa
+navegação por HTTP; ele herda as tools pelo registro do MCP, que é **por
+servidor**, não por tool. Nenhum código novo é necessário para expô-las ao
+modelo.
 
 ## Implementação (E3b, 2026-10-14)
 
@@ -83,6 +86,6 @@ escolhido. Quando o memtier expuser a tool, o plugin a herda sem código novo
 - `src/mcp/kilo-config.ts` — lê o `kilo.jsonc` (JSONC) e respeita um `mcp.<name>`
   já definido pelo usuário (idempotência, FR-602).
 - E2E (`tests/e2e/test_e2e_mcp.test.ts`, gated `E2E=1`) prova o registro
-  implícito e as **4 tools** listáveis/chamáveis via cliente MCP real.
-- A tool `neighbors` **não** é oferecida (não existe no memtier) — navegação não
-  é prometida.
+  implícito e as **7 tools** listáveis/chamáveis via cliente MCP real.
+- Navegação **é** prometida desde o v1.1.0: `code_neighbors`, `memory_episodes`
+  e `memory_neighbors` são expostas ao modelo pelo MCP.

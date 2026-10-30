@@ -715,3 +715,28 @@ v1.1.0 o uuid vem na própria resposta de `code_search`, então:
   4. Nota para a S3: o valor final a registrar no histórico do BACKLOG é **707**
      (a spec citava 870 do rascunho). Nenhum overclaim novo: o texto diz "tem
      grafo consultável via MCP", não "tools disponíveis" (resíduo da decisão 6).
+
+- **2026-10-30 — E8-S3 (fechamento) implementada.** E2E de ida-e-volta em
+  `tests/e2e/test_e2e_e8_roundtrip.test.ts` (5 testes): `[ep=…]` injetado resolve
+  `content` em `/v1/memory/episodes` (`uuids: []`), com contraprova
+  `resolved: 0` para o uuid do **fato** e `422` para o campo singular; `[id=…]` do
+  chunk navega em `/v1/code/neighbors` (200); `system.transform` sem tools de
+  código com `code_index.enabled=false`. O E2E do coletor passou a ler o uuid de
+  `code_search` (`symbolChunkId`), sem `uuid5` recalculado (`rg "chunkUuid"` = 0).
+
+  `stash@{0}` (item 7 da RFC-001) aplicado e conferido: README, ADR-006,
+  ARCHITECTURE §2 (exemplos de `recall`/`code/search` com `uuid`, `code_neighbors`
+  como tool, 7 tools, rotas `/v1/memory/episodes` e `/v1/memory/neighbors`), §3
+  (`system.transform` = instrução de uso), §5 (formato real com `[id=]`/`[ep=]`),
+  §6 (`inject.instruction_enabled`), PRD FR-603 e E2E do MCP (conjunto exato de
+  7 tools). RFC §7 e o Encaminhamento marcados como feitos. `rg
+  "travada|4 tools"` = 0.
+
+  **Valor final de custo da instrução: 707 chars** (com código) / 555 (só
+  memória) — substitui a estimativa de 870 no histórico acima.
+
+  **Revisão inline (S3 não é de vulto):** E2E com `dispose` no `finally`; URL do
+  E2E do round-trip pinada em `E2E_MEMTIER_URL` (ou local) para não herdar um
+  `KILOCODE_GRAPH_URL` remoto de dev — o teste é do stack local; `code_min_score`
+  pinado em `""` no cenário de código para o piso do ambiente não filtrar o probe.
+  Verificação: `tsc --noEmit` limpo; `npm test` 672 (643 pass, 29 skip, 0 fail).

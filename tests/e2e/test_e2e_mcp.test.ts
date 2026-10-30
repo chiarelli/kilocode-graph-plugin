@@ -9,7 +9,7 @@
  *      `client.mcp` captura o `McpRemoteConfig` que o plugin registraria.
  *   2. O config capturado aponta para o `/v1/mcp` real com o bearer do workspace.
  *   3. Um cliente MCP real (JSON-RPC sobre Streamable HTTP) **conecta** nesse
- *      `/v1/mcp` e prova o efeito do outro lado: as **4 tools**
+ *      `/v1/mcp` e prova o efeito do outro lado: as **7 tools**
  *      (`recall`/`ingest`/`code_search`/`code_sync`) listam, e `recall` e
  *      `code_search` são **chamáveis** (`isError:false`).
  *
@@ -38,7 +38,13 @@ import { workspaceName } from "../../src/workspace.ts";
 
 const E2E = process.env.E2E === "1";
 const MEMTIER_URL = process.env.KILOCODE_GRAPH_URL ?? "http://127.0.0.1:8400";
-const WS = "kilocode-graph-plugin";
+/**
+ * Workspace do bearer real. O token de `graph-key.json` é escopado ao nome
+ * EXATO (que carrega o hash do caminho — `kilocode-graph-plugin-b3527df0` numa
+ * máquina), então o nome é configurável como nas outras suítes: sem o override
+ * o teste falha por escopo, não por contrato.
+ */
+const WS = process.env.E2E_MCP_WS ?? "kilocode-graph-plugin";
 /** Programa do escopo do bearer (o `graph-key.json` real usa `graphplugin`). */
 const PROGRAM = process.env.E2E_PROGRAM ?? "graphplugin";
 
@@ -117,7 +123,7 @@ function spyMcp(): { client: KiloLikeClient; registered: () => McpRemoteConfig |
   return { client: { mcp }, registered: () => config };
 }
 
-test("e2e: registro implícito do MCP + 4 tools reais listáveis/chamáveis", {
+test("e2e: registro implícito do MCP + 7 tools reais listáveis/chamáveis", {
   // Só `E2E=1` decide o skip. Sem token, o corpo FALHA (D-2) — nunca verde por
   // fallback silencioso.
   skip: !E2E,
@@ -176,11 +182,24 @@ test("e2e: registro implícito do MCP + 4 tools reais listáveis/chamáveis", {
     assert.equal(config.enabled, true, "enabled do add = true");
 
     // Efeito do outro lado: o config que o plugin registrou conecta no memtier
-    // MCP real e as 4 tools respondem.
+    // MCP real e as 7 tools respondem. Conjunto EXATO (não `includes` de 4
+    // nomes): `includes` era satisfeito por qualquer superset e passaria mesmo
+    // se uma tool sumisse (RFC-001 §7).
     const tools = await listTools(config);
-    for (const name of ["recall", "ingest", "code_search", "code_sync"]) {
-      assert.ok(tools.includes(name), `tool "${name}" ausente; tools=${tools.join(",")}`);
-    }
+    const esperadas = [
+      "recall",
+      "ingest",
+      "code_search",
+      "code_sync",
+      "code_neighbors",
+      "memory_episodes",
+      "memory_neighbors",
+    ];
+    assert.deepEqual(
+      [...tools].sort(),
+      [...esperadas].sort(),
+      `tools do MCP divergem do contrato v1.1.0: ${tools.join(",")}`,
+    );
 
     const recall = await callTool(config, "recall", {
       workspace: WS,

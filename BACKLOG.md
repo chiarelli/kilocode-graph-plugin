@@ -184,7 +184,7 @@ Convenções válidas para todas as epics:
 ### E8 — Identidade no bloco injetado e instrução de uso do memtier
 - [x] **E8-S1** — Identidade: `uuid`/`episodes` em `Fact`, `uuid` em `CodeChunkHit`, `[id=<uuid>]`/`[ep=<uuid> +N]`, dedup por uuid
 - [x] **E8-S2** — Instrução de sistema: `system.transform` derivado da config efetiva (`mcp.enabled`; código por `code_index.enabled`, não `inject.code_enabled` — pull ≠ push)
-- [ ] **E8-S3** — Fechamento: E2E de ida-e-volta (id → tool), `chunkUuid` eliminado, docs
+- [x] **E8-S3** — Fechamento: E2E de ida-e-volta (id → tool), `chunkUuid` eliminado, docs
 
 ---
 
@@ -1103,3 +1103,33 @@ redescobertas no meio do loop.
      (README, ADR-006, ARCHITECTURE, PRD e o E2E do MCP) estão em **stash**, não
      aplicadas — e a RFC ainda as declarava "feitas". Item 7 des-riscado.
      Aplicar **antes do fechamento (S3)**; não bloqueia S1/S2.
+
+- **2026-10-30 — E8 fechada (S1 → S2 → S3).**
+  1. **S1 — identidade no bloco.** `Fact.uuid?`/`episodes?` e
+     `CodeChunkHit.uuid?` no fio; `src/inject/uuid.ts` (`isValidUuid`,
+     `8-4-4-4-12` minúsculo) como regra única; `[id=<uuid>]`/`[ep=<uuid> +N]`
+     no fim da linha (memória) e `[id=]` no cabeçalho do chunk (código);
+     `factKey` (uuid validado, fallback `text:<fato>`) no dedup; aviso de uuid
+     malformado **um por turno por família**. `chunkIdentity` segue
+     `path:start-end`. `score`/`raw_score` nunca no envelope.
+  2. **S2 — instrução de sistema.** `experimental.chat.system.transform`
+     (hook irmão do `messages.transform`) via `src/hooks/system.ts`; texto
+     derivado da config efetiva (memória com `mcp.enabled`; código com
+     `mcp.enabled` E `code_index.enabled` — pull ≠ push; `ingest`/`code_sync`
+     nunca); `push` sem substituir, idempotente, never-throws. Chave nova
+     `inject.instruction_enabled` (default `true`), fora de `configStateFrom`.
+     **Custo final medido: 707 chars** com código / **555** sem (rascunho da spec
+     dizia 870), teto assertado `≤ 1000`. Tracer bullet cumprido; marcadores
+     `TODO(tracer-bullet)` removidos (`rg src/` = 0).
+  3. **S3 — fechamento.** E2E de ida-e-volta (`tests/e2e/test_e2e_e8_roundtrip.test.ts`):
+     `recall` → `[ep=…]` → `/v1/memory/episodes` (`uuids: []`) resolve com
+     `content` não vazio, **contraprova** `resolved: 0` com o uuid do **fato** e
+     `422` no campo singular; `code_search` → `[id=…]` → `/v1/code/neighbors`
+     `200`; `system.transform` sem tools de código com `code_index=false`. O E2E
+     do coletor deixou de recalcular `uuid5` (`rg "chunkUuid" tests/` = 0).
+     `stash@{0}` (item 7 da RFC-001) aplicado: README, ADR-006, ARCHITECTURE
+     (§2/§3/§5/§6), PRD, E2E do MCP (conjunto **exato** de 7 tools) e RFC §7.
+     `rg "travada|4 tools"` = 0.
+  4. **Verificação:** `tsc --noEmit` limpo; `npm test` **672 · 643 pass · 0 fail
+     · 29 skip** (E2E gated). E2E verdes contra o stack local (`E2E=1` com
+     `E2E_TOKEN`/`E2E_CODE_TOKEN` por suíte).

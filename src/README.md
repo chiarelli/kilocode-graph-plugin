@@ -8,7 +8,7 @@ de epic): **provisionamento do workspace memtier 1:1** (`provision.ts`) e
 resolvido no runtime, nunca de `process.cwd()`). A segunda onda (E5–E7) ainda é
 forma e contratos. O que existe hoje em `src/` é `index.ts`, `config.ts`,
 `provision.ts`, `client.ts`, `workspace.ts`, `logger.ts`, `types.ts`,
-`hooks/{messages,collect,ingest}.ts`, `inject/{memory,code,budget}.ts`,
+`hooks/{messages,system,collect,ingest}.ts`, `inject/{memory,code,budget,uuid}.ts`,
 `index/{runner,collector,edges,manifest,trigger}.ts`,
 `ingest/{db,batch,state,routine}.ts` e `mcp/{register,kilo-config}.ts`.
 
@@ -25,7 +25,8 @@ src/
 ├── inject/
 │   ├── memory.ts
 │   ├── code.ts
-│   └── budget.ts
+│   ├── budget.ts
+│   └── uuid.ts           # ⬅ NOVO (E8-S1) — `isValidUuid` (8-4-4-4-12), regra única dos dois blocos
 ├── ingest/               # (E4) — a INGESTÃO (conteúdo vem do kilo.db)
 │   ├── db.ts             # localiza o kilo.db; lê message+part; cursor (ts,id)
 │   ├── batch.ts          # lote, hash djb2, reference_time, limiar
@@ -145,6 +146,7 @@ function applyJointBudget(facts, chunks, cfg): { facts; chunks }
 ### `inject/memory.ts` (E2 + prepare/commit da E3c — implementado)
 ```ts
 function formatMemoryBlock(facts: Fact[]): string | null   // null ⇒ não injeta
+function factKey(fact: Fact): string                      // E8: uuid validado, fallback `text:<fato>`
 async function recallAndFormat(client, cfg, query, signal?): Promise<string | null>
 class MemoryInjector {                                    // dedup por turno (FR-104)
   inject(query): Promise<InjectionResult | null>          // { block, facts, chars, recallMs }
@@ -152,6 +154,8 @@ class MemoryInjector {                                    // dedup por turno (FR
   commit(prep, facts): InjectionResult | null             // E3c: dedup + formatação
 }
 // observabilidade do turno (base E7): loga `inject recall_ms=… facts=… injected_chars=…`
+// E8: linha vira `- <fato> (válido desde …) [id=<uuid>] [ep=<uuid> +N]`; o uuid
+// vai COMPLETO e validado por forma (inválido ⇒ marcador omitido + 1 aviso/turno).
 ```
 
 ### `inject/code.ts` (E3c — implementado)
@@ -166,6 +170,22 @@ class CodeInjector {                                      // dedup por turno (me
 // sentinela própria `graph-code` (distinta de `graph-memory`); procedência por
 // chunk `[CÓDIGO RELEVANTE — path:ini-fim]`; sanitiza `<`/`>` preservando
 // quebras de linha/indentação. Nunca busca com `limit:0` (422 no servidor).
+// E8: cabeçalho ganha ` [id=<uuid do chunk>]` quando o servidor manda o 9º
+// campo; uuid inválido ⇒ omitido + 1 aviso por turno. `chunkIdentity` continua
+// `path:start-end` (guarda local do turno, não identidade de grafo).
+```
+
+### `hooks/system.ts` (E8-S2 — implementado)
+```ts
+function systemHook(rt: SystemRuntime): { "experimental.chat.system.transform": fn }
+function buildInstruction(rt): string | null   // null ⇒ nada a anunciar
+function appendInstruction(rt, output): void   // push; idempotente; NUNCA lança
+function systemRuntimeFrom(config): SystemRuntime  // derivação pura da config
+// Hook IRMÃO do messages.transform: o bloco carrega os ids, o system prompt
+// carrega o protocolo. Tools derivadas da config: memória com `mcp.enabled`;
+// código com `mcp.enabled` E `code_index.enabled` (pull ≠ push). `ingest`/
+// `code_sync` nunca. Efetiva só com `inject.enabled` e `mcp.enabled`; governada
+// por `inject.instruction_enabled` (default true). Teto ≤ 1000 chars.
 ```
 
 ### `hooks/messages.ts` (E2 + E3c — implementado)
