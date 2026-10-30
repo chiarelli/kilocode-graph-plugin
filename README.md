@@ -56,7 +56,7 @@ Kilo Code ──hooks──▶ plugin ──HTTP──▶ memtier ──▶ Falk
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Hooks, fluxo do turno, coletor, MCP, adaptadores (v0.2) |
 | [`docs/SPIKE-FINDINGS.md`](docs/SPIKE-FINDINGS.md) | O que o spike provou sobre multi-CLI |
 | [`docs/adr/`](docs/adr/README.md) | Decisões (ADR-005: coletor; ADR-006: push vs pull MCP) |
-| [`docs/rfc/`](docs/rfc/README.md) | RFCs — problemas observados (RFC-001: navegação do grafo e integridade do chunk) |
+| [`docs/rfc/`](docs/rfc/README.md) | RFCs — problemas observados (RFC-001: navegação do grafo e identidade no RAG) |
 
 ## Hooks do Kilo usados
 
